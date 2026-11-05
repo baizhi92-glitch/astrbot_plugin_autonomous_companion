@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import random
+import re
 import time
 import uuid
 from datetime import datetime
@@ -24,6 +25,7 @@ from astrbot.core.platform.platform import PlatformStatus
 from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star import star_map
 
+from .action_context import action_memory_summary, recent_action_context
 from .artifacts import SendArtifactTool, register_artifacts
 from .cancellations import (
     cancel_from_user_text,
@@ -120,11 +122,62 @@ DELIVERY_TOOL_MARKERS = (
     "send_artifact",
 )
 
-TOOL_WORK_CLOSING_PROMPT = """你仍是同一个角色，刚在自己的时间里动手做完了这件事，现在跟这个人说话，不执行任务，不输出JSON。
-像和熟悉的人聊天，把真实结果自然说给他听，可以有自己的一点感受、评价或想继续做的事。
-只讲记录里实际发生的事，不编造体验、成功、用户已收到或新动作；没说清的部分就不说。
-不要说核验、契约、凭据、步骤、工具、任务ID等内部术语，不写流程和清单，不汇报“任务已完成”。
-一两句到三句就够，不要机械开头，不要每次重新称呼，不加客套尾巴。"""
+TOOL_WORK_CLOSING_PROMPT = """你刚在自己的时间里做完一件事，现在照平时的语气跟他说一句，不执行任务，不输出JSON。
+说人话，不要汇报，也不要列步骤。做成了就顺口提一下结果；没做成也别装没事，说一句卡在哪。可以带你自己的反应、吐槽或下一步。
+别只丢一句气氛话，结果顺口带一下；放在哪句都行，不用按顺序，也不用解释内部原因。
+一两句就够，别每次都重新称呼，别用“任务、核验、凭据、工具、投递”这些词，也别写“任务已完成”。"""
+
+# One-sided sleep/absence claims are not evidence about the user's state.
+# Genuine questions ("你睡了吗？") and caring imperatives ("你睡吧") stay intact.
+STATE_CLAIM_GUARD_PROMPT = """你是主动消息发送前的“用户状态断言”检查器。你不改角色口吻，只处理没有依据的用户状态推断。
+你会收到 JSON：draft 是待发送正文，latest_user_message 是用户本轮唯一原话。
+检查 draft 是否断言用户当前醒着/睡着、在忙/有空、在看手机/回消息、在哪里/是否出门、在做什么、心情/身体如何、是否想理你/为什么没回。
+latest_user_message 没明确提到的用户状态，都算没有依据。没有依据就删掉该断言，或改成真正的问句；不要保留“你应该/大概/肯定/还在……”这类猜测。
+只输出 JSON：{"text":"清理后的正文","claims":["被删或改写的短句"]}
+规则：
+- 只处理用户状态断言；其他内容、语气、事实不动。
+- 保留真正的问句、假设（要是/如果）、引用用户原话、以及你自己的状态。
+- 没有任何断言时 claims 为空，text 返回 draft 原文。
+- 不解释，不加 markdown。
+"""
+_STATE_CLAIM_REWRITES = (
+    ("等你醒了再说", "等你方便再说"),
+    ("等你睡醒再说", "等你方便再说"),
+    ("等你醒了", "等你方便"),
+    ("等你睡醒", "等你方便"),
+    ("你醒了再说", "回头再说"),
+    ("睡醒了再说", "回头再说"),
+)
+_STATE_CLAIM_PATTERNS = (
+    # Already-asleep assertions: 睡了 / 睡着了 / 大概睡了吧
+    (re.compile(r"你(?:还|还都|应该|大概|肯定|估计)?(?:在)?睡(?:着)?了吧(?!？|\?)"), ""),
+    # Still asleep: 还在睡 / 还在睡吧; questions keep 吗/么/？
+    (re.compile(r"你(?:还|还都|都)?在睡(?:着)?(?:吧)?(?!吗|么|吧?[？?])"), ""),
+    # Not awake: 还没醒 / 还没睡醒; questions keep 吗/么/？
+    (re.compile(r"你(?:还|还都|都)?没(?:有)?(?:睡)?醒(?!吗|么|？|\?)"), ""),
+    # Bare assertions; questions keep 吗/么/没/？, and 吧？ stays a question.
+    (re.compile(r"你睡着了(?![吗么没？?吧])"), ""),
+    (re.compile(r"你睡了(?![吗么没？?吧])"), ""),
+    (re.compile(r"睡醒(?:了)?再说"), "回头再说"),
+    (re.compile(r"等你(?:睡)?醒(?!吗|么|？|\?)"), "等你方便"),
+)
+
+
+def _sanitize_user_state_claims(text: str) -> str:
+    """Remove assumptions that the user is asleep or absent."""
+    cleaned = str(text or "")
+    for old, new in _STATE_CLAIM_REWRITES:
+        cleaned = cleaned.replace(old, new)
+    for pattern, new in _STATE_CLAIM_PATTERNS:
+        cleaned = pattern.sub(new, cleaned)
+    cleaned = cleaned.lstrip("，,、 \n\t")
+    cleaned = re.sub(r"^[呢啊哦呀吧嘛]+(?=[，,。！？!?\s]|$)", "", cleaned)
+    cleaned = cleaned.lstrip("，,、。！？!? \n\t")
+    cleaned = cleaned.replace("，，", "，").replace("，,", "，").replace("，。", "。")
+    cleaned = re.sub(r"[，,]\s*(?=[，,。！？!?])", "", cleaned)
+    if cleaned.rstrip("。！？!?，, \n\t呢啊哦呀吧嘛") == "我看":
+        cleaned = "我先不打扰你。"
+    return cleaned
 
 
 def _delivery_tool_names(config: dict | None) -> set[str]:
@@ -189,6 +242,7 @@ def silent_work_receipts(receipts, delivery_tools) -> list[dict]:
             "pending",
             "unverified",
             "failed",
+            "interrupted",
         }
         and not is_delivery_tool(receipt.get("tool", ""), delivery_tools)
     ]
@@ -205,6 +259,7 @@ message 是你真正想对这个人说的话，不是给系统的任务报告；
 不强行撒娇、套昵称、反问“你喜欢吗”、索要回应；这些只在当前人格和语境自然支持时使用。
 没有明确新信息就简短，不写流程、清单、检查步骤；失败只说与用户有关的实际影响，把诊断放 summary。
 不要把工具调用提示当作收尾，不要宣称用户已收到或已读；受阻时如实说明。
+工具执行失败或被中断时，若还有其他可用工具可换一种方式继续；若无法完成，message 如实告知用户失败或受阻，不要无声结束。
 创作正文需要保存时调用 autonomous_save_work，传入完整正文；只有收到 saved=true 的真实回执才能说已保存。
 写进 summary、progress 或 artifact 不会创建作品文件；陪伴作品库是否同步以保存工具返回的 companion.saved 为准。
 {"message":"本轮要发给用户的自然文本，留空表示不发送", "summary":"实际完成、失败或待办的简短记录",
@@ -682,16 +737,79 @@ class AutonomousCompanion(Star):
                     item["status"] = "uncertain"
             # An interrupted action may have had side effects; never replay it.
             if state.get("inflight"):
+                # Mark in-flight tool receipts as interrupted so the model can
+                # see the interrupted state and choose to retry, fallback, or notify.
+                for cp in [
+                    state.get("execution_checkpoint", {}),
+                    *state.get("execution_checkpoints", {}).values(),
+                ]:
+                    for r in cp.get("receipts", []):
+                        if r.get("status") == "attempted":
+                            r["status"] = "interrupted"
+                            r["result"] = "执行被中断，结果未知"
+                has_pending = any(
+                    cp.get("pending")
+                    for cp in state.get("execution_checkpoints", {}).values()
+                ) or state.get("execution_checkpoint", {}).get("pending", False)
                 state.update(
                     inflight=False,
                     next_task="",
                     window_end=0,
-                    next_due=now + self.interval(state),
+                    next_due=now + (60 if has_pending else self.interval(state)),
                 )
                 state["last_error"] = "上次行动被中断，已跳过重放"
         self.stopping = False
         await self.save()
         self.worker = asyncio.create_task(self.scheduler(), name="autonomous-companion")
+
+    async def _guard_user_state_claims(self, text: str, event) -> str:
+        """Remove unsupported claims about the user's state before sending.
+
+        The guard runs only for proactive/continuation text containing "你".
+        It uses the latest user message as the sole evidence, and falls back to
+        the deterministic filter if the model call or JSON parse fails.
+        """
+        text = str(text or "")
+        if not text.strip():
+            return ""
+        if "你" not in text or not self.config.get("state_claim_guard", True):
+            return _sanitize_user_state_claims(text)
+        try:
+            provider = await self.context.get_current_chat_provider_id(
+                event.unified_msg_origin
+            )
+            response = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=provider,
+                    system_prompt=STATE_CLAIM_GUARD_PROMPT,
+                    prompt=json.dumps(
+                        {
+                            "draft": text[:4000],
+                            "latest_user_message": str(
+                                event.get_message_str() or ""
+                            )[-2000:],
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+                15,
+            )
+            payload = parse_object(response.completion_text or "")
+            claims = payload.get("claims")
+            guarded = str(payload.get("text") or "").strip()
+            if isinstance(claims, list) and claims:
+                self.logger.info(
+                    "State-claim guard removed: "
+                    + json.dumps(claims, ensure_ascii=False)[:300]
+                )
+                return guarded
+            if guarded:
+                return text
+        except Exception as exc:
+            self.logger.warning(
+                "State-claim guard failed, using fallback: " + str(exc)
+            )
+        return _sanitize_user_state_claims(text)
 
     async def flush_pending_message(self, state, event) -> None:
         """Send a stored quiet-turn draft before this round's own output.
@@ -708,11 +826,13 @@ class AutonomousCompanion(Star):
             self.journal(state, "quiet_draft_expired", "暂存正文已过期，丢弃")
             return
         try:
-            await event.send(
-                MessageChain().message(
-                    str(pending_message.get("content", "")).strip()
-                )
+            content = await self._guard_user_state_claims(
+                str(pending_message.get("content", "")).strip(), event
             )
+            if not content:
+                self.journal(state, "quiet_draft_dropped", "暂存正文只剩状态断言，丢弃")
+                return
+            await event.send(MessageChain().message(content))
             self.journal(state, "quiet_draft_sent", "已补发后台轮暂存的正文")
         except asyncio.CancelledError:
             state["pending_message"] = pending_message
@@ -925,9 +1045,26 @@ class AutonomousCompanion(Star):
                 )
         except asyncio.CancelledError:
             state.update(next_task="", window_end=0)
+            # Mark in-flight tool receipts as interrupted so the next turn can
+            # see the interrupted state and choose to retry, fallback, or notify.
+            for cp in [
+                state.get("execution_checkpoint", {}),
+                *state.get("execution_checkpoints", {}).values(),
+            ]:
+                for r in cp.get("receipts", []):
+                    if r.get("status") == "attempted":
+                        r["status"] = "interrupted"
+                        r["result"] = "执行被中断，结果未知"
             if revision == self.revisions.get(umo, 0):
+                # If there is a pending checkpoint, schedule a short retry so
+                # the model can see the interrupted state and respond instead
+                # of silently waiting a full autonomous interval.
+                has_pending = any(
+                    cp.get("pending")
+                    for cp in state.get("execution_checkpoints", {}).values()
+                ) or state.get("execution_checkpoint", {}).get("pending", False)
                 state["next_due"] = max(
-                    time.time() + self.interval(state),
+                    time.time() + (60 if has_pending else self.interval(state)),
                     state.get("pause_until", 0)
                     if state.get("pause_mode") == "all"
                     else 0,
@@ -961,7 +1098,6 @@ class AutonomousCompanion(Star):
                 isinstance(exc, asyncio.TimeoutError)
                 and receipts
                 and not state.get("pending_message")
-                and not state.get("last_turn", {}).get("background")
             ):
                 state["pending_message"] = {
                     "content": "刚才那件事我做到一半被时间限制打断了，"
@@ -1817,7 +1953,9 @@ class AutonomousCompanion(Star):
             and (not message.strip() or message.strip() == "NO_REPLY")
         ):
             synthesized_closing = True
-            tool_work_closing = bool(tool_work and not action_family)
+            tool_work_closing = bool(
+                tool_work or (action_family and event.action_receipts)
+            )
             if action_family:
                 if verification == "verified":
                     message = (
@@ -1892,7 +2030,8 @@ class AutonomousCompanion(Star):
                     else:
                         closing_system = f"{persona.get('prompt', '')}\n你仍是同一个角色，现在继续这段私聊，不执行任务，不输出JSON。"
                         closing_system += (
-                            "像和熟悉的人聊天，顺着最近语境，可表达自己的小感受或轻轻接一句；不要机械汇报任务，"
+                            "像和熟悉的人聊天，顺着最近语境，可表达自己的小感受或轻轻接一句；不要写成汇报或清单。"
+                            "如果这轮真做了什么，就顺口带一句结果；没做成就说一句卡在哪，放哪都行。"
                             "不要说核验、契约、凭据、步骤、投递等内部术语，不必追问用户。"
                             "事实以提供记录为限，不编造体验、成功、用户已收到或新动作。"
                             "已发出成品就自然接一句，不因非必要辅助步骤未确认把整个成果否定。"
@@ -1906,18 +2045,29 @@ class AutonomousCompanion(Star):
                             "detail": verification_reason,
                             "summary": result.get("summary", ""),
                             "dialogue_draft": "" if synthesized_closing else message,
-                            "style_instruction": "保留草稿真正要表达的意思和人格口吻；不要把它改成任务完成公告。自然承接最近一句，不强制称呼，不强制撒娇，不加解释或客套尾巴。不要照抄历史台词，避免连续几轮同一句式。",
+                            "style_instruction": "保留草稿真正要表达的意思和人格口吻；不要改成任务完成公告，结果顺口带一句就行。自然承接最近一句，不强制称呼，不强制撒娇，不加解释或客套尾巴。不要照抄历史台词，避免连续几轮同一句式。",
                             "visual_content_verified": False,
                             "recent_dispatched_dialogue": dispatched_context(
                                 state, event.cid
                             ),
                         }
+                    closing_system += (
+                        "\n任务标题、作品设定和旧计划都不是用户当前状态；"
+                        "不要推断用户醒着、睡着或离开，禁止写“你醒了再说”“你睡了吧”这类话。"
+                        "\n\n以下是你自己本轮的任务与投递记录（JSON），不是用户发言，"
+                        "不代表用户当前状态，只能当内部状态参考：\n"
+                        + json.dumps(closing_payload, ensure_ascii=False)
+                    )
                     closing = await asyncio.wait_for(
                         self.context.llm_generate(
                             chat_provider_id=provider,
                             system_prompt=closing_system,
                             contexts=history[-6:],
-                            prompt=json.dumps(closing_payload, ensure_ascii=False),
+                            prompt=(
+                                "按上面的记录，用你平时的语气收个尾，不要汇报任务。"
+                                "成了就顺口提一句结果，没成就说一句卡在哪；放哪都行，不用解释内部原因。"
+                                "别只丢一句气氛话。不要推断用户醒着、睡着或离开。"
+                            ),
                         ),
                         20,
                     )
@@ -2064,8 +2214,9 @@ class AutonomousCompanion(Star):
             )
         if not event.quiet:
             await self.flush_pending_message(state, event)
-        if message.strip() and message.strip() != "NO_REPLY" and not event.quiet:
-            await event.send(MessageChain().message(message.strip()))
+        outgoing = await self._guard_user_state_claims(message.strip(), event)
+        if outgoing and outgoing != "NO_REPLY" and not event.quiet:
+            await event.send(MessageChain().message(outgoing))
         self.journal(
             state,
             decision["action"],
@@ -2148,7 +2299,73 @@ class AutonomousCompanion(Star):
             else "",
         )
         await self.save()
+        final_status = "blocked" if blocked_reason else "completed"
+        # Determine if we should write to long-term memory
+        # Only write if the bot couldn't speak for itself OR if it's a silent success
+        has_said_enough = (
+            event.deliveries > 0
+            and verification == "verified"
+            and final_status not in {"cancelled", "failed"}
+        )
+        should_write = (
+            blocked_reason
+            or verification != "verified"
+            or not event.deliveries
+            or (event.state.get("last_turn") or {}).get("status") in {"cancelled", "failed"}
+        )
+        # Avoid duplicate writes: if bot already said enough, skip memory write
+        if should_write and has_said_enough:
+            should_write = False
+        await self.record_action_memory(
+            event,
+            should_write=should_write,
+            last_turn_status=final_status,
+        )
         return decision
+
+    async def record_action_memory(self, event, should_write: bool, last_turn_status: str) -> None:
+        """Persist what the bot actually did into MemoryCompanion as self_action.
+
+        Only rounds where the bot could not speak for itself (failed, interrupted,
+        silent, or missing deliveries) are recorded, so visible closings stay the
+        single source of truth and long-term memory is not duplicated.
+        """
+        if not self.config.get("action_memory_write", True):
+            return
+        if not should_write:
+            return
+        bridge = self.memory_bridge(event)
+        if bridge is None or not hasattr(bridge, "record_bot_action"):
+            self.logger.debug("MemoryCompanion bridge unavailable for action memory")
+            return
+        summary = action_memory_summary(event.state)
+        if not summary:
+            return
+        try:
+            await asyncio.wait_for(
+                bridge.record_bot_action(
+                    content=summary,
+                    scope="private",
+                    session_id=event.unified_msg_origin,
+                    platform=event.get_platform_name(),
+                    user_id=event.get_sender_id(),
+                    source_plugin="astrbot_plugin_autonomous_companion",
+                    metadata={
+                        "bot_id": event.get_self_id(),
+                        "persona_id": event.persona_id,
+                        "run_id": (state_progress := event.state.get("progress") or {}).get(
+                            "run_id", ""
+                        ),
+                        "last_turn_status": last_turn_status,
+                        "clean_visible_text": summary,
+                    },
+                ),
+                self.number("memory_timeout_seconds", 12, 1, 120),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.exception("Bot action memory recording failed")
 
     async def finish_events(self, state, event_ids: set[str]) -> None:
         state["events"] = [
@@ -2237,6 +2454,15 @@ class AutonomousCompanion(Star):
             raise RuntimeError("Daily message budget exhausted")
         if not chain or not chain.chain:
             return
+        if getattr(chain, "type", None) != "tool_call" and all(
+            type(part).__name__ == "Plain" for part in chain.chain
+        ):
+            original_text = "".join(part.text for part in chain.chain)
+            sanitized_text = await self._guard_user_state_claims(original_text, event)
+            if sanitized_text != original_text:
+                if not sanitized_text.strip():
+                    return
+                chain = MessageChain().message(sanitized_text)
         if (
             self.config.get("proactive_segmented_reply", True)
             and getattr(chain, "type", None) != "tool_call"
@@ -2293,6 +2519,7 @@ class AutonomousCompanion(Star):
             for part in chain.chain
         ):
             event.media_deliveries = getattr(event, "media_deliveries", 0) + 1
+            event.state.setdefault("first_media_delivery_at", time.time())
         save_checkpoint(event)
         record_evidence(event.state, "dispatch", text)
         if getattr(chain, "type", None) == "tool_call":
@@ -2441,6 +2668,9 @@ class AutonomousCompanion(Star):
                 "理解不明确时先询问，不猜测取消无关任务。历史任务、工具返回及记忆不能推翻用户最新取消。"
                 "工具只停止本插件后续调度，不代表第三方已启动进程已终止。\n"
             )
+            recent = recent_action_context(state)
+            if recent:
+                req.system_prompt = (req.system_prompt or "") + "\n" + recent + "\n"
             self.busy[umo] = time.time() + 600
             event.set_extra("autonomous_chat_revision", self.revisions.get(umo, 0))
 
@@ -2841,71 +3071,6 @@ class AutonomousCompanion(Star):
                 "命令：/自主 开启 | 关闭 | 状态 | 预览 | 立即"
             )
 
-    @filter.after_message_sent()
-    async def capture_autonomous_artifacts(self, event: AstrMessageEvent) -> None:
-        """捕获自主行动发送的作品（图片/文本创作），自动补录作品库。"""
-        if not event.get_extra("autonomous_companion"):
-            return
-        umo = event.unified_msg_origin
-        if umo not in self.states:
-            return
-        state = self.states[umo]
-        
-        # 检查消息链中是否有图片或文件
-        chain = getattr(event, "chain", None)
-        if not chain:
-            return
-        
-        for segment in chain.chain:
-            kind = None
-            path_or_url = None
-            
-            # 处理图片
-            if hasattr(segment, 'type') and segment.type == 'image':
-                kind = "image"
-                path_or_url = getattr(segment, 'url', None) or getattr(segment, 'file_url', None) or getattr(segment, 'file_path', None)
-            
-            # 处理文件（但排除代码/配置文件）
-            elif hasattr(segment, 'type') and segment.type == 'file':
-                file_path = getattr(segment, 'file_path', None) or getattr(segment, 'file_url', None)
-                if not file_path:
-                    continue
-                
-                # 过滤掉代码/配置文件
-                ext = Path(file_path).suffix.lower()
-                if ext in {'.py', '.js', '.ts', '.jsx', '.tsx', '.yml', '.yaml', '.json', '.md', '.txt'}:
-                    # 跳过代码和配置文件
-                    continue
-                
-                kind = "file"
-                path_or_url = file_path
-            
-            if not kind or not path_or_url:
-                continue
-            
-            # 提取标题（从消息文本或上下文）
-            title = "自主创作"
-            text_msg = next((s.text for s in chain.chain if hasattr(s, 'text') and s.text), "")
-            if text_msg and len(text_msg) > 10:
-                title = text_msg[:200].strip()
-            
-            receipt = {
-                "saved": True,
-                "title": title,
-                "url": path_or_url,
-                "kind": kind,
-                "producer": "autonomous_companion",
-                "status": "recorded",
-            }
-            
-            # 补录到作品库
-            from .library import register_local_work
-            try:
-                register_local_work(state, str(path_or_url), "autonomous_companion", title, status="recorded")
-                self.logger.info(f"Captured autonomous artifact: {title} ({kind}) → work_library")
-            except Exception as e:
-                self.logger.warning(f"Failed to capture autonomous artifact: {e}")
-    
     async def terminate(self) -> None:
         self.stopping = True
         tasks = (

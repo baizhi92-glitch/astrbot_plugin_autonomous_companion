@@ -10,8 +10,16 @@ from pathlib import Path
 from astrbot.api.star import StarTools
 from astrbot.core.agent.tool import FunctionTool
 
-from .library import catalogue_receipt
+from .library import catalogue_receipt, text_content_hash
 from .lifecycle import record_evidence
+
+_TITLE_NOISE = " \t\r\n《》〈〉【】[]()（）\"'“”‘’·-—_：:；;，,。.!！?？、"
+_TITLE_TABLE = str.maketrans("", "", _TITLE_NOISE)
+
+
+def _work_title_key(title):
+    """Match title variants such as 《深浅》铺底色稿 and 深浅铺底色稿."""
+    return str(title or "").translate(_TITLE_TABLE).casefold()
 
 
 class SaveWorkTool(FunctionTool):
@@ -69,13 +77,33 @@ class SaveWorkTool(FunctionTool):
         def resolve_draft_path():
             drafts_dir = root / "works" / scope / "drafts"
             drafts_dir.mkdir(parents=True, exist_ok=True)
-            # Stable name so register_local_work updates same entry on re-save
-            return drafts_dir / f"draft-{uuid.uuid4().hex[:8]}.md"
+            # Stable by title so re-saving a draft updates one entry.
+            digest = hashlib.sha256(
+                (scope + "\n" + title.strip()).encode()
+            ).hexdigest()[:8]
+            return drafts_dir / f"draft-{digest}.md"
 
         if mode == "draft":
             # Find existing draft by work_id
             state = self.event.state
             target = None
+            inherited_from = ""
+            if not work_id:
+                # Inherit the latest same-title draft instead of creating a duplicate.
+                drafts = [
+                    w
+                    for w in state.get("work_library", [])
+                    if _work_title_key(w.get("title", "")) == _work_title_key(title)
+                    and w.get("producer") == "autonomous_save_work"
+                    and w.get("status") == "drafting"
+                    and w.get("path")
+                ]
+                existing = max(
+                    drafts, key=lambda w: w.get("modified_at", 0), default=None
+                )
+                if existing:
+                    work_id = existing["id"]
+                    inherited_from = existing["id"]
             if work_id:
                 work_item = next(
                     (w for w in state.get("work_library", []) if w["id"] == work_id),
@@ -104,6 +132,7 @@ class SaveWorkTool(FunctionTool):
                         "characters": len(content),
                         "status": "drafting",
                         "work_id": work_id,
+                        "inherited_from": inherited_from,
                     }
                     catalogue_receipt(state, "autonomous_save_work", json.dumps(receipt))
                     record_evidence(state, "work_saved", json.dumps(receipt, ensure_ascii=False))
@@ -204,6 +233,30 @@ class SaveWorkTool(FunctionTool):
                         "Local work saved but Companion import failed: %s", exc
                     )
         
+        if not work_id:
+            # Inherit a same-title draft, or an identical finished body, instead of duplicating.
+            candidates = [
+                w
+                for w in state.get("work_library", [])
+                if _work_title_key(w.get("title", "")) == _work_title_key(title)
+                and w.get("producer") == "autonomous_save_work"
+                and w.get("path")
+            ]
+            draft = max(
+                (w for w in candidates if w.get("status") == "drafting"),
+                key=lambda w: w.get("modified_at", 0),
+                default=None,
+            )
+            if draft:
+                work_id = draft["id"]
+            else:
+                new_hash = text_content_hash(content, title)
+                same = next(
+                    (w for w in candidates if w.get("content_hash") == new_hash),
+                    None,
+                )
+                if same:
+                    work_id = same["id"]
         if work_id:
             # Finalize an existing draft
             work_item = next(

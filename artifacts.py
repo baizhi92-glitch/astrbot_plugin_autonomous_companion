@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import time
 
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.message.components import Image
@@ -42,6 +43,7 @@ def register_artifacts(event, tool, text):
                 "url": url,
                 "producer": tool,
                 "status": "pending",
+                "registered_at": time.time(),
             }
             retained.append(item)
         added.append(dict(item))
@@ -53,7 +55,7 @@ class SendArtifactTool(FunctionTool):
     def __init__(self, event):
         super().__init__(
             name="autonomous_send_artifact",
-            description="发送当前任务生成回执登记的图片。传 artifact_id，不猜路径，不用其他任务的历史图片；发送一次后不要重复投递。",
+            description="发送当前任务生成回执登记的图片。传 artifact_id，不猜路径，不用其他任务的历史图片；发送一次后不要重复投递。已投递媒体后又重新生成的产物会被拦截，确需多张请一次性生成后再依次投递。",
             parameters={
                 "type": "object",
                 "properties": {"artifact_id": {"type": "string"}},
@@ -79,6 +81,19 @@ class SendArtifactTool(FunctionTool):
         if item is None or item["status"] != "pending":
             return json.dumps(
                 {"success": False, "reason": "产物不属于当前任务或已处理"},
+                ensure_ascii=False,
+            )
+        first_delivery = event.state.get("first_media_delivery_at", 0)
+        registered_at = item.get("registered_at", 0)
+        if first_delivery and registered_at and registered_at > first_delivery:
+            # The task already delivered media; this artifact was regenerated
+            # afterwards (typically an interrupted extra call). Sending it would
+            # append an unexpected, possibly unrelated image to the conversation.
+            return json.dumps(
+                {
+                    "success": False,
+                    "reason": "本任务已成功投递过媒体；该产物是投递之后重新生成的，已拦截重复投递，避免追加与用户预期不符的图片。确需多张时，请一次性生成后再依次投递。",
+                },
                 ensure_ascii=False,
             )
         item["status"] = "sending"
