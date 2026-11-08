@@ -9,6 +9,7 @@ from typing import Any
 from .cancellations import cancelled_match
 from .conditions import validate_conditions
 from .lifecycle import appointment_updates
+from .notes import NOTE_KINDS
 
 
 def resolve_project(state, task, identifier=""):
@@ -45,6 +46,12 @@ def filter_project_updates(state, payload):
 PLANNING_PROMPT = """
 你还可以在 JSON 中使用下列可选字段（省略表示保持）：
 next_check_minutes: 5~180，选择下次周期主动判断的间隔；有具体原因才改变。
+next_speak_minutes: 5~1440，你自己约定多少分钟后开口说话；到点会专门为这个约定唤醒你，默认应开口而不是只做判断。
+next_speak_reason: 简短说明为什么选这个时间。填 0 表示取消尚未到期的开口约定；省略表示保持原约定。
+只在确实想到时候说点什么时使用，不要每轮都约定，也不要用它代替 rhythm_minutes 的长期节奏。
+speak_wish: 有想说但此刻没说出口的话时，用一句话记下它（不超过300字）；下次唤醒时你会看到这句话，再决定说不说、什么时候说。
+speak_wish_clear: true 表示放下之前记下的那句话（已经说了、不必说了或过时了）；没有要放下的就省略。
+念头和开口约定不同：speak_wish 是"我想说这件事"，next_speak_minutes 是"我打算几点说"。两者可以同时存在，也可以只有念头。
 rhythm_minutes: 希望持续采用的基础主动间隔（分钟），不是仅本次等待时间；
 rhythm_reason: 简短说明为何想更频繁或更安静。两个字段一起提供，有真实动机再调整。
 根据自己的未完成事项、创作兴趣、对话进展和用户明确偏好调整；
@@ -95,11 +102,21 @@ CHAT_PLANNING_PROMPT = (
     """你是对话后的自主计划整理器，不向用户说话，不执行工具。
 根据刚才的真实用户发言和助手回复，决定是否形成值得保留的未来计划或创作项目。
 不要把每句话都变成任务；不要将助手的设想当成用户偏好或已完成事实。
-只输出一个 JSON 对象，可包含 future_task、project_updates、next_check_minutes。
-还可包含 preference_updates: [{"key":"偏好主题","value":"用户明确表达的偏好",
-"evidence":"用户原话中的连续片段"}]，最多 3 项。
-偏好仅来自用户明确表达，不能由沉默、未回复或助手的话推断。
-同 key 替换旧偏好；用户修正偏好时遵循最新表达。无需更新时返回 {}。
+只输出一个 JSON 对象，可包含 future_task、project_updates、next_check_minutes、next_speak_minutes、next_speak_reason、speak_wish、speak_wish_clear。
+还可包含 note_updates: [{"key":"这条的主题","value":"具体内容",
+"kind":"preference 或 fact 或 interest","evidence":"用户原话中的连续片段",
+"confirmed":true 或 false,"drop":可选，true 表示删掉这个主题}]，每轮最多 3 条改动。
+三个 kind 的区别：preference 是"你该怎么对待用户"（作息、语气、称呼、不喜欢的话题），会约束你开口的时间、话题与语气；
+fact 是关于用户的事实（身份、职业、居住、家人宠物、重要日程）；interest 是用户的爱好与口味。
+拿不准算偏好还是事实时，用 fact，不要用 preference 乱加限制。
+key 用稳定短标签，同一件事必须复用同一个 key，不要造近义 key。
+evidence 必须逐字复制用户本轮原话的连续片段，不能改写、拼接或用自己的总结代替，否则整条会被丢弃。
+preference 只能来自用户明确表达，不能由沉默、未回复或助手的话推断；它记的是以后要反复照做的约束，一次性的"这次想听个故事"属于临时计划。
+confirmed 只在用户本人明确说出或明确确认过时为 true；从语气猜的、从上下文推的、助手说的，一律 false。preference 视为已确认。
+只记稳定、以后还用得上的信息；不记情绪、临时状态、一次性经历、别人的隐私；身份证号、门牌号、密码、账号这类敏感信息一律不记。
+不限条数。人是会变的：用户改口、搬家、换工作、分手、戒掉某个习惯时，用同一个 key 写成新说法覆盖旧的（旧说法会自动留一份做对比）；
+发现某条已经彻底不对或当初就记错了，就在同一条里带 "drop": true 删掉它，不要留着自相矛盾的旧记录。
+和已有记录对不上、又没有用户原话支撑时，不要改也不要删。没有值得改的就省略这个字段。
 """
     + PLANNING_PROMPT
 )
@@ -251,37 +268,87 @@ def apply_plan(
             raise ValueError("最多保留5个持续项目，请先删除旧项目；未覆盖已有项目")
     if updates:
         changes["projects"] = projects
-    preferences = payload.get("preference_updates", [])
-    if not isinstance(preferences, list) or len(preferences) > 3:
-        raise ValueError("Invalid preferences")
-    retained = dict(state.get("preferences", {}))
-    for item in preferences:
-        if not isinstance(item, dict) or any(
-            not isinstance(item.get(k), str) for k in ("key", "value", "evidence")
+    updates = payload.get("note_updates", [])
+    # 兼容旧字段名：偏好与印象曾经分开输出
+    legacy = [
+        (payload.get("preference_updates", []), "preference"),
+        (payload.get("impression_updates", []), None),
+    ]
+    merged = list(updates) if isinstance(updates, list) else None
+    if merged is None:
+        raise ValueError("Invalid notes")
+    for rows, forced_kind in legacy:
+        if not rows:
+            continue
+        if not isinstance(rows, list):
+            raise ValueError("Invalid notes")
+        for row in rows:
+            if isinstance(row, dict) and forced_kind:
+                row = dict(row, kind="preference")
+            merged.append(row)
+    retained_notes = dict(state.get("notes", {}))
+    seen_notes = {
+        str(note.get("value", "")).strip()
+        for note in retained_notes.values()
+        if isinstance(note, dict)
+    }
+    touched = False
+    for item in merged[:6]:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("key"), str)
+            or not isinstance(item.get("evidence"), str)
         ):
-            raise ValueError("Invalid preference")
+            raise ValueError("Invalid note")
+        # drop 只需要 key 和原话依据，其余改动必须有 value
+        if item.get("drop") is not True and not isinstance(item.get("value"), str):
+            raise ValueError("Invalid note")
         evidence = item["evidence"].strip()
         key = item["key"].strip()[:80]
-        if key and evidence and evidence in user_text:
-            old = retained.get(key, {})
-            retained[key] = {
-                "value": item["value"][:600],
-                "evidence": evidence[:300],
-                "created_at": old.get("created_at", time.time()),
-                "updated_at": time.time(),
-                "pinned": bool(old.get("pinned", False)),
-                "source": "explicit_user",
+        value = str(item.get("value") or "").strip()[:600]
+        if not (key and evidence and evidence in user_text):
+            # 没有逐字原话依据，或原话不在本轮发言里：整条丢弃
+            continue
+        if item.get("drop") is True:
+            # 人变了或当初记错了：她可以主动删掉这一条
+            retained_notes.pop(key, None)
+            seen_notes = {
+                str(note.get("value", "")).strip()
+                for note in retained_notes.values()
+                if isinstance(note, dict)
             }
-    if preferences:
-        ordered = sorted(
-            retained.items(),
-            key=lambda pair: (
-                bool(pair[1].get("pinned")),
-                pair[1].get("updated_at", 0),
-            ),
-            reverse=True,
-        )
-        changes["preferences"] = dict(ordered[:12])
+            touched = True
+            continue
+        if not value:
+            continue
+        if key not in retained_notes and value in seen_notes:
+            # 同一个值换个 key 再记一次不带来新信息
+            continue
+        old = retained_notes.get(key, {})
+        kind = item.get("kind") if item.get("kind") in NOTE_KINDS else "fact"
+        entry = {
+            "value": value,
+            "kind": kind,
+            # 偏好来自用户明确表达，天然是已确认的；其余按模型给出的确认状态
+            "confirmed": True if kind == "preference" else item.get("confirmed") is True,
+            "evidence": evidence[:300],
+            "created_at": old.get("created_at", time.time()),
+            "updated_at": time.time(),
+            "pinned": bool(old.get("pinned", False)),
+            "source": "chat",
+        }
+        if entry["confirmed"]:
+            entry["confirmed_at"] = time.time()
+        previous = str(old.get("value", "")).strip()
+        if previous and previous != value:
+            entry["previous"] = previous[:600]
+            entry["changed_at"] = time.time()
+        retained_notes[key] = entry
+        seen_notes.add(value)
+        touched = True
+    if touched:
+        # 不设条数上限：人会变，新的说法覆盖旧的，旧的留一份做对比
+        changes["notes"] = retained_notes
     state.update(changes)
     if state.get("manual_plan"):
         state["future_task"] = state["manual_plan"]
