@@ -16,7 +16,7 @@ from .cancellations import (
 from .companion_library import sync_companion_library
 from .compiled_work import compile_chapters
 from .conditions import validate_conditions
-from .daily import usage_for
+from .daily import pool_snapshot, usage_for
 from .diagnostics import inspect_runtime
 from .library import (
     archive_library_images,
@@ -31,6 +31,8 @@ from .library_management import add_text_work, organize_work
 from .long_tasks import control_task as control_long_task
 from .long_tasks import create_task as create_long_task
 from .outbox import enqueue_work, output_chain
+from .notes import NOTE_KINDS, migrate_user_notes
+from .activity import clear as clear_activity
 from .planning import apply_plan, resolve_project
 
 
@@ -95,6 +97,8 @@ class CompanionPageAPI:
                         "umo": umo,
                         "active": umo in targets,
                         "running": umo in owner.running,
+                        # 当前用的是白天池还是夜间池、各用掉多少，供页面显示。
+                        "pool": pool_snapshot(owner, state),
                         "state": {
                             **state,
                             "work_library": [
@@ -188,6 +192,10 @@ class CompanionPageAPI:
         maximum = merged.get("frequency_max_minutes", 180)
         if minimum < 1 or maximum < minimum or maximum > 1440:
             raise ValueError("自主频率范围必须满足 1 ≤ 最短 ≤ 最长 ≤ 1440 分钟")
+        speak_min = merged.get("next_speak_min_minutes", 5)
+        speak_max = merged.get("next_speak_max_minutes", 1440)
+        if speak_min < 1 or speak_max < speak_min or speak_max > 1440:
+            raise ValueError("开口约定范围必须满足 1 ≤ 最短 ≤ 最长 ≤ 1440 分钟")
         bounds = {
             "interval_minutes": (1, 1440),
             "jitter_minutes": (0, 120),
@@ -201,6 +209,11 @@ class CompanionPageAPI:
             "history_messages": (2, 200),
             "history_chars": (1000, 100000),
             "memory_timeout_seconds": (1, 120),
+            "next_speak_min_minutes": (1, 1440),
+            "next_speak_max_minutes": (1, 1440),
+            "speak_wish_ttl_hours": (1, 168),
+            "preference_stale_days": (1, 3650),
+            "activity_half_life_days": (7, 365),
         }
         for key, (low, high) in bounds.items():
             if key in body and not low <= body[key] <= high:
@@ -257,6 +270,7 @@ class CompanionPageAPI:
         if not isinstance(umo, str) or umo not in owner.target_origins():
             raise ValueError("请先在设置中配置该对象")
         state = owner.states.setdefault(umo, owner.new_state())
+        migrate_user_notes(state)
         if action == "long_task":
             operation = body.get("operation")
             if operation == "create":
@@ -439,26 +453,90 @@ class CompanionPageAPI:
             if umo in owner.running or umo in owner.chat_tasks:
                 raise ValueError("正在执行或整理，请稍后加入成果箱")
             enqueue_work(state, body.get("id"))
-        elif action in {"preference_delete", "preference_pin"}:
+        elif action in {"note_save", "preference_save", "impression_save"}:
             if umo in owner.running or umo in owner.chat_tasks:
-                raise ValueError("正在执行或整理，请稍后修改偏好")
+                raise ValueError("正在执行或整理，请稍后修改关于你的记录")
+            key = str(body.get("key") or "").strip()[:80]
+            value = str(body.get("value") or "").strip()[:600]
+            replace_key = str(body.get("replace_key") or "").strip()[:80]
+            kind = body.get("kind")
+            if action == "preference_save":
+                kind = "preference"
+            if kind in (None, ""):
+                kind = "fact"
+            if kind not in NOTE_KINDS:
+                raise ValueError("类型只能是偏好、事实或爱好")
+            if not key or not value:
+                raise ValueError("主题和内容都不能为空")
+            notes = state.get("notes")
+            if not isinstance(notes, dict):
+                notes = {}
+                state["notes"] = notes
+            old = notes.get(replace_key or key) or {}
+            renaming = bool(replace_key) and replace_key != key and replace_key in notes
+            # 偏好只来自用户明确表达，天然是已确认的
+            confirmed = True if kind == "preference" else body.get(
+                "confirmed", old.get("confirmed", False)
+            )
+            if type(confirmed) is not bool:
+                raise ValueError("确认状态必须为布尔值")
+            pinned = body.get("pinned", old.get("pinned", False))
+            if type(pinned) is not bool:
+                raise ValueError("固定状态必须为布尔值")
+            entry = {
+                "value": value,
+                "kind": kind,
+                "confirmed": confirmed,
+                "evidence": str(body.get("evidence") or "").strip()[:300]
+                or "用户手动添加",
+                "created_at": old.get("created_at") or time.time(),
+                "updated_at": time.time(),
+                "pinned": pinned,
+                "source": "manual",
+            }
+            if confirmed:
+                entry["confirmed_at"] = time.time()
+            previous = str(old.get("value") or "").strip()
+            if previous and previous != value:
+                entry["previous"] = previous[:600]
+                entry["changed_at"] = time.time()
+            notes[key] = entry
+            if renaming:
+                notes.pop(replace_key, None)
+        elif action in {
+            "note_confirm",
+            "note_pin",
+            "note_delete",
+            "preference_pin",
+            "preference_delete",
+            "impression_confirm",
+            "impression_delete",
+        }:
+            if umo in owner.running or umo in owner.chat_tasks:
+                raise ValueError("正在执行或整理，请稍后修改关于你的记录")
             key = body.get("key")
-            prefs = state.setdefault("preferences", {})
-            if not isinstance(key, str) or key not in prefs:
-                raise ValueError("偏好不存在，请刷新")
-            if action == "preference_delete":
-                prefs.pop(key)
+            notes = state.get("notes")
+            if not isinstance(notes, dict):
+                notes = {}
+                state["notes"] = notes
+            if not isinstance(key, str) or key not in notes:
+                raise ValueError("这条记录不存在，请刷新")
+            if action.endswith("_delete"):
+                notes.pop(key)
+            elif action.endswith("_confirm"):
+                confirmed = body.get("confirmed")
+                if type(confirmed) is not bool:
+                    raise ValueError("确认状态必须为布尔值")
+                notes[key]["confirmed"] = confirmed
+                if confirmed:
+                    notes[key]["confirmed_at"] = time.time()
+                else:
+                    notes[key].pop("confirmed_at", None)
             else:
                 pinned = body.get("pinned")
                 if type(pinned) is not bool:
                     raise ValueError("固定状态必须为布尔值")
-                if (
-                    pinned
-                    and not prefs[key].get("pinned")
-                    and sum(bool(p.get("pinned")) for p in prefs.values()) >= 8
-                ):
-                    raise ValueError("最多固定8项，请先取消固定一项")
-                prefs[key]["pinned"] = pinned
+                notes[key]["pinned"] = pinned
         elif action == "pending_message_discard":
             if umo in owner.running or umo in owner.chat_tasks:
                 raise ValueError("正在执行或整理，请稍候再丢弃")
@@ -479,6 +557,18 @@ class CompanionPageAPI:
                     if state.get("pause_mode") == "all"
                     else 0,
                 )
+        elif action == "activity_note":
+            if umo in owner.running or umo in owner.chat_tasks:
+                raise ValueError("正在执行或整理，请稍后修改作息备注")
+            entry = state.get("activity")
+            if not isinstance(entry, dict):
+                entry = {}
+            entry["note"] = str(body.get("note") or "").strip()[:160]
+            state["activity"] = entry
+        elif action == "activity_reset":
+            if umo in owner.running or umo in owner.chat_tasks:
+                raise ValueError("正在执行或整理，请稍后清空活跃统计")
+            clear_activity(state)
         elif action == "appointment_status":
             status = body.get("status")
             if status not in {"resolved", "cancelled"}:
@@ -519,6 +609,10 @@ class CompanionPageAPI:
                 if umo in owner.running:
                     owner.running[umo].cancel()
                 state["next_due"] = state["pause_until"]
+                if state.get("next_speak_at", 0):
+                    state["next_speak_at"] = max(
+                        state["next_speak_at"], state["pause_until"]
+                    )
                 state.update(next_task="", window_end=0, window_admitted=False)
         elif action == "resume":
             state.update(pause_until=0, pause_mode="", next_due=time.time() + 30)
