@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>我只在乎你</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./common.js" defer></script>
+  <script src="./dialogs.js" defer></script>
+  <script src="./gallery.js" defer></script>
+  <script src="./plans.js" defer></script>
+  <script src="./library.js" defer></script>
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <aside class="rail">
+      <div class="brand">
+        <span class="brand-mark">你</span>
+        <div>
+          <h1>我只在乎你</h1>
+          <p>自主陪伴 · 控制台</p>
+        </div>
+      </div>
+
+      <nav class="tabs" role="tablist" aria-label="页面导航">
+        <button class="tab active" data-tab="overview" role="tab" aria-selected="true" type="button">
+          <span class="tab-index">01</span>
+          <span class="tab-body">
+            <span class="tab-label">总览</span>
+            <span class="tab-hint">她现在是什么状态</span>
+          </span>
+        </button>
+        <button class="tab" data-tab="plans" role="tab" aria-selected="false" type="button">
+          <span class="tab-index">02</span>
+          <span class="tab-body">
+            <span class="tab-label">行为与计划</span>
+            <span class="tab-hint">她下一步想做什么</span>
+          </span>
+        </button>
+        <button class="tab" data-tab="works" role="tab" aria-selected="false" type="button">
+          <span class="tab-index">03</span>
+          <span class="tab-body">
+            <span class="tab-label">作品库</span>
+            <span class="tab-hint">她做出来的东西</span>
+          </span>
+        </button>
+        <button class="tab" data-tab="activity" role="tab" aria-selected="false" type="button">
+          <span class="tab-index">04</span>
+          <span class="tab-body">
+            <span class="tab-label">行动记录</span>
+            <span class="tab-hint">每一轮为什么这样做</span>
+          </span>
+        </button>
+        <button class="tab" data-tab="settings" role="tab" aria-selected="false" type="button">
+          <span class="tab-index">05</span>
+          <span class="tab-body">
+            <span class="tab-label">设置</span>
+            <span class="tab-hint">对象、节奏与预算</span>
+          </span>
+        </button>
+      </nav>
+
+      <div class="rail-foot">
+        <span>全部数据来自本机 AstrBot</span>
+        <span>我只在乎你 · 1.12</span>
+      </div>
+    </aside>
+
+    <div class="shell">
+      <header class="topbar">
+        <div class="topbar-meta"><span id="updated">等待首次更新</span></div>
+        <div class="topbar-actions">
+          <span id="live" class="pill">连接中</span>
+          <button id="refresh" class="btn-ghost btn-small" type="button">刷新</button>
+        </div>
+      </header>
+
+      <div id="notice" class="notice" hidden>
+        <span id="notice-text"></span>
+        <button id="notice-close" class="btn-ghost btn-small" type="button">关闭</button>
+      </div>
+
+      <main>
+        <section id="overview" class="view">
+          <div class="view-head">
+            <div>
+              <span class="eyebrow">01 / 状态</span>
+              <h2>总览</h2>
+              <p class="lead">她能不能主动、下一次什么时候判断、自己约了几点开口，以及今天的预算还剩多少——先看这一页。</p>
+            </div>
+          </div>
+
+          <div id="metrics" class="stats">
+            <div class="stat"><span class="stat-icon skeleton" style="width:34px;height:34px"></span><div class="grow"><b class="skeleton" style="display:block;width:48px;height:22px"></b><span class="skeleton" style="display:block;width:64px;height:12px;margin-top:6px"></span></div></div>
+            <div class="stat"><span class="stat-icon skeleton" style="width:34px;height:34px"></span><div class="grow"><b class="skeleton" style="display:block;width:48px;height:22px"></b><span class="skeleton" style="display:block;width:64px;height:12px;margin-top:6px"></span></div></div>
+            <div class="stat"><span class="stat-icon skeleton" style="width:34px;height:34px"></span><div class="grow"><b class="skeleton" style="display:block;width:48px;height:22px"></b><span class="skeleton" style="display:block;width:64px;height:12px;margin-top:6px"></span></div></div>
+            <div class="stat"><span class="stat-icon skeleton" style="width:34px;height:34px"></span><div class="grow"><b class="skeleton" style="display:block;width:48px;height:22px"></b><span class="skeleton" style="display:block;width:64px;height:12px;margin-top:6px"></span></div></div>
+            <div class="stat"><span class="stat-icon skeleton" style="width:34px;height:34px"></span><div class="grow"><b class="skeleton" style="display:block;width:48px;height:22px"></b><span class="skeleton" style="display:block;width:64px;height:12px;margin-top:6px"></span></div></div>
+          </div>
+
+          <div class="group-head"><h3>陪伴对象</h3><p class="hint">一个对象一行：状态、下次判断、她自己约的开口时间、心里存着的话。</p></div>
+          <section class="panel">
+            <div class="panel-head">
+              <div><h2>对象列表</h2><p class="hint">点“立即判断”可让她马上跑一轮；想加人或改配置去设置页。</p></div>
+              <button id="open-settings" class="btn-ghost btn-small" type="button">管理对象</button>
+            </div>
+            <div id="sessions" class="list"></div>
+          </section>
+
+          <div class="group-head"><h3>今日用量</h3><p class="hint">每日预算是每个对象独立计算的保护阈值，暂停则完全停下。</p></div>
+          <section class="panel">
+            <div class="panel-head">
+              <div><h2>今日与免打扰</h2><p class="hint">判断次数、执行回合、工具与发送尝试的消耗情况。</p></div>
+              <label class="inline-field">对象<select id="overview-target"></select></label>
+            </div>
+            <div id="usage" class="panel-body stack"></div>
+          </section>
+
+          <details class="panel">
+            <summary><span>运行自检</span><span class="hint">平台、会话、人格与模型配置</span></summary>
+            <div class="panel-body stack">
+              <p class="hint">只做只读检查，不发起模型请求，也不会发消息。</p>
+              <div class="actions"><button id="diagnose" type="button">开始自检</button></div>
+              <div id="diagnostics-result" class="stack"></div>
+            </div>
+          </details>
+        </section>
+
+        <section id="plans" class="view" hidden>
+          <div class="view-head">
+            <div>
+              <span class="eyebrow">02 / 行为</span>
+              <h2>行为与计划</h2>
+              <p class="lead">她正在推进什么、下一步想做什么，以及她凭什么这样安排自己的节奏——包括自己约定的开口时间和心里存着的话。</p>
+            </div>
+            <label class="inline-field">对象<select id="plans-target"></select></label>
+          </div>
+          <div id="plans-content" class="stack"></div>
+        </section>
+
+        <section id="works" class="view" hidden>
+          <div class="view-head">
+            <div>
+              <span class="eyebrow">03 / 成果</span>
+              <h2>作品库</h2>
+              <p class="lead">她写作、画画、整理的成果。列表只算元信息，点开某一条才读取图片或正文。</p>
+            </div>
+            <label class="inline-field">对象<select id="works-target"></select></label>
+          </div>
+          <div id="work-filters" class="toolbar"></div>
+          <div id="works-content" class="stack"></div>
+        </section>
+
+        <section id="activity" class="view" hidden>
+          <div class="view-head">
+            <div>
+              <span class="eyebrow">04 / 追踪</span>
+              <h2>行动记录</h2>
+              <p class="lead">每一轮的触发来源、判断依据、实际结果和没发出去的原因。她为什么沉默，也能在这里查到。</p>
+            </div>
+            <label class="inline-field">对象<select id="activity-target"></select></label>
+          </div>
+          <div id="activity-content" class="stack"></div>
+        </section>
+
+        <section id="settings" class="view" hidden>
+          <div class="view-head">
+            <div>
+              <span class="eyebrow">05 / 配置</span>
+              <h2>设置</h2>
+              <p class="lead">填好对象 QQ 号并保存就会持续运行。下面按用途分组，改动保存后立即生效，不需要重启。</p>
+            </div>
+            <button id="save-settings" class="btn-primary" form="config-form" type="submit">保存设置</button>
+          </div>
+          <form id="config-form"><div id="config-fields"></div></form>
+        </section>
+      </main>
+
+      <footer>
+        <span>本页面只读展示与有限操作，不接管 AstrBot 其他功能。</span>
+        <span>版本 1.12</span>
+      </footer>
+    </div>
+  </div>
+</body>
+</html>
