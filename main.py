@@ -4,7 +4,9 @@ import asyncio
 import copy
 import json
 import math
+import os
 import random
+import re
 import time
 import uuid
 from datetime import datetime
@@ -15,6 +17,7 @@ from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.agent.tool import FunctionTool, ToolSet
+from astrbot.core.astr_agent_hooks import MAIN_AGENT_HOOKS
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 from astrbot.core.cron.events import CronMessageEvent
 from astrbot.core.message.message_event_result import MessageChain
@@ -24,6 +27,11 @@ from astrbot.core.platform.platform import PlatformStatus
 from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star import star_map
 
+from .action_context import action_memory_summary, recent_action_context
+from .action_digest import action_digest
+from .activity import clear as clear_activity
+from .activity import record as record_activity
+from .activity import summary as activity_summary
 from .artifacts import SendArtifactTool, register_artifacts
 from .cancellations import (
     cancel_from_user_text,
@@ -42,11 +50,16 @@ from .compiled_work import compile_chapters
 from .conditions import refresh_conditions
 from .daily import (
     active_budget_override,
+    count,
     exhausted,
     next_day,
+    night_end_timestamp,
+    night_pool_key,
+    pool_snapshot,
     retain_outputs,
     usage_for,
 )
+from .morning import build_digest, digest_text, fallback_text, report_due
 from .dialogue_context import dispatched_context, remember_dispatch
 from .dsh_worker import DSHWorker
 from .execution_proof import (
@@ -57,6 +70,13 @@ from .execution_proof import (
     required_action,
     validate_contract,
 )
+from .file_tools import Workspace
+from .file_tools import list_dir as local_list_dir
+from .file_tools import read_file as local_read_file
+from .file_tools import run_command as local_run_command
+from .file_tools import search_files as local_search_files
+from .file_tools import write_file as local_write_file
+from .guard import guard_external_result, is_external_tool
 from .library import (
     archive_library_images,
     backfill_library,
@@ -70,6 +90,7 @@ from .long_tasks import create_task as create_long_task
 from .long_tasks import due_task, recover_tasks
 from .long_tasks import run_task as run_long_task
 from .mcp_recovery import recover_template_tools
+from .notes import NOTE_KIND_LABELS, NOTE_KINDS, migrate_user_notes, note_kind
 from .message_segments import split_proactive_text
 from .page_api import CompanionPageAPI
 from .planning import (
@@ -84,6 +105,57 @@ from .skill_context import load_skill_context
 from .task_control import cancel_tasks, pending_tasks
 from .works import SaveWorkTool
 
+# ============================== 依赖的私有约定 ==============================
+# 这一段不是功能代码，是给以后改它的人（包括我）留下的说明：下面这些东西
+# 没有公开文档保证，全靠读源码对出来的。框架升级后如果行为变了，先查这里。
+#
+# 1. 合成事件
+#    AutonomousEvent(CronMessageEvent) 是自称的事件类型，靠 prepare() 手工填
+#    message_obj / platform_meta / sender。事件上 set_extra("autonomous_companion")
+#    是本插件自己的记号，只有本插件认。
+#
+# 2. 生态记号（别的插件认的）
+#    _is_active_chat_synthetic / _active_chat_target_uid 来自
+#    astrbot_plugin_favour_ultra/main.py 里“合成事件塞回事件队列”的做法。
+#    好感度插件用它来判断“只注入数据、不在这一轮结算”。
+#
+# 3. 原生通知器
+#    MAIN_AGENT_HOOKS（astrbot.core.astr_agent_hooks）是框架给主 Agent 用的
+#    钩子对象，它把 on_agent_begin / on_llm_response / on_using_llm_tool /
+#    on_llm_tool_respond / on_agent_done 转成事件钩子派发给所有插件。
+#    tool_loop_agent(agent_hooks=...) 不传就退回空对象，谁都不会收到通知。
+#
+# 4. 钩子一轮只响一次的原因
+#    tool_loop_agent_runner 里只有“没有工具调用”的最终回复才会走
+#    _complete_with_assistant_response()，那是唯一派发 on_agent_done 的地方；
+#    带工具调用的中间轮不派发。所以 expose_only_visible_text 拿到的必然是
+#    最终那份回复，也就能安全地改写 completion_text。
+#
+# 5. 自己挂的属性
+#    response.autonomous_original_text 是本插件挂上去的（LLMResponse 是
+#    dataclass，允许动态属性）。钩子改写正文后，control_output 优先读它；
+#    没有它才读 completion_text。事件上同样的内容存在
+#    extra["autonomous_original_text"]，便于其他钩子取用。
+#
+# 6. 回执字段
+#    event.action_receipts 每项：tool / status / call_key / args / result。
+#    status 由 execution_proof.receipt_status 判定，取值见 action_digest.STATUS_WORDS。
+#    args 只给提示词里的“做过什么”用，去重仍然只看 call_key。
+#
+# 7. 钩子优先级
+#    expose_only_visible_text 用 1000001：必须高于 show_model(1000000) 和
+#    shutup / turn_budget(10000)，因为它们会改写或清空正文；低于它们就会被
+#    别人先改一遍。
+#
+# 8. 出问题怎么查
+#    · 想确认是不是这套改动引起的：把 expose_plugin_hooks 关掉重载，行为回到
+#      改造前（事件不再广播、正文不再改写）。
+#    · 日志里搜“[autonomous]”看本机任务是否被红线拦下、快照是否失败。
+#    · 钩子不生效先看 call_event_hook 是不是被前一个 handler 的
+#      event.stop_event() 掐断（它按优先级顺序执行，被停则后面的不再跑）。
+# ===========================================================================
+
+
 DECISION_PROMPT = """这是一次自主唤醒，不是用户刚发来的消息。保持当前人格。
 根据真实近期对话、长期记忆、最近主动记录和未完成事项，自行选择：
 chat（聊天）、create（创作）、tools（工具行动）、silent（本次沉默）。
@@ -93,6 +165,11 @@ chat（聊天）、create（创作）、tools（工具行动）、silent（本�
 若存在待续目标或未完成项目，先考虑是否有不依赖用户的新进展可做，再决定继续或结束；
 连续表达可以是新的想法、补充、成果，不必每轮都向用户提问，也不要简单重复上一条。
 如果用户手动计划写着连续主动，应在窗口预算内考虑 chat，而不是自动等待新入站消息。
+若上下文标注已到你自己约定的开口时间，本轮默认开口说话（chat 或分享成果）；确实无话可说才 silent，并在 reason 说明为何改变主意。
+心里存着还没说出口的话时，要么本轮说出来，要么明确放下（speak_wish_clear）；一直挂着不提，比说错更不像你自己。
+关于用户的记录分三类用法：偏好是硬约束，开口时间、话题和语气都要绕开用户明确说过不喜欢的方式；
+事实与爱好只用来挑话题、理解用户，不要逐条复述成清单；标着"还没确认"的只当猜测，不要当成用户说过的事实说出口。
+用户活跃时间只用来挑时机：她基本不在的时段默认不要主动，你约好的时间与最近一条消息优先于统计；样本不足时不要假装知道她的作息。
 ComfyUI 等工具当前是否可用只能由本轮实际工具返回确认；过去失败不等于现在仍关闭。
 依赖工具确实暂不可用时，可以选择其他有价值的聊天或创作，不必停止所有主动。
 只输出一个 JSON 对象，不要代码围栏：
@@ -120,11 +197,62 @@ DELIVERY_TOOL_MARKERS = (
     "send_artifact",
 )
 
-TOOL_WORK_CLOSING_PROMPT = """你仍是同一个角色，刚在自己的时间里动手做完了这件事，现在跟这个人说话，不执行任务，不输出JSON。
-像和熟悉的人聊天，把真实结果自然说给他听，可以有自己的一点感受、评价或想继续做的事。
-只讲记录里实际发生的事，不编造体验、成功、用户已收到或新动作；没说清的部分就不说。
-不要说核验、契约、凭据、步骤、工具、任务ID等内部术语，不写流程和清单，不汇报“任务已完成”。
-一两句到三句就够，不要机械开头，不要每次重新称呼，不加客套尾巴。"""
+TOOL_WORK_CLOSING_PROMPT = """你刚在自己的时间里做完一件事，现在照平时的语气跟他说一句，不执行任务，不输出JSON。
+说人话，不要汇报，也不要列步骤。做成了就顺口提一下结果；没做成也别装没事，说一句卡在哪。可以带你自己的反应、吐槽或下一步。
+别只丢一句气氛话，结果顺口带一下；放在哪句都行，不用按顺序，也不用解释内部原因。
+一两句就够，别每次都重新称呼，别用“任务、核验、凭据、工具、投递”这些词，也别写“任务已完成”。"""
+
+# One-sided sleep/absence claims are not evidence about the user's state.
+# Genuine questions ("你睡了吗？") and caring imperatives ("你睡吧") stay intact.
+STATE_CLAIM_GUARD_PROMPT = """你是主动消息发送前的“用户状态断言”检查器。你不改角色口吻，只处理没有依据的用户状态推断。
+你会收到 JSON：draft 是待发送正文，latest_user_message 是用户本轮唯一原话。
+检查 draft 是否断言用户当前醒着/睡着、在忙/有空、在看手机/回消息、在哪里/是否出门、在做什么、心情/身体如何、是否想理你/为什么没回。
+latest_user_message 没明确提到的用户状态，都算没有依据。没有依据就删掉该断言，或改成真正的问句；不要保留“你应该/大概/肯定/还在……”这类猜测。
+只输出 JSON：{"text":"清理后的正文","claims":["被删或改写的短句"]}
+规则：
+- 只处理用户状态断言；其他内容、语气、事实不动。
+- 保留真正的问句、假设（要是/如果）、引用用户原话、以及你自己的状态。
+- 没有任何断言时 claims 为空，text 返回 draft 原文。
+- 不解释，不加 markdown。
+"""
+_STATE_CLAIM_REWRITES = (
+    ("等你醒了再说", "等你方便再说"),
+    ("等你睡醒再说", "等你方便再说"),
+    ("等你醒了", "等你方便"),
+    ("等你睡醒", "等你方便"),
+    ("你醒了再说", "回头再说"),
+    ("睡醒了再说", "回头再说"),
+)
+_STATE_CLAIM_PATTERNS = (
+    # Already-asleep assertions: 睡了 / 睡着了 / 大概睡了吧
+    (re.compile(r"你(?:还|还都|应该|大概|肯定|估计)?(?:在)?睡(?:着)?了吧(?!？|\?)"), ""),
+    # Still asleep: 还在睡 / 还在睡吧; questions keep 吗/么/？
+    (re.compile(r"你(?:还|还都|都)?在睡(?:着)?(?:吧)?(?!吗|么|吧?[？?])"), ""),
+    # Not awake: 还没醒 / 还没睡醒; questions keep 吗/么/？
+    (re.compile(r"你(?:还|还都|都)?没(?:有)?(?:睡)?醒(?!吗|么|？|\?)"), ""),
+    # Bare assertions; questions keep 吗/么/没/？, and 吧？ stays a question.
+    (re.compile(r"你睡着了(?![吗么没？?吧])"), ""),
+    (re.compile(r"你睡了(?![吗么没？?吧])"), ""),
+    (re.compile(r"睡醒(?:了)?再说"), "回头再说"),
+    (re.compile(r"等你(?:睡)?醒(?!吗|么|？|\?)"), "等你方便"),
+)
+
+
+def _sanitize_user_state_claims(text: str) -> str:
+    """Remove assumptions that the user is asleep or absent."""
+    cleaned = str(text or "")
+    for old, new in _STATE_CLAIM_REWRITES:
+        cleaned = cleaned.replace(old, new)
+    for pattern, new in _STATE_CLAIM_PATTERNS:
+        cleaned = pattern.sub(new, cleaned)
+    cleaned = cleaned.lstrip("，,、 \n\t")
+    cleaned = re.sub(r"^[呢啊哦呀吧嘛]+(?=[，,。！？!?\s]|$)", "", cleaned)
+    cleaned = cleaned.lstrip("，,、。！？!? \n\t")
+    cleaned = cleaned.replace("，，", "，").replace("，,", "，").replace("，。", "。")
+    cleaned = re.sub(r"[，,]\s*(?=[，,。！？!?])", "", cleaned)
+    if cleaned.rstrip("。！？!?，, \n\t呢啊哦呀吧嘛") == "我看":
+        cleaned = "我先不打扰你。"
+    return cleaned
 
 
 def _delivery_tool_names(config: dict | None) -> set[str]:
@@ -189,6 +317,7 @@ def silent_work_receipts(receipts, delivery_tools) -> list[dict]:
             "pending",
             "unverified",
             "failed",
+            "interrupted",
         }
         and not is_delivery_tool(receipt.get("tool", ""), delivery_tools)
     ]
@@ -205,6 +334,7 @@ message 是你真正想对这个人说的话，不是给系统的任务报告；
 不强行撒娇、套昵称、反问“你喜欢吗”、索要回应；这些只在当前人格和语境自然支持时使用。
 没有明确新信息就简短，不写流程、清单、检查步骤；失败只说与用户有关的实际影响，把诊断放 summary。
 不要把工具调用提示当作收尾，不要宣称用户已收到或已读；受阻时如实说明。
+工具执行失败或被中断时，若还有其他可用工具可换一种方式继续；若无法完成，message 如实告知用户失败或受阻，不要无声结束。
 创作正文需要保存时调用 autonomous_save_work，传入完整正文；只有收到 saved=true 的真实回执才能说已保存。
 写进 summary、progress 或 artifact 不会创建作品文件；陪伴作品库是否同步以保存工具返回的 companion.saved 为准。
 {"message":"本轮要发给用户的自然文本，留空表示不发送", "summary":"实际完成、失败或待办的简短记录",
@@ -260,6 +390,41 @@ def parse_object(text: str) -> dict[str, Any]:
     return value
 
 
+CONTROL_MARKERS = (
+    "action",
+    "message",
+    "summary",
+    "mode",
+    "steps",
+    "blocked_reason",
+    "continue_after_seconds",
+    "next_task",
+)
+
+
+def visible_control_text(text: str) -> str | None:
+    """Return only the human-visible sentence of an autonomous control payload.
+
+    The parse is local and synchronous on purpose: it must never call a model or
+    raise inside a hook. Anything that is not recognisably a control object
+    returns None so the caller keeps the original text untouched.
+
+    Args:
+        text: Model completion text, possibly fenced or wrapped in prose.
+
+    Returns:
+        The visible sentence (possibly empty), or None when text is ordinary prose.
+    """
+    try:
+        parsed = parse_object(text)
+    except ValueError:
+        return None
+    if not any(key in parsed for key in CONTROL_MARKERS):
+        return None
+    message = parsed.get("message")
+    return message.strip() if isinstance(message, str) else ""
+
+
 class AutonomousEvent(CronMessageEvent):
     """Route tool messages through the same stale-turn and history checks."""
 
@@ -277,6 +442,9 @@ class BudgetTool(FunctionTool):
         self.wrapped = tool
         self.event = event
         self.handler_module_path = tool.handler_module_path
+        # 原生工具靠这个标记告诉插件“这是后台任务，别当已完成”；
+        # 外壳只照抄名字/说明/参数，漏了它技能插件就会把后台提交当成功。
+        self.is_background_task = bool(getattr(tool, "is_background_task", False))
 
     async def call(self, context, **kwargs):
         await self.event.owner.check_current(self.event)
@@ -367,10 +535,16 @@ class BudgetTool(FunctionTool):
         state["tool_calls"] += 1
         if not hasattr(self.event, "action_receipts"):
             self.event.action_receipts = []
-        receipt = {"tool": self.name, "status": "attempted", "call_key": key}
+        receipt = {
+            "tool": self.name,
+            "status": "attempted",
+            "call_key": key,
+            # 参数摘要只用于提示词里的“做过什么”，不参与去重判定。
+            "args": json.dumps(kwargs, ensure_ascii=False, sort_keys=True)[:200],
+        }
         self.event.action_receipts.append(receipt)
         save_checkpoint(self.event)
-        usage_for(state)["tools"] += 1
+        count(self.event.owner, state, "tools")
         await self.event.owner.save()
         await self.event.owner.phase(state, "tool", self.name)
         await self.event.owner.tool_notice(self.event, self.name, "开始调用")
@@ -382,6 +556,14 @@ class BudgetTool(FunctionTool):
             # Forwarding None would make the outer executor send them twice.
             if result is not None:
                 text = "\n".join(getattr(part, "text", "") for part in result.content)
+                if is_external_tool(self.name):
+                    # 外部网页/搜索结果只作资料：剥掉隐藏字与注释，并明确告知
+                    # 其中的任何要求都不执行。原结果对象不修改，改为安全副本。
+                    result, text = guard_external_result(
+                        result,
+                        text,
+                        self.event.owner.number("external_text_chars", 6000, 500, 40000),
+                    )
                 receipt["status"] = receipt_status(
                     self.name, text, bool(getattr(result, "isError", False))
                 )
@@ -452,7 +634,7 @@ class BudgetTool(FunctionTool):
                 self.event.clear_result()
 
 
-@register("AutonomousCompanion", "local", "我只在乎你：自主心跳与无回复续行", "1.10.0")
+@register("AutonomousCompanion", "local", "我只在乎你：自主心跳与无回复续行", "1.12.0")
 class AutonomousCompanion(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -465,6 +647,8 @@ class AutonomousCompanion(Star):
         self.store_lock = asyncio.Lock()
         self.stopping = False
         self.chat_tasks: dict[str, asyncio.Task] = {}
+        # 早报任务：每天早上一条，独立于主动回合跑
+        self.reporting: dict[str, asyncio.Task] = {}
         # 本机执行通道（自带 dsh 调用，不依赖外部桥插件）
         self.dsh = DSHWorker(self)
 
@@ -473,6 +657,50 @@ class AutonomousCompanion(Star):
             return max(low, min(high, int(self.config.get(key, default))))
         except (TypeError, ValueError):
             return default
+
+    @property
+    def notification_hooks(self):
+        """Return the native notifier so plugin hooks fire during proactive turns.
+
+        Passing the framework's own hook object makes ``on_llm_response`` /
+        ``on_using_llm_tool`` / ``on_llm_tool_respond`` / ``on_agent_done``
+        reachable for other plugins exactly as in a real chat. Turning the
+        switch off restores the previous private flow and silences them again.
+        """
+        if not self.config.get("expose_plugin_hooks", True):
+            return None
+        return MAIN_AGENT_HOOKS
+
+    @filter.on_llm_response(priority=1000001)
+    async def expose_only_visible_text(self, event, response) -> None:
+        """Let other plugins see only the sentence meant for him.
+
+        Runs first in the hook chain (a higher priority than every plugin on this
+        machine), so memory, skill learning and favour all observe real words
+        instead of the control payload. The payload is retained on the response
+        and the event for our own parser. Never calls a model, never raises: an
+        unrecognised completion is passed through untouched.
+
+        Args:
+            event: Message event, synthetic during proactive turns.
+            response: Final model response of the tool loop.
+        """
+        if not self.config.get("expose_plugin_hooks", True):
+            return
+        if not event.get_extra("autonomous_companion"):
+            return
+        original = getattr(response, "completion_text", "") or ""
+        if not original.strip():
+            return
+        visible = visible_control_text(original)
+        if visible is None:
+            return
+        try:
+            response.autonomous_original_text = original
+            response.completion_text = visible
+            event.set_extra("autonomous_original_text", original)
+        except Exception:
+            return
 
     async def control_output(self, response, provider, kind):
         """Repair malformed control output once without replaying tools.
@@ -485,7 +713,13 @@ class AutonomousCompanion(Star):
         Returns:
             Parsed control object with execution text preserved when needed.
         """
-        text = response.completion_text or ""
+        # 通知钩子会把 completion_text 改写成台词，控制原文留在 autonomous_original_text；
+        # 这里必须优先读原文，否则会解析失败并白跑一次“修复格式”的模型调用。
+        text = (
+            getattr(response, "autonomous_original_text", "")
+            or getattr(response, "completion_text", "")
+            or ""
+        )
         try:
             return parse_object(text)
         except ValueError:
@@ -615,6 +849,323 @@ class AutonomousCompanion(Star):
         if state.get("pause_mode") == "all":
             state["next_due"] = max(state["next_due"], state.get("pause_until", 0))
 
+    def wake_at(self, state) -> float:
+        """Earliest wake: regular judgment or a self-committed opening.
+
+        Args:
+            state: Target state.
+
+        Returns:
+            Unix timestamp of the next scheduler wake.
+        """
+        due = state.get("next_due", 0)
+        if not due:
+            # 0/None means "wake as soon as possible"; a future opening
+            # commitment must never postpone an immediate wake request.
+            return 0
+        speak = state.get("next_speak_at", 0)
+        if speak and speak < due:
+            return speak
+        return due
+
+    def update_speak_commitment(self, state, payload):
+        """Persist an optional model-committed next opening time.
+
+        Args:
+            state: Target state.
+            payload: Control output containing next_speak_minutes and its reason.
+
+        Returns:
+            None. An unusable value is ignored and journaled instead of raised:
+            this optional hint must never abort a round before its produced
+            reply is delivered.
+        """
+        if not self.config.get("self_scheduled_speak", True):
+            return
+        if "next_speak_minutes" not in payload:
+            return
+        delay = payload["next_speak_minutes"]
+        if isinstance(delay, str):
+            try:
+                delay = float(delay.strip())
+            except ValueError:
+                delay = None
+        if (
+            delay is None
+            or isinstance(delay, bool)
+            or not isinstance(delay, (int, float))
+            or not math.isfinite(delay)
+        ):
+            state["speak_ignored_reason"] = "开口约定分钟数无法识别，本轮已忽略"
+            self.journal(
+                state,
+                "speak_ignored",
+                "开口约定无法识别，本轮忽略："
+                + str(payload.get("next_speak_minutes"))[:80],
+            )
+            return
+        state["speak_ignored_reason"] = ""
+        if delay == 0:
+            if state.get("next_speak_at", 0):
+                state.pop("next_speak_at", None)
+                state.pop("next_speak_reason", None)
+                self.journal(state, "speak_cancelled", "已取消自己约定的开口时间")
+            return
+        low = self.number("next_speak_min_minutes", 5, 1, 1440)
+        high = max(low, self.number("next_speak_max_minutes", 1440, 1, 1440))
+        minutes = max(low, min(high, delay))
+        reason = str(payload.get("next_speak_reason") or "").strip()[:500]
+        state["next_speak_at"] = time.time() + minutes * 60
+        state["next_speak_reason"] = reason
+        state["next_speak_set_at"] = time.time()
+        if state.get("pause_mode") == "all":
+            state["next_speak_at"] = max(
+                state["next_speak_at"], state.get("pause_until", 0)
+            )
+        self.journal(
+            state,
+            "speak_scheduled",
+            f"自己约定约 {minutes:.0f} 分钟后开口：" + (reason or "未说明原因"),
+        )
+
+    def consume_speak_commitment(self, state) -> str:
+        """Pop a due self-committed opening and return its recorded reason.
+
+        Args:
+            state: Target state.
+
+        Returns:
+            The commitment reason, or "" when none is due.
+        """
+        due_at = state.get("next_speak_at", 0)
+        if not due_at:
+            return ""
+        if not self.config.get("self_scheduled_speak", True):
+            state.pop("next_speak_at", None)
+            state.pop("next_speak_reason", None)
+            self.journal(
+                state, "speak_dropped", "自己约定开口已在配置中关闭，丢弃待生效约定"
+            )
+            return ""
+        if time.time() < due_at:
+            return ""
+        reason = str(state.pop("next_speak_reason", "")).strip()[:500]
+        state.pop("next_speak_at", None)
+        state["last_speak_commitment"] = {
+            "reason": reason,
+            "due_at": due_at,
+            "consumed_at": time.time(),
+        }
+        self.journal(
+            state, "speak_due", "已到自己约定的开口时间：" + (reason or "未说明原因")
+        )
+        # 返回空串会让这一轮看起来像普通唤醒，约定就被悄悄吞掉：即使模型当时
+        # 没写原因，也要给出非空标记，让提示词和界面都知道这是她自己约的时刻。
+        return reason or "当时没写原因，只约了这个时间"
+
+    def speak_wish_text(self, state) -> str:
+        """Return the note about something she still wants to say.
+
+        Args:
+            state: Target state.
+
+        Returns:
+            The held note, or "" when she has nothing pending.
+        """
+        return str(state.get("speak_wish") or "").strip()
+
+    def clear_speak_wish(self, state, action: str, summary: str) -> None:
+        """Drop the held note and journal why it no longer applies.
+
+        Args:
+            state: Target state.
+            action: Journal action name.
+            summary: Short explanation for the journal.
+        """
+        text = self.speak_wish_text(state)
+        if not text:
+            return
+        for key in ("speak_wish", "speak_wish_at", "speak_wish_kept", "speak_wish_kept_at"):
+            state.pop(key, None)
+        state["speak_wish_cleared_at"] = time.time()
+        self.journal(state, action, summary + "：" + text[:200])
+
+    def update_speak_wish(self, state, payload):
+        """Record, keep or drop the thing she currently wants to say.
+
+        The note is not a schedule: it is what she keeps in mind between
+        rounds, so a later round can decide whether and when to say it.
+
+        Args:
+            state: Target state.
+            payload: Control output that may carry speak_wish / speak_wish_clear.
+        """
+        if not self.config.get("self_scheduled_speak", True):
+            return
+        if payload.get("speak_wish_clear") is True:
+            self.clear_speak_wish(state, "wish_cleared", "她放下这句话，决定不说了")
+        wish = payload.get("speak_wish")
+        if wish is None:
+            return
+        text = str(wish).strip()[:300]
+        if not text:
+            self.clear_speak_wish(state, "wish_cleared", "她放下这句话")
+            return
+        if text == self.speak_wish_text(state):
+            # 同一轮里决策和行动都可能复述这句话，只有跨轮才计一次搁置。
+            if time.time() - (state.get("speak_wish_kept_at") or 0) >= 60:
+                state["speak_wish_kept"] = int(state.get("speak_wish_kept", 0) or 0) + 1
+                state["speak_wish_kept_at"] = time.time()
+            return
+        state["speak_wish"] = text
+        state["speak_wish_at"] = time.time()
+        state["speak_wish_kept"] = 0
+        state["speak_wish_kept_at"] = time.time()
+        self.journal(state, "wish_kept", "心里记下一句想说的话：" + text[:200])
+
+    def expire_speak_wish(self, state) -> None:
+        """Fade a note held for too long so it never nags forever.
+
+        Args:
+            state: Target state.
+        """
+        at = state.get("speak_wish_at") or 0
+        if not self.speak_wish_text(state) or not at:
+            return
+        hours = self.number("speak_wish_ttl_hours", 24, 1, 168)
+        if time.time() - at >= hours * 3600:
+            self.clear_speak_wish(
+                state, "wish_faded", f"这句话放了 {hours} 小时，念头淡了"
+            )
+
+    def user_notes_context(self, state) -> str:
+        """Render the merged preference and impression list as prompt lines.
+
+        Preferences constrain how she is allowed to behave; facts and interests
+        only help her pick topics. Unconfirmed rows stay in their own block so
+        they are never stated as if the user had said them.
+
+        Args:
+            state: Target state.
+
+        Returns:
+            A prompt block describing what she knows about the user.
+        """
+        notes = state.get("notes")
+        if not isinstance(notes, dict):
+            notes = {}
+        rows = []
+        for key, item in notes.items():
+            if not isinstance(item, dict):
+                continue
+            value = str(item.get("value") or "").strip()
+            if not value:
+                continue
+            rows.append((str(key)[:80], item, value))
+        if not rows:
+            return "关于用户：暂无记录。不要编造用户的偏好、经历、喜好或身份。\n"
+        days = self.number("preference_stale_days", 90, 1, 3650)
+        rows.sort(
+            key=lambda row: (bool(row[1].get("pinned")), row[1].get("updated_at") or 0),
+            reverse=True,
+        )
+        budget = 4000
+        used = omitted = 0
+        preference, known, pending = [], [], []
+        for key, item, value in rows:
+            kind = note_kind(item)
+            line = f"- {key}（{NOTE_KIND_LABELS[kind]}）：{value[:200]}"
+            if item.get("previous"):
+                line += f"（之前的说法：{str(item['previous'])[:60]}）"
+            updated = item.get("updated_at") or 0
+            if (
+                kind == "preference"
+                and updated
+                and not item.get("pinned")
+                and time.time() - updated > days * 86400
+            ):
+                line += f"（{days} 天未更新，可能过时，必要时再确认）"
+            if used + len(line) > budget:
+                omitted += 1
+                continue
+            used += len(line) + 1
+            if kind == "preference":
+                preference.append(line)
+            elif item.get("confirmed"):
+                known.append(line)
+            else:
+                pending.append(line)
+        block = (
+            "关于用户（她知道的事，用来理解用户、挑话题；不要逐条复述成清单，"
+            "也不要说出“我记得你说过…”这类刻意证明记忆的话）：\n"
+        )
+        if preference:
+            block += (
+                "明确偏好（约束你开口的时间、话题与语气，必须遵守）：\n"
+                + "\n".join(preference)
+                + "\n"
+            )
+        if known:
+            block += (
+                "已确认的事实与爱好（只用来挑话题，不要当谈资陈列）：\n"
+                + "\n".join(known)
+                + "\n"
+            )
+        if pending:
+            block += (
+                "还没确认（只当猜测，不要当事实说出口，也不要据此替用户下结论）：\n"
+                + "\n".join(pending)
+                + "\n"
+            )
+        if omitted:
+            block += f"（另有 {omitted} 条较早的记录这次没列出来，需要时再说，不要凭印象编）\n"
+        return block + (
+            "偏好和你的表达冲动冲突时，宁可晚一点或换个说法，不要为了说出自己的话而违反偏好。"
+            "记录会过时：用户现在的说法一律优先于记录，冲突时以新说法为准，不要拿旧记录纠正用户；"
+            "发现这条已经不对，就改成新说法或直接删掉。\n"
+        )
+
+    def activity_context(self, state) -> str:
+        """Describe when the user is usually around, from the hourly histogram.
+
+        Args:
+            state: Target state.
+
+        Returns:
+            A prompt block; it never guesses when there are too few samples.
+        """
+        half = self.number("activity_half_life_days", 30, 7, 365)
+        info = activity_summary(state, half)
+        entry = state.get("activity")
+        note = str(entry.get("note") or "").strip() if isinstance(entry, dict) else ""
+        lines = []
+        if note:
+            lines.append(f"用户自己说的作息：{note[:160]}")
+        if not info["enough"]:
+            lines.append(
+                f"用户活跃时间：只有 {info['samples']} 次发言，还看不出规律，"
+                "不要凭猜测判断她此刻在不在。"
+            )
+        else:
+            lines.append(f"用户常在线：{'、'.join(info['active']) or '没有明显高峰'}")
+            if info["quiet"]:
+                lines.append(f"基本不在：{'、'.join(info['quiet'])}")
+            if info["weekend_shift"]:
+                lines.append(info["weekend_shift"])
+            lines.append(f"最新一次统计更新：{time.strftime('%m-%d %H:%M', time.localtime(info['updated_at']))}"
+                         if info["updated_at"] else "")
+        while lines and not lines[-1]:
+            lines.pop()
+        return (
+            "关于用户的活跃时间：\n"
+            + "\n".join(lines)
+            + "\n"
+            + "活跃时间只用来挑开口时机：用户常在线时主动更容易被看到；"
+            "基本不在的时段默认不要主动开口，除非她自己约过时间，或用户说过那个时间也可以。"
+            "统计只是习惯，不是当下的状态：她此刻在不在，以最近一条消息为准，"
+            "不要用作息推断她的心情、行踪或为什么没回。\n"
+        )
+
     def target_origins(self) -> list[str]:
         """Resolve configured QQ numbers using an explicit or unique OneBot route.
 
@@ -677,21 +1228,85 @@ class AutonomousCompanion(Star):
                 if item.get("status") == "sending":
                     item["status"] = "uncertain"
             self.migrate_legacy_drafts(state)
+            migrate_user_notes(state)
             for item in state.get("task_artifacts", []):
                 if item.get("status") == "sending":
                     item["status"] = "uncertain"
             # An interrupted action may have had side effects; never replay it.
             if state.get("inflight"):
+                # Mark in-flight tool receipts as interrupted so the model can
+                # see the interrupted state and choose to retry, fallback, or notify.
+                for cp in [
+                    state.get("execution_checkpoint", {}),
+                    *state.get("execution_checkpoints", {}).values(),
+                ]:
+                    for r in cp.get("receipts", []):
+                        if r.get("status") == "attempted":
+                            r["status"] = "interrupted"
+                            r["result"] = "执行被中断，结果未知"
+                has_pending = any(
+                    cp.get("pending")
+                    for cp in state.get("execution_checkpoints", {}).values()
+                ) or state.get("execution_checkpoint", {}).get("pending", False)
                 state.update(
                     inflight=False,
                     next_task="",
                     window_end=0,
-                    next_due=now + self.interval(state),
+                    next_due=now + (60 if has_pending else self.interval(state)),
                 )
                 state["last_error"] = "上次行动被中断，已跳过重放"
         self.stopping = False
         await self.save()
         self.worker = asyncio.create_task(self.scheduler(), name="autonomous-companion")
+
+    async def _guard_user_state_claims(self, text: str, event) -> str:
+        """Remove unsupported claims about the user's state before sending.
+
+        The guard runs only for proactive/continuation text containing "你".
+        It uses the latest user message as the sole evidence, and falls back to
+        the deterministic filter if the model call or JSON parse fails.
+        """
+        text = str(text or "")
+        if not text.strip():
+            return ""
+        if "你" not in text or not self.config.get("state_claim_guard", True):
+            return _sanitize_user_state_claims(text)
+        try:
+            provider = await self.context.get_current_chat_provider_id(
+                event.unified_msg_origin
+            )
+            response = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=provider,
+                    system_prompt=STATE_CLAIM_GUARD_PROMPT,
+                    prompt=json.dumps(
+                        {
+                            "draft": text[:4000],
+                            "latest_user_message": str(
+                                event.get_message_str() or ""
+                            )[-2000:],
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+                15,
+            )
+            payload = parse_object(response.completion_text or "")
+            claims = payload.get("claims")
+            guarded = str(payload.get("text") or "").strip()
+            if isinstance(claims, list) and claims:
+                self.logger.info(
+                    "State-claim guard removed: "
+                    + json.dumps(claims, ensure_ascii=False)[:300]
+                )
+                return guarded
+            if guarded:
+                return text
+        except Exception as exc:
+            self.logger.warning(
+                "State-claim guard failed, using fallback: " + str(exc)
+            )
+        return _sanitize_user_state_claims(text)
 
     async def flush_pending_message(self, state, event) -> None:
         """Send a stored quiet-turn draft before this round's own output.
@@ -708,11 +1323,13 @@ class AutonomousCompanion(Star):
             self.journal(state, "quiet_draft_expired", "暂存正文已过期，丢弃")
             return
         try:
-            await event.send(
-                MessageChain().message(
-                    str(pending_message.get("content", "")).strip()
-                )
+            content = await self._guard_user_state_claims(
+                str(pending_message.get("content", "")).strip(), event
             )
+            if not content:
+                self.journal(state, "quiet_draft_dropped", "暂存正文只剩状态断言，丢弃")
+                return
+            await event.send(MessageChain().message(content))
             self.journal(state, "quiet_draft_sent", "已补发后台轮暂存的正文")
         except asyncio.CancelledError:
             state["pending_message"] = pending_message
@@ -763,6 +1380,10 @@ class AutonomousCompanion(Star):
     def new_state(self) -> dict[str, Any]:
         return {
             "next_due": time.time() + self.interval(),
+            "next_speak_at": 0,
+            "speak_wish": "",
+            "speak_wish_at": 0,
+            "speak_wish_kept": 0,
             "last_inbound": 0,
             "window_end": 0,
             "rounds": 0,
@@ -774,7 +1395,8 @@ class AutonomousCompanion(Star):
             "inflight": False,
             "last_error": "",
             "projects": [],
-            "preferences": {},
+            "notes": {},
+            "activity": {},
             "events": [],
         }
 
@@ -860,16 +1482,96 @@ class AutonomousCompanion(Star):
                             state["next_due"] = min(
                                 state.get("next_due", time.time()), time.time()
                             )
-                        if umo not in self.running and time.time() >= state.get(
-                            "next_due", 0
+                        if umo not in self.running and time.time() >= self.wake_at(
+                            state
                         ):
                             self.running[umo] = asyncio.create_task(self.run_due(umo))
+                        finished_report = self.reporting.get(umo)
+                        if finished_report is not None and finished_report.done():
+                            self.reporting.pop(umo, None)
+                        if (
+                            umo not in self.running
+                            and umo not in self.reporting
+                            and report_due(self, state)
+                        ):
+                            self.reporting[umo] = asyncio.create_task(
+                                self.morning_report(umo)
+                            )
                 await asyncio.sleep(5)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger.exception("Autonomous scheduler tick failed")
                 await asyncio.sleep(10)
+
+    async def morning_report(self, umo: str) -> None:
+        """Tell him, in her own words, what really happened overnight.
+
+        The text is generated once per day, capped by configuration, prefixed by
+        deterministic alert lines, and delivered through the normal proactive
+        path so budgets, pause and dispatch bookkeeping still apply.
+
+        Args:
+            umo: Exact private-chat origin.
+        """
+        state = self.states.get(umo)
+        if not state or not report_due(self, state):
+            return
+        if state.get("pause_until", 0) > time.time():
+            return
+        window_end = state.get("window_end", 0) or 0
+        if window_end > time.time():
+            # A continuation window is still open; report once it closes.
+            return
+        if window_end:
+            state["window_end"] = 0
+        try:
+            event, persona, provider_id, _, _ = await self.prepare(umo)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.warning("Morning report skipped for %s: %s", umo, exc)
+            return
+        digest = build_digest(self, state)
+        text = ""
+        try:
+            response = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    system_prompt=((persona or {}).get("prompt", "") or "")
+                    + "\n你是这个人的陪伴者。现在把昨夜到今早的实际情况用你自己的话告诉他："
+                    "做了什么、什么没做成、什么等他点头、今晚打算。两到四句，"
+                    "不要列表符号，不要提系统、报告、记录、数据这些词，"
+                    "不要编造记录里没有的事，不要追问。",
+                    prompt=digest_text(digest),
+                ),
+                self.number("morning_report_timeout_seconds", 60, 5, 600),
+            )
+            text = (response.completion_text or "").strip()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.warning("Morning report generation failed for %s: %s", umo, exc)
+        limit = self.number("morning_report_max_chars", 400, 80, 2000)
+        text = text[:limit].strip() or fallback_text(digest)
+        if digest["alerts"]:
+            text = "\n".join(digest["alerts"]) + "\n" + text
+        event.quiet = False
+        event.set_extra("morning_report", True)
+        try:
+            await self.deliver(event, MessageChain().message(text))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.warning("Morning report delivery failed for %s: %s", umo, exc)
+            return
+        state["morning_report"] = {
+            "day": datetime.now().astimezone().date().isoformat(),
+            "at": time.time(),
+            "text": text[:2000],
+        }
+        self.journal(state, "morning_report", "已把昨晚的情况说给他")
+        await self.save()
 
     async def run_due(self, umo: str) -> None:
         state = self.states[umo]
@@ -878,12 +1580,33 @@ class AutonomousCompanion(Star):
             now = time.time()
             if state.get("pause_until", 0) > now and state.get("pause_mode") == "all":
                 state["next_due"] = state["pause_until"]
+                if state.get("next_speak_at", 0):
+                    state["next_speak_at"] = max(
+                        state["next_speak_at"], state["pause_until"]
+                    )
                 return
             if exhausted(self, state, "checks", "daily_check_limit", 144) or exhausted(
                 self, state, "rounds", "daily_round_limit", 96
             ):
-                state["next_due"] = next_day()
-                state["last_error"] = "今日自主预算已用完，次日自动恢复"
+                nightly = bool(night_pool_key(self))
+                state["next_due"] = (
+                    max(night_end_timestamp(self), now + 60) if nightly else next_day()
+                )
+                if state.get("next_speak_at", 0):
+                    state.pop("next_speak_at", None)
+                    state.pop("next_speak_reason", None)
+                    self.journal(
+                        state,
+                        "speak_dropped",
+                        "夜间额度已用完，取消自己约定的开口时间"
+                        if nightly
+                        else "今日预算已用完，取消自己约定的开口时间",
+                    )
+                state["last_error"] = (
+                    "夜间额度已用完，早上自动恢复"
+                    if nightly
+                    else "今日自主预算已用完，次日自动恢复"
+                )
                 return
             grace = self.number("recent_chat_grace_seconds", 180, 0, 3600)
             blocked_until = max(
@@ -891,6 +1614,11 @@ class AutonomousCompanion(Star):
             )
             if now < blocked_until:
                 state["next_due"] = blocked_until + 5
+                if (
+                    state.get("next_speak_at", 0)
+                    and state["next_speak_at"] < blocked_until + 5
+                ):
+                    state["next_speak_at"] = blocked_until + 5
                 return
             state["inflight"] = True
             state["progress"] = {
@@ -902,8 +1630,11 @@ class AutonomousCompanion(Star):
             await self.phase(state, "preparing", "准备会话、人格与记忆")
             await self.save()
             long_job = due_task(state) if not state.get("manual_plan") else None
+            speak_due = "" if long_job else self.consume_speak_commitment(state)
             await asyncio.wait_for(
-                run_long_task(self, umo, long_job) if long_job else self.turn(umo),
+                run_long_task(self, umo, long_job)
+                if long_job
+                else self.turn(umo, speak_due=speak_due),
                 self.number("turn_timeout_seconds", 480, 30, 3600),
             )
             if long_job:
@@ -925,9 +1656,26 @@ class AutonomousCompanion(Star):
                 )
         except asyncio.CancelledError:
             state.update(next_task="", window_end=0)
+            # Mark in-flight tool receipts as interrupted so the next turn can
+            # see the interrupted state and choose to retry, fallback, or notify.
+            for cp in [
+                state.get("execution_checkpoint", {}),
+                *state.get("execution_checkpoints", {}).values(),
+            ]:
+                for r in cp.get("receipts", []):
+                    if r.get("status") == "attempted":
+                        r["status"] = "interrupted"
+                        r["result"] = "执行被中断，结果未知"
             if revision == self.revisions.get(umo, 0):
+                # If there is a pending checkpoint, schedule a short retry so
+                # the model can see the interrupted state and respond instead
+                # of silently waiting a full autonomous interval.
+                has_pending = any(
+                    cp.get("pending")
+                    for cp in state.get("execution_checkpoints", {}).values()
+                ) or state.get("execution_checkpoint", {}).get("pending", False)
                 state["next_due"] = max(
-                    time.time() + self.interval(state),
+                    time.time() + (60 if has_pending else self.interval(state)),
                     state.get("pause_until", 0)
                     if state.get("pause_mode") == "all"
                     else 0,
@@ -961,7 +1709,6 @@ class AutonomousCompanion(Star):
                 isinstance(exc, asyncio.TimeoutError)
                 and receipts
                 and not state.get("pending_message")
-                and not state.get("last_turn", {}).get("background")
             ):
                 state["pending_message"] = {
                     "content": "刚才那件事我做到一半被时间限制打断了，"
@@ -1054,6 +1801,10 @@ class AutonomousCompanion(Star):
         selected = cfg.get("plugin_set", ["*"])
         event.plugins_name = None if selected == ["*"] else selected
         event.set_extra("autonomous_companion", True)
+        # 生态约定：主动轮是“合成事件 + 目标用户”，好感度这类插件据此只注入
+        # 数据、不在主动轮上结算；不标就会被当作真实对话去改数值。
+        event.set_extra("_is_active_chat_synthetic", True)
+        event.set_extra("_active_chat_target_uid", event.get_sender_id())
         (
             persona_id,
             persona,
@@ -1175,14 +1926,39 @@ class AutonomousCompanion(Star):
                 return getattr(meta.star_cls, "memory_companion", None)
         return None
 
+    def hidden_tool_names(self) -> set[str]:
+        """Tools that must not even be listed because their switch is off.
+
+        Returns:
+            Names filtered out of the tool set for this turn.
+        """
+        hidden: set[str] = set()
+        if not bool(self.config.get("dsh_enabled", False)):
+            hidden |= {"autonomous_dsh_task", "autonomous_dsh_cli"}
+        if not bool(self.config.get("allow_shell_commands", False)):
+            hidden.add("autonomous_run_command")
+        if not bool(self.config.get("file_tools_enabled", True)):
+            hidden |= {
+                "autonomous_read_file",
+                "autonomous_write_file",
+                "autonomous_list_files",
+                "autonomous_search_files",
+            }
+        return hidden
+
     def tools(self, event, persona) -> ToolSet:
         tools = ToolSet()
         tools.add_tool(BudgetTool(SaveWorkTool(event), event))
         tools.add_tool(BudgetTool(SendArtifactTool(event), event))
+        # 关掉的能力就不给模型看见：能跑命令、能碰本机的工具默认不在清单里，
+        # 免得模型一遍遍去试一个注定被拒的工具，也免得“看着有这个本事”。
+        hidden = self.hidden_tool_names()
         allowed = self.config.get("allowed_tools", [])
         persona_tools = persona.get("tools")
         for tool in self.context.get_llm_tool_manager().get_full_tool_set().tools:
             if not tool.active or (allowed and tool.name not in allowed):
+                continue
+            if tool.name in hidden:
                 continue
             if persona_tools is not None and tool.name not in persona_tools:
                 continue
@@ -1227,12 +2003,15 @@ class AutonomousCompanion(Star):
         ):
             raise asyncio.CancelledError("Autonomous turn superseded")
 
-    async def turn(self, umo: str, preview: bool = False) -> dict[str, Any]:
+    async def turn(
+        self, umo: str, preview: bool = False, speak_due: str = ""
+    ) -> dict[str, Any]:
         """Select and execute one autonomous round, preserving a bounded continuation.
 
         Args:
             umo: Exact target private-chat origin.
             preview: Only select an action; do not execute tools or send messages.
+            speak_due: Reason of a due self-committed opening, shown to the model.
 
         Returns:
             The model's validated action decision.
@@ -1263,7 +2042,7 @@ class AutonomousCompanion(Star):
             state["next_due"] = next_day()
             await self.save()
             return {"action": "silent", "reason": "今日自主预算已用完"}
-        usage_for(state)["previews" if preview else "checks"] += 1
+        count(self, state, "previews" if preview else "checks")
         await self.save()
         event, persona, provider, history, memory = await self.prepare(umo)
         skill_prompt, skill_names = await load_skill_context(self, event, persona)
@@ -1279,6 +2058,8 @@ class AutonomousCompanion(Star):
                 if state.get("events")
                 else "continuation"
                 if state.get("next_task")
+                else "speak"
+                if speak_due
                 else "heartbeat",
                 "status": "running",
             }
@@ -1293,7 +2074,7 @@ class AutonomousCompanion(Star):
                 )
                 return {"action": "silent", "reason": state["companion_status"]}
             return await self.execute_turn(
-                umo, preview, event, persona, provider, history, memory
+                umo, preview, event, persona, provider, history, memory, speak_due
             )
         finally:
             if not preview:
@@ -1302,7 +2083,7 @@ class AutonomousCompanion(Star):
             await adapter.finish()
 
     async def execute_turn(
-        self, umo, preview, event, persona, provider, history, memory
+        self, umo, preview, event, persona, provider, history, memory, speak_due=""
     ):
         """Execute a round after optional host coordination is established."""
         state = self.states[umo]
@@ -1333,6 +2114,9 @@ class AutonomousCompanion(Star):
             await self.phase(state, "checking", "重新检查待办条件")
             dependencies = await refresh_conditions(self, event, persona)
         await self.check_current(event)
+        self.expire_speak_wish(state)
+        pool = pool_snapshot(self, state)
+        pool_label = "夜间" if pool.get("pool") == "night" else "白天"
         context_text = (
             dispatched_context(state, event.cid)
             + f"模板工具连接情况：{state.get('template_mcp_status', '未触发恢复检查')}\n"
@@ -1367,13 +2151,56 @@ class AutonomousCompanion(Star):
             "条件不足时返回 blocked_reason 说明具体阻碍，保留任务。只有真正完成全部要求后，"
             "返回 manual_plan_completed=true；多轮任务首次说话不等于完成，需安排 next_task 和 continue_after_seconds。\n"
             f"持续项目（优先参考最久未尝试的项目，不重复受阻方案）：{json.dumps(sorted(state.get('projects', []), key=lambda p: p.get('last_attempt_at', 0)), ensure_ascii=False)}\n"
-            f"用户明确偏好：{json.dumps(state.get('preferences', {}), ensure_ascii=False)}\n"
-            f"待处理实际事件：{json.dumps(state.get('events', []), ensure_ascii=False)}\n"
+            + self.user_notes_context(state)
+            + self.activity_context(state)
+            + f"待处理实际事件：{json.dumps(state.get('events', []), ensure_ascii=False)}\n"
             f"今日使用量：{json.dumps(usage_for(state), ensure_ascii=False)}\n"
+            f"当前{pool_label}额度池：工具 {pool['tools']}/{pool['limit_tools']}，"
+            f"回合 {pool['rounds']}/{pool['limit_rounds']}，判断 {pool['checks']}/{pool['limit_checks']}，"
+            f"发送 {pool['messages']}/{pool['limit_messages']}；用完就停，不跨池借用。\n"
             f"自主频率：{'允许调整' if self.config.get('adaptive_frequency', True) else '已关闭'}；"
             f"范围 {self.number('frequency_min_minutes', 10, 1, 1440)}~{max(self.number('frequency_min_minutes', 10, 1, 1440), self.number('frequency_max_minutes', 180, 1, 1440))} 分钟；"
             f"当前基础间隔 {state.get('rhythm_minutes', self.config.get('interval_minutes', 60))} 分钟；原因 {state.get('rhythm_reason', '默认节奏')}\n"
-            f"待分享成果：{json.dumps([item for item in state.get('outbox', []) if item['status'] == 'pending'], ensure_ascii=False)}\n"
+            + (
+                "【已到你自己约定的开口时间】约定原因："
+                + (speak_due or "未说明")
+                + "。这是你此前自己决定的开口时刻：本轮默认开口说话（chat 或分享成果），"
+                "把此刻想说的自然说出来；确实没有可说的才允许 silent，并在 reason 说明为何改变主意，"
+                "不要只汇报约定本身。\n"
+                if speak_due
+                else ""
+            )
+            + (
+                "你已和自己约定于 "
+                + datetime.fromtimestamp(state["next_speak_at"])
+                .astimezone()
+                .strftime("%m-%d %H:%M")
+                + " 开口（原因："
+                + str(state.get("next_speak_reason", ""))
+                + "）。未到点前不必提前开口；要改动用 next_speak_minutes 重新约定，填 0 取消。\n"
+                if (state.get("next_speak_at") or 0) > time.time()
+                else ""
+            )
+            + f"待分享成果：{json.dumps([item for item in state.get('outbox', []) if item['status'] == 'pending'], ensure_ascii=False)}\n"
+            + (
+                "【你心里存着一句还没说出口的话】从 "
+                + datetime.fromtimestamp(state.get("speak_wish_at") or time.time())
+                .astimezone()
+                .strftime("%m-%d %H:%M")
+                + " 起就惦记着"
+                + (
+                    f"，已经搁置 {int(state.get('speak_wish_kept') or 0)} 轮"
+                    if state.get("speak_wish_kept")
+                    else ""
+                )
+                + "："
+                + self.speak_wish_text(state)
+                + "。这句是你自己记下的，不是在回答用户；想说就在本轮说出来"
+                "（时机不合适可以顺手用 next_speak_minutes 约个更合适的时刻），"
+                "不想说了就输出 speak_wish_clear: true 放下它，别一直挂着不提。\n"
+                if self.speak_wish_text(state)
+                else ""
+            )
             + (
                 f"已暂存待补发的后台正文（本轮允许发消息时会自动先发出，不要重复写）：{state['pending_message']['content'][:300]}\n"
                 if state.get("pending_message")
@@ -1478,6 +2305,8 @@ class AutonomousCompanion(Star):
                     update.pop(key, None)
         apply_plan(state, selection, allow_completion=False)
         self.update_rhythm(state, decision)
+        self.update_speak_commitment(state, decision)
+        self.update_speak_wish(state, decision)
         if "conditions" in decision and decision["conditions"]:
             dependencies = await refresh_conditions(self, event, persona)
             context_text += f"\n本轮新登记条件的实际查询结果：{dependencies}\n"
@@ -1540,7 +2369,7 @@ class AutonomousCompanion(Star):
             return decision
         state["rounds"] += 1
         state["window_admitted"] = True
-        usage_for(state)["rounds"] += 1
+        count(self, state, "rounds")
         await self.phase(state, "executing", "执行本轮目标")
         await self.save()
         available_tools = self.tools(event, persona)
@@ -1678,6 +2507,19 @@ class AutonomousCompanion(Star):
             await self.save()
             return decision
         context_text += "\n本轮明确目标优先于历史项目：不得用续写旧小说或推进其他项目替代当前目标。若当前目标因禁止发消息而无法完成，返回 blocked_reason，保留任务，不声称完成。"
+        digest = action_digest(
+            event, state, self.number("action_digest_chars", 1500, 0, 8000)
+        )
+        if digest:
+            context_text += "\n" + digest + "\n"
+        # 让下游插件看到本轮真实目标，而不是占位的“自主心跳”：只改事件文本，
+        # 不动对话历史，也不改我们自己拼的上下文。
+        round_goal = str(decision.get("task") or decision.get("reason") or "").strip()
+        if round_goal:
+            event.message_str = round_goal[:200]
+            message_obj = getattr(event, "message_obj", None)
+            if message_obj is not None:
+                message_obj.message_str = event.message_str
         save_checkpoint(event)
         await self.save()
         response = await self.context.tool_loop_agent(
@@ -1694,6 +2536,7 @@ class AutonomousCompanion(Star):
             tools=available_tools,
             max_steps=self.number("max_agent_steps", 12, 1, 30),
             tool_call_timeout=self.number("tool_timeout_seconds", 120, 5, 600),
+            agent_hooks=self.notification_hooks,
         )
         await self.check_current(event)
         result = await self.control_output(response, provider, "action")
@@ -1710,6 +2553,7 @@ class AutonomousCompanion(Star):
                 prompt=f"{context_text}\n执行任务：{decision.get('task', '')}\n本轮工具清单：{json.dumps(state['available_tool_names'], ensure_ascii=False)}\n上一轮只返回文本，没有调用任何工具。现在必须按已学技能实际调用工具；若工具不可用，返回 blocked_reason，不得声称完成。最终仍返回规定 JSON。",
                 max_steps=self.number("max_agent_steps", 12, 1, 30),
                 tool_call_timeout=self.number("tool_timeout_seconds", 120, 5, 600),
+                agent_hooks=self.notification_hooks,
             )
             await self.check_current(event)
             result = await self.control_output(response, provider, "action")
@@ -1760,6 +2604,7 @@ class AutonomousCompanion(Star):
                     + "\n若有成图URL，使用现有投递工具发送该实际URL，禁止猜路径；投递失败如实说明。最终返回规定JSON。",
                     max_steps=3,
                     tool_call_timeout=self.number("tool_timeout_seconds", 120, 5, 600),
+                    agent_hooks=self.notification_hooks,
                 )
                 await self.check_current(event)
                 result = await self.control_output(response, provider, "action")
@@ -1773,8 +2618,11 @@ class AutonomousCompanion(Star):
             tool_receipts=copy.deepcopy(event.action_receipts),
         )
         event.checkpoint_pending = bool(action_family and verification != "verified")
+        # Always persist the final state: mid-round saves (pre-tool-loop and
+        # deliver) default pending to True, and skipping the save on verified
+        # rounds leaves them as pending zombies that keep getting retried.
+        save_checkpoint(event)
         if event.checkpoint_pending:
-            save_checkpoint(event)
             record = state.get("execution_checkpoints", {}).get(
                 getattr(event, "checkpoint_id", "")
             )
@@ -1817,7 +2665,9 @@ class AutonomousCompanion(Star):
             and (not message.strip() or message.strip() == "NO_REPLY")
         ):
             synthesized_closing = True
-            tool_work_closing = bool(tool_work and not action_family)
+            tool_work_closing = bool(
+                tool_work or (action_family and event.action_receipts)
+            )
             if action_family:
                 if verification == "verified":
                     message = (
@@ -1892,7 +2742,8 @@ class AutonomousCompanion(Star):
                     else:
                         closing_system = f"{persona.get('prompt', '')}\n你仍是同一个角色，现在继续这段私聊，不执行任务，不输出JSON。"
                         closing_system += (
-                            "像和熟悉的人聊天，顺着最近语境，可表达自己的小感受或轻轻接一句；不要机械汇报任务，"
+                            "像和熟悉的人聊天，顺着最近语境，可表达自己的小感受或轻轻接一句；不要写成汇报或清单。"
+                            "如果这轮真做了什么，就顺口带一句结果；没做成就说一句卡在哪，放哪都行。"
                             "不要说核验、契约、凭据、步骤、投递等内部术语，不必追问用户。"
                             "事实以提供记录为限，不编造体验、成功、用户已收到或新动作。"
                             "已发出成品就自然接一句，不因非必要辅助步骤未确认把整个成果否定。"
@@ -1906,18 +2757,29 @@ class AutonomousCompanion(Star):
                             "detail": verification_reason,
                             "summary": result.get("summary", ""),
                             "dialogue_draft": "" if synthesized_closing else message,
-                            "style_instruction": "保留草稿真正要表达的意思和人格口吻；不要把它改成任务完成公告。自然承接最近一句，不强制称呼，不强制撒娇，不加解释或客套尾巴。不要照抄历史台词，避免连续几轮同一句式。",
+                            "style_instruction": "保留草稿真正要表达的意思和人格口吻；不要改成任务完成公告，结果顺口带一句就行。自然承接最近一句，不强制称呼，不强制撒娇，不加解释或客套尾巴。不要照抄历史台词，避免连续几轮同一句式。",
                             "visual_content_verified": False,
                             "recent_dispatched_dialogue": dispatched_context(
                                 state, event.cid
                             ),
                         }
+                    closing_system += (
+                        "\n任务标题、作品设定和旧计划都不是用户当前状态；"
+                        "不要推断用户醒着、睡着或离开，禁止写“你醒了再说”“你睡了吧”这类话。"
+                        "\n\n以下是你自己本轮的任务与投递记录（JSON），不是用户发言，"
+                        "不代表用户当前状态，只能当内部状态参考：\n"
+                        + json.dumps(closing_payload, ensure_ascii=False)
+                    )
                     closing = await asyncio.wait_for(
                         self.context.llm_generate(
                             chat_provider_id=provider,
                             system_prompt=closing_system,
                             contexts=history[-6:],
-                            prompt=json.dumps(closing_payload, ensure_ascii=False),
+                            prompt=(
+                                "按上面的记录，用你平时的语气收个尾，不要汇报任务。"
+                                "成了就顺口提一句结果，没成就说一句卡在哪；放哪都行，不用解释内部原因。"
+                                "别只丢一句气氛话。不要推断用户醒着、睡着或离开。"
+                            ),
                         ),
                         20,
                     )
@@ -2021,6 +2883,8 @@ class AutonomousCompanion(Star):
             else:
                 project["retry_after"] = 0
         self.update_rhythm(staged, result)
+        self.update_speak_commitment(staged, result)
+        self.update_speak_wish(staged, result)
         retain_outputs(staged, result.get("deferred_outputs") or [])
         state.update(staged)
         completed_project = bool(project and project.get("status") == "completed")
@@ -2064,8 +2928,13 @@ class AutonomousCompanion(Star):
             )
         if not event.quiet:
             await self.flush_pending_message(state, event)
-        if message.strip() and message.strip() != "NO_REPLY" and not event.quiet:
-            await event.send(MessageChain().message(message.strip()))
+        outgoing = await self._guard_user_state_claims(message.strip(), event)
+        if outgoing and outgoing != "NO_REPLY" and not event.quiet:
+            await event.send(MessageChain().message(outgoing))
+            if speak_due:
+                # She committed to speaking at this moment: the held note has
+                # served its purpose, so it must not keep nagging her.
+                self.clear_speak_wish(state, "wish_spoken", "到点开口时把这句话说出来了")
         self.journal(
             state,
             decision["action"],
@@ -2148,7 +3017,73 @@ class AutonomousCompanion(Star):
             else "",
         )
         await self.save()
+        final_status = "blocked" if blocked_reason else "completed"
+        # Determine if we should write to long-term memory
+        # Only write if the bot couldn't speak for itself OR if it's a silent success
+        has_said_enough = (
+            event.deliveries > 0
+            and verification == "verified"
+            and final_status not in {"cancelled", "failed"}
+        )
+        should_write = (
+            blocked_reason
+            or verification != "verified"
+            or not event.deliveries
+            or (event.state.get("last_turn") or {}).get("status") in {"cancelled", "failed"}
+        )
+        # Avoid duplicate writes: if bot already said enough, skip memory write
+        if should_write and has_said_enough:
+            should_write = False
+        await self.record_action_memory(
+            event,
+            should_write=should_write,
+            last_turn_status=final_status,
+        )
         return decision
+
+    async def record_action_memory(self, event, should_write: bool, last_turn_status: str) -> None:
+        """Persist what the bot actually did into MemoryCompanion as self_action.
+
+        Only rounds where the bot could not speak for itself (failed, interrupted,
+        silent, or missing deliveries) are recorded, so visible closings stay the
+        single source of truth and long-term memory is not duplicated.
+        """
+        if not self.config.get("action_memory_write", True):
+            return
+        if not should_write:
+            return
+        bridge = self.memory_bridge(event)
+        if bridge is None or not hasattr(bridge, "record_bot_action"):
+            self.logger.debug("MemoryCompanion bridge unavailable for action memory")
+            return
+        summary = action_memory_summary(event.state)
+        if not summary:
+            return
+        try:
+            await asyncio.wait_for(
+                bridge.record_bot_action(
+                    content=summary,
+                    scope="private",
+                    session_id=event.unified_msg_origin,
+                    platform=event.get_platform_name(),
+                    source_plugin="astrbot_plugin_autonomous_companion",
+                    metadata={
+                        "bot_id": event.get_self_id(),
+                        "user_id": event.get_sender_id(),
+                        "persona_id": event.persona_id,
+                        "run_id": (state_progress := event.state.get("progress") or {}).get(
+                            "run_id", ""
+                        ),
+                        "last_turn_status": last_turn_status,
+                        "clean_visible_text": summary,
+                    },
+                ),
+                self.number("memory_timeout_seconds", 12, 1, 120),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.exception("Bot action memory recording failed")
 
     async def finish_events(self, state, event_ids: set[str]) -> None:
         state["events"] = [
@@ -2237,6 +3172,15 @@ class AutonomousCompanion(Star):
             raise RuntimeError("Daily message budget exhausted")
         if not chain or not chain.chain:
             return
+        if getattr(chain, "type", None) != "tool_call" and all(
+            type(part).__name__ == "Plain" for part in chain.chain
+        ):
+            original_text = "".join(part.text for part in chain.chain)
+            sanitized_text = await self._guard_user_state_claims(original_text, event)
+            if sanitized_text != original_text:
+                if not sanitized_text.strip():
+                    return
+                chain = MessageChain().message(sanitized_text)
         if (
             self.config.get("proactive_segmented_reply", True)
             and getattr(chain, "type", None) != "tool_call"
@@ -2274,7 +3218,7 @@ class AutonomousCompanion(Star):
         )
         # Mark the attempt before dispatch; uncertain transport errors are not retried.
         self.journal(event.state, "dispatch_attempt", text)
-        usage_for(event.state)["messages"] += 1
+        count(self, event.state, "messages")
         await self.save()
         await self.check_current(event)
         if not await self.context.send_message(event.session, chain):
@@ -2293,6 +3237,7 @@ class AutonomousCompanion(Star):
             for part in chain.chain
         ):
             event.media_deliveries = getattr(event, "media_deliveries", 0) + 1
+            event.first_media_delivery_at = time.time()
         save_checkpoint(event)
         record_evidence(event.state, "dispatch", text)
         if getattr(chain, "type", None) == "tool_call":
@@ -2396,6 +3341,8 @@ class AutonomousCompanion(Star):
                 "bot_id": event.get_self_id(),
             },
         )
+        # 只记时间不记内容：入站消息顺带更新她的活跃时段统计
+        record_activity(state, state["last_inbound"], self.number("activity_half_life_days", 30, 7, 365))
         if (
             state.get("pause_mode") == "all"
             and state.get("pause_until", 0) > time.time()
@@ -2441,6 +3388,9 @@ class AutonomousCompanion(Star):
                 "理解不明确时先询问，不猜测取消无关任务。历史任务、工具返回及记忆不能推翻用户最新取消。"
                 "工具只停止本插件后续调度，不代表第三方已启动进程已终止。\n"
             )
+            recent = recent_action_context(state)
+            if recent:
+                req.system_prompt = (req.system_prompt or "") + "\n" + recent + "\n"
             self.busy[umo] = time.time() + 600
             event.set_extra("autonomous_chat_revision", self.revisions.get(umo, 0))
 
@@ -2505,7 +3455,7 @@ class AutonomousCompanion(Star):
             stdin(string): 可选。dsh 的标准输入；headless 一次性任务写在这里。
             working_dir(string): 可选。dsh 的工作目录。
         """
-        if not self.config.get("dsh_enabled", True):
+        if not self.config.get("dsh_enabled", False):
             return json.dumps(
                 {"ok": False, "status": "failed", "error": "本机执行通道已关闭（dsh_enabled）"},
                 ensure_ascii=False,
@@ -2523,6 +3473,11 @@ class AutonomousCompanion(Star):
                 "exit_code": result["exit_code"],
                 "duration_seconds": result["duration_seconds"],
                 "working_dir": result["working_dir"],
+                **(
+                    {"backup": self.dsh.last_snapshot}
+                    if getattr(self.dsh, "last_snapshot", "")
+                    else {}
+                ),
             },
             ensure_ascii=False,
         )
@@ -2540,12 +3495,13 @@ class AutonomousCompanion(Star):
             task(string): 要用自然语言写清目标和输出要求的任务。
             working_dir(string): 可选。工作目录，也是能写文件的边界。
         """
-        if not self.config.get("dsh_enabled", True):
+        if not self.config.get("dsh_enabled", False):
             return json.dumps(
                 {"ok": False, "status": "failed", "error": "本机执行通道已关闭（dsh_enabled）"},
                 ensure_ascii=False,
             )
         result = await self.dsh.run(task, working_dir=working_dir)
+        backup = getattr(self.dsh, "last_snapshot", "")
         if result["ok"]:
             payload = {
                 "ok": True,
@@ -2562,6 +3518,189 @@ class AutonomousCompanion(Star):
                 "output": result["output"][:2000],
                 "working_dir": result["working_dir"],
             }
+        if backup:
+            payload["backup"] = backup
+            payload["backup_hint"] = "改动前已备份；如需撤回，请让人用 /自主 回退。"
+        return json.dumps(payload, ensure_ascii=False)
+
+    def file_workspace(self) -> Workspace:
+        """Resolve the writable root and readable roots for the local file tools.
+
+        Returns:
+            A root-bound workspace; writes outside the root are refused.
+        """
+        raw_root = str(self.config.get("file_tools_root", "") or "").strip()
+        base = (
+            Path(os.path.expandvars(raw_root)).expanduser()
+            if raw_root
+            else self.dsh.default_working_dir().parent / "files"
+        )
+        reads: list[Path] = [base]
+        extra = list(self.config.get("work_library_roots", []) or []) + list(
+            self.config.get("file_tools_extra_read_roots", []) or []
+        )
+        for item in extra:
+            text = str(item or "").strip()
+            if text:
+                reads.append(Path(os.path.expandvars(text)).expanduser())
+        working = str(self.config.get("dsh_working_dir", "") or "").strip()
+        if working:
+            reads.append(Path(os.path.expandvars(working)).expanduser())
+        return Workspace(base, reads)
+
+    def snapshot_store(self) -> Path:
+        """Directory holding pre-action snapshots (shared with the dsh channel)."""
+        try:
+            return self.dsh._plugin_data_dir() / "snapshots"
+        except Exception:  # noqa: BLE001
+            return Path(__file__).resolve().parent / "snapshots"
+
+    def files_ready(self):
+        """Return a refusal payload when the local file tools are switched off."""
+        if self.config.get("file_tools_enabled", True):
+            return None
+        return {
+            "ok": False,
+            "status": "failed",
+            "error": "本机文件工具已关闭（file_tools_enabled）",
+        }
+
+    @filter.llm_tool(name="autonomous_read_file")
+    async def autonomous_read_file(
+        self,
+        event: AstrMessageEvent,
+        path: str,
+        max_chars: int = 8000,
+        offset: int = 0,
+    ):
+        """读本机上的文本文件内容。不需要 dsh 也能用；只能在允许读取的目录里读。
+
+        Args:
+            path(string): 文件路径，可写相对可写目录的相对路径。
+            max_chars(int): 最多返回多少字，默认 8000，上限 20000。
+            offset(int): 从第几个字开始读，用于分段读长文件。
+        """
+        blocked = self.files_ready()
+        if blocked:
+            return json.dumps(blocked, ensure_ascii=False)
+        payload = local_read_file(self.file_workspace(), path, max_chars, offset)
+        return json.dumps(payload, ensure_ascii=False)
+
+    @filter.llm_tool(name="autonomous_write_file")
+    async def autonomous_write_file(
+        self,
+        event: AstrMessageEvent,
+        path: str,
+        content: str,
+        mode: str = "overwrite",
+    ):
+        """把文字写入本机的文件（覆盖或追加）。只能写进可写目录，动手前会自动备份。
+
+        Args:
+            path(string): 目标文件路径，必须在可写目录里。
+            content(string): 要写入的完整文字。
+            mode(string): overwrite 覆盖，append 追加。
+        """
+        blocked = self.files_ready()
+        if blocked:
+            return json.dumps(blocked, ensure_ascii=False)
+        payload = local_write_file(
+            self.file_workspace(),
+            self.snapshot_store(),
+            path,
+            content,
+            mode,
+            self.number("dsh_snapshot_keep", 5, 1, 50),
+            bool(self.config.get("file_tools_snapshot_before_write", True)),
+        )
+        return json.dumps(payload, ensure_ascii=False)
+
+    @filter.llm_tool(name="autonomous_list_files")
+    async def autonomous_list_files(
+        self,
+        event: AstrMessageEvent,
+        path: str = ".",
+        depth: int = 1,
+    ):
+        """列出一个目录里有什么文件和子目录。不需要 dsh 也能用。
+
+        Args:
+            path(string): 目录路径，默认当前可写目录。
+            depth(int): 往下看几层，0 只看一层，最多 3。
+        """
+        blocked = self.files_ready()
+        if blocked:
+            return json.dumps(blocked, ensure_ascii=False)
+        payload = local_list_dir(self.file_workspace(), path, depth)
+        return json.dumps(payload, ensure_ascii=False)
+
+    @filter.llm_tool(name="autonomous_search_files")
+    async def autonomous_search_files(
+        self,
+        event: AstrMessageEvent,
+        pattern: str = "*",
+        root: str = ".",
+        contains: str = "",
+        limit: int = 20,
+    ):
+        """按文件名通配符或包含的文字在本机找文件。不需要 dsh 也能用。
+
+        Args:
+            pattern(string): 文件名通配符，例如 *.md、第*章*。
+            root(string): 从哪个目录开始找。
+            contains(string): 可选。文件内容里必须包含这段文字才算命中。
+            limit(int): 最多返回多少条，默认 20，上限 100。
+        """
+        blocked = self.files_ready()
+        if blocked:
+            return json.dumps(blocked, ensure_ascii=False)
+        payload = local_search_files(
+            self.file_workspace(), root, pattern, contains, limit
+        )
+        return json.dumps(payload, ensure_ascii=False)
+
+    @filter.llm_tool(name="autonomous_run_command")
+    async def autonomous_run_command(
+        self,
+        event: AstrMessageEvent,
+        command: str,
+        timeout: int = 60,
+    ):
+        """在本机执行一条命令。默认关闭，必须由人在插件配置里打开 allow_shell_commands 才可用。
+
+        Args:
+            command(string): 要执行的命令。
+            timeout(int): 最多等多少秒，默认 60，受配置上限约束。
+        """
+        if not bool(self.config.get("allow_shell_commands", False)):
+            return json.dumps(
+                {
+                    "ok": False,
+                    "status": "failed",
+                    "error": "本机命令执行默认关闭。需要时请人在插件配置里打开 allow_shell_commands。",
+                },
+                ensure_ascii=False,
+            )
+        blocked = self.files_ready()
+        if blocked:
+            return json.dumps(blocked, ensure_ascii=False)
+        workspace = self.file_workspace()
+        try:
+            workspace.write_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return json.dumps(
+                {"ok": False, "status": "failed", "error": f"可写目录建不出来：{exc}"},
+                ensure_ascii=False,
+            )
+        cap = self.number("shell_command_timeout", 60, 5, 600)
+        payload = await local_run_command(
+            command,
+            workspace.write_root,
+            max(5, min(int(timeout or cap), cap)),
+            self.snapshot_store(),
+            self.number("dsh_snapshot_keep", 5, 1, 50),
+            bool(self.config.get("file_tools_snapshot_before_write", True)),
+        )
         return json.dumps(payload, ensure_ascii=False)
 
     @filter.llm_tool(name="autonomous_long_task")
@@ -2716,7 +3855,7 @@ class AutonomousCompanion(Star):
                             "assistant": reply[-6000:],
                             "future_task": state.get("future_task", ""),
                             "projects": state.get("projects", []),
-                            "preferences": state.get("preferences", {}),
+                            "notes": state.get("notes", {}),
                             "appointments": state.get("appointments", []),
                             "current_time": datetime.now().astimezone().isoformat(),
                         },
@@ -2738,6 +3877,8 @@ class AutonomousCompanion(Star):
             payload = parse_object(response.completion_text or "")
             apply_plan(state, payload, user_text=user_text, allow_completion=False)
             self.update_rhythm(state, payload, user_text=user_text)
+            self.update_speak_commitment(state, payload)
+            self.update_speak_wish(state, payload)
             await self.save()
         except asyncio.CancelledError:
             raise
@@ -2753,7 +3894,7 @@ class AutonomousCompanion(Star):
         """Manage this private conversation's autonomous heartbeat."""
         if event.get_message_type() != MessageType.FRIEND_MESSAGE:
             yield event.plain_result(
-                "请在目标私聊使用：/自主 开启、关闭、状态、预览、立即"
+                "请在目标私聊使用：/自主 开启、关闭、状态、预览、立即、快照、回退"
             )
             return
         umo = event.unified_msg_origin
@@ -2761,6 +3902,19 @@ class AutonomousCompanion(Star):
         active_targets = self.target_origins()
         if umo in active_targets and umo not in self.states:
             self.states[umo] = self.new_state()
+        if action in {"快照", "备份"}:
+            names = self.dsh.snapshots(10)
+            body = "\n".join(names) if names else "还没有；她每次在本机动手前会自动生成。"
+            yield event.plain_result(
+                f"本机目录的备份（最新在前）：\n{body}\n回退：/自主 回退 或 /自主 回退 指定名字"
+            )
+            return
+        if action == "回退":
+            raw = event.get_message_str().strip()
+            wanted = raw.split("回退", 1)[-1].strip() if "回退" in raw else ""
+            ok, message = self.dsh.restore(wanted)
+            yield event.plain_result(("✅ " if ok else "⚠️ ") + message)
+            return
         if action == "开启":
             if umo not in active_targets:
                 targets.append(umo)
@@ -2828,12 +3982,69 @@ class AutonomousCompanion(Star):
                 if due
                 else "未安排"
             )
+            speak_at = state.get("next_speak_at") or 0
+            speak_time = (
+                datetime.fromtimestamp(speak_at).astimezone().strftime("%m-%d %H:%M")
+                + (
+                    f"（{state['next_speak_reason']}）"
+                    if state.get("next_speak_reason")
+                    else ""
+                )
+                if speak_at
+                else "未约定"
+            )
+            wish = self.speak_wish_text(state)
+            wish_line = (
+                wish[:120]
+                + "（从 "
+                + datetime.fromtimestamp(state.get("speak_wish_at") or time.time())
+                .astimezone()
+                .strftime("%m-%d %H:%M")
+                + " 起惦记着"
+                + (
+                    f"，已搁置 {int(state.get('speak_wish_kept') or 0)} 轮）"
+                    if state.get("speak_wish_kept")
+                    else "）"
+                )
+                if wish
+                else "没有挂着的话"
+            )
+            notes = state.get("notes")
+            if not isinstance(notes, dict):
+                notes = {}
+            rows = [(key, item) for key, item in notes.items() if isinstance(item, dict)]
+            preference_rows = [row for row in rows if note_kind(row[1]) == "preference"]
+            guess_rows = [row for row in rows if note_kind(row[1]) != "preference" and not row[1].get("confirmed")]
+            known_rows = [row for row in rows if note_kind(row[1]) != "preference" and row[1].get("confirmed")]
+            note_line = (
+                f"偏好 {len(preference_rows)} 条 · 事实与爱好 {len(known_rows)} 条"
+                + (f" · 待确认 {len(guess_rows)} 条" if guess_rows else "")
+                + (
+                    "："
+                    + "；".join(f"{key}:{str(item.get('value') or '')[:30]}" for key, item in rows[:3])
+                    if rows
+                    else ""
+                )
+                if rows
+                else "暂无"
+            )
+            activity_info = activity_summary(
+                state, self.number("activity_half_life_days", 30, 7, 365)
+            )
+            activity_line = (
+                f"常在线 {'、'.join(activity_info['active']) or '没有明显高峰'}"
+                + (f"；基本不在 {'、'.join(activity_info['quiet'])}" if activity_info["quiet"] else "")
+                if activity_info["enough"]
+                else f"样本不足（{activity_info['samples']} 次发言）"
+            )
             yield event.plain_result(
                 f"自主心跳：{'开启' if umo in active_targets and self.config.get('enabled', True) else '关闭'}\n"
-                f"下次判断：{next_time}\n续行目标：{state.get('next_task') or '无'}\n"
+                f"下次判断：{next_time}\n下次开口：{speak_time}\n心里存着：{wish_line}\n"
+                f"续行目标：{state.get('next_task') or '无'}\n"
                 f"未来计划：{state.get('future_task') or '无'}\n"
                 f"持续项目：{json.dumps(state.get('projects', []), ensure_ascii=False)}\n"
-                f"明确偏好：{json.dumps(state.get('preferences', {}), ensure_ascii=False)}\n"
+                f"关于你：{note_line}\n"
+                f"你的活跃时间：{activity_line}\n"
                 f"待处理事件：{len(state.get('events', []))}\n"
                 f"记忆：{state.get('memory_status', '尚未读取')}\n"
                 f"陪伴适配：{state.get('companion_status', '尚未检查')}\n"
@@ -2841,76 +4052,12 @@ class AutonomousCompanion(Star):
                 "命令：/自主 开启 | 关闭 | 状态 | 预览 | 立即"
             )
 
-    @filter.after_message_sent()
-    async def capture_autonomous_artifacts(self, event: AstrMessageEvent) -> None:
-        """捕获自主行动发送的作品（图片/文本创作），自动补录作品库。"""
-        if not event.get_extra("autonomous_companion"):
-            return
-        umo = event.unified_msg_origin
-        if umo not in self.states:
-            return
-        state = self.states[umo]
-        
-        # 检查消息链中是否有图片或文件
-        chain = getattr(event, "chain", None)
-        if not chain:
-            return
-        
-        for segment in chain.chain:
-            kind = None
-            path_or_url = None
-            
-            # 处理图片
-            if hasattr(segment, 'type') and segment.type == 'image':
-                kind = "image"
-                path_or_url = getattr(segment, 'url', None) or getattr(segment, 'file_url', None) or getattr(segment, 'file_path', None)
-            
-            # 处理文件（但排除代码/配置文件）
-            elif hasattr(segment, 'type') and segment.type == 'file':
-                file_path = getattr(segment, 'file_path', None) or getattr(segment, 'file_url', None)
-                if not file_path:
-                    continue
-                
-                # 过滤掉代码/配置文件
-                ext = Path(file_path).suffix.lower()
-                if ext in {'.py', '.js', '.ts', '.jsx', '.tsx', '.yml', '.yaml', '.json', '.md', '.txt'}:
-                    # 跳过代码和配置文件
-                    continue
-                
-                kind = "file"
-                path_or_url = file_path
-            
-            if not kind or not path_or_url:
-                continue
-            
-            # 提取标题（从消息文本或上下文）
-            title = "自主创作"
-            text_msg = next((s.text for s in chain.chain if hasattr(s, 'text') and s.text), "")
-            if text_msg and len(text_msg) > 10:
-                title = text_msg[:200].strip()
-            
-            receipt = {
-                "saved": True,
-                "title": title,
-                "url": path_or_url,
-                "kind": kind,
-                "producer": "autonomous_companion",
-                "status": "recorded",
-            }
-            
-            # 补录到作品库
-            from .library import register_local_work
-            try:
-                register_local_work(state, str(path_or_url), "autonomous_companion", title, status="recorded")
-                self.logger.info(f"Captured autonomous artifact: {title} ({kind}) → work_library")
-            except Exception as e:
-                self.logger.warning(f"Failed to capture autonomous artifact: {e}")
-    
     async def terminate(self) -> None:
         self.stopping = True
         tasks = (
             list(self.running.values())
             + list(self.chat_tasks.values())
+            + list(getattr(self, "reporting", {}).values())
             + list(getattr(self, "library_jobs", {}).values())
             + ([self.worker] if self.worker else [])
         )
