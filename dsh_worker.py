@@ -23,6 +23,11 @@ from astrbot.api import logger
 from astrbot.api.star import StarTools
 from astrbot.core.agent.tool import FunctionTool
 
+try:  # 正常按包导入
+    from .guard import check_task, take_snapshot
+except ImportError:  # pragma: no cover - 单独以脚本方式加载时兜底
+    from guard import check_task, take_snapshot
+
 DEFAULT_DSH_COMMAND = r"D:\dsh\resources\runtime\cli\bin\dsh.cmd"
 COMMAND_FALLBACK_ROOTS = (
     r"D:\dsh",
@@ -90,6 +95,7 @@ class DSHWorker:
             max(1, self._int("dsh_max_concurrency", 1))
         )
         self._api_key_source = ""
+        self.last_snapshot = ""
 
     # ---------------------------------------------------------------- 配置读取
 
@@ -102,6 +108,54 @@ class DSHWorker:
 
     def _int(self, key: str, default: int) -> int:
         return _as_int(self._get(key, default), default)
+
+    def _flag(self, key: str, default: bool) -> bool:
+        """Read a boolean switch that may arrive as bool, string or number."""
+        value = self._get(key, default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() not in {"0", "false", "off", "no", ""}
+
+    def _backup(self, cwd: Path, label: str) -> str:
+        """Snapshot the working directory before a real action.
+
+        Args:
+            cwd: Directory the local run may modify.
+            label: Short tag for the snapshot file name.
+
+        Returns:
+            Snapshot name, or an empty string when disabled or failing.
+        """
+        self.last_snapshot = ""
+        if not self._flag("dsh_snapshot_before_task", True):
+            return ""
+        try:
+            self.last_snapshot = take_snapshot(
+                cwd,
+                self._plugin_data_dir() / "snapshots",
+                max(1, self._int("dsh_snapshot_keep", 5)),
+                label,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[autonomous] 快照失败，继续执行：{exc}")
+            self.last_snapshot = ""
+        return self.last_snapshot
+
+    def snapshots(self, limit: int = 10) -> list[str]:
+        """List local snapshots, newest first."""
+        from .guard import list_snapshots
+
+        return list_snapshots(self._plugin_data_dir() / "snapshots", limit)
+
+    def restore(self, name: str = "", working_dir: str = "") -> tuple[bool, str]:
+        """Roll the working directory back to a snapshot."""
+        from .guard import restore_snapshot
+
+        return restore_snapshot(
+            self._plugin_data_dir() / "snapshots",
+            self.working_dir(working_dir),
+            name,
+        )
 
     # ---------------------------------------------------------------- 路径解析
 
@@ -208,7 +262,7 @@ class DSHWorker:
         text = (task or "").strip()
         if not text:
             return self._result(False, "", "任务内容是空的，什么都没执行。")
-        if str(self._get("dsh_enabled", True)).strip().lower() in {
+        if str(self._get("dsh_enabled", False)).strip().lower() in {
             "0",
             "false",
             "off",
@@ -225,6 +279,11 @@ class DSHWorker:
         if timeout and timeout > 0:
             limit = max(10, min(int(timeout), limit))
         cwd = self.working_dir(working_dir)
+        refusal = check_task(text, cwd)
+        if refusal:
+            logger.warning(f"[autonomous] 本机任务被红线拦下：{text[:120]}")
+            return self._result(False, "", refusal, cwd)
+        self._backup(cwd, "task")
 
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
@@ -322,7 +381,7 @@ class DSHWorker:
             return self._result(
                 False, "", "没有给 dsh 任何参数，什么都没执行（比如传 ['--version']）。"
             )
-        if str(self._get("dsh_enabled", True)).strip().lower() in {
+        if str(self._get("dsh_enabled", False)).strip().lower() in {
             "0",
             "false",
             "off",
@@ -338,6 +397,11 @@ class DSHWorker:
         if timeout and timeout > 0:
             limit = max(10, min(int(timeout), limit))
         cwd = self.working_dir(working_dir)
+        refusal = check_task(" ".join(argv), cwd)
+        if refusal:
+            logger.warning(f"[autonomous] 命令行任务被红线拦下：{argv}")
+            return self._result(False, "", refusal, cwd)
+        self._backup(cwd, "cli")
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
