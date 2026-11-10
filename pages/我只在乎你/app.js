@@ -83,35 +83,54 @@ function changed(key, value) {
   return true;
 }
 
+const metricIcons = {
+  // 单色线性图标：只用 currentColor 描边，不填色、不带 emoji
+  people: '<circle cx="9" cy="6.6" r="2.6"/><path d="M3.8 15c.5-2.6 2.6-4 5.2-4s4.7 1.4 5.2 4"/>',
+  pulse: '<path d="M2.2 9h3l1.8-4 2.6 8 1.7-4h3.5"/>',
+  clock: '<circle cx="9" cy="9" r="6.2"/><path d="M9 5.6V9l2.4 1.6"/>',
+  folder: '<path d="M2.4 6.2a1.4 1.4 0 0 1 1.4-1.4h3l1.4 1.8h5a1.4 1.4 0 0 1 1.4 1.4v5.6a1.4 1.4 0 0 1-1.4 1.4H3.8a1.4 1.4 0 0 1-1.4-1.4z"/>',
+  outbox: '<path d="M3 11.2V14a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-2.8"/><path d="M9 11V3.4M6.2 6.2 9 3.4l2.8 2.8"/>',
+};
+
+function metricIcon(name) {
+  return `<svg class="icon" viewBox="0 0 18 18" aria-hidden="true" focusable="false">${metricIcons[name]}</svg>`;
+}
+
 function renderMetrics(list) {
   const projects = list.flatMap(item => item.state.projects || []);
   const pending = list.reduce((count, item) => count + (item.state.outbox || []).filter(entry => entry.status === "pending").length, 0);
   const active = list.filter(item => item.running).length;
+  const speakList = list.filter(item => item.state.next_speak_at);
+  const speakAt = speakList.map(item => item.state.next_speak_at).sort((a, b) => a - b)[0] || 0;
   const cards = [
-    ["👤", "accent", "陪伴对象", list.length],
-    ["⚡", active ? "ok" : "", "正在行动", active],
-    ["📁", projects.filter(item => item.status === "active").length ? "accent" : "", "持续项目", projects.filter(item => item.status === "active").length],
-    ["📤", pending ? "warn" : "", "待分享", pending],
+    ["people", "accent", "陪伴对象", list.length],
+    ["pulse", active ? "ok" : "", "正在行动", active],
+    ["clock", speakList.length ? "accent" : "", speakAt ? `约好开口 · ${soonText(speakAt)}` : "约好开口", speakList.length],
+    ["folder", projects.filter(item => item.status === "active").length ? "accent" : "", "持续项目", projects.filter(item => item.status === "active").length],
+    ["outbox", pending ? "warn" : "", "待分享", pending],
   ];
   $("metrics").innerHTML = cards.map(([icon, tone, label, value]) =>
-    `<div class="stat" data-tone="${tone}"><span class="stat-icon">${icon}</span><div><b>${value}</b><span>${label}</span></div></div>`
+    `<div class="stat" data-tone="${tone}"><span class="stat-icon">${metricIcon(icon)}</span><div><b>${value}</b><span>${label}</span></div></div>`
   ).join("");
 }
 
 function renderSessions(list) {
-  if (!changed("sessions", [data.enabled, list.map(item => [item.umo, item.running, item.state.next_due, item.state.future_task, item.state.last_error, item.state.pause_until, item.state.last_turn?.status])])) return;
+  if (!changed("sessions", [data.enabled, list.map(item => [item.umo, item.running, item.state.next_due, item.state.next_speak_at, item.state.next_speak_reason, item.state.speak_wish, item.state.speak_wish_at, item.state.speak_wish_kept, item.state.future_task, item.state.last_error, item.state.pause_until, item.state.last_turn?.status])])) return;
   const unresolved = (data.config.targets || []).length && !list.length;
   $("sessions").innerHTML = list.map(session => {
     const paused = session.state.pause_until > Date.now() / 1000;
     const status = session.running ? ["行动中", "accent"] : data.enabled && !paused ? ["等待心跳", "ok"] : ["已暂停", ""];
-    const next = session.state.next_due ? timeText(session.state.next_due) : "尚未安排";
-    const inMin = session.state.next_due ? Math.max(0, Math.round((session.state.next_due - Date.now() / 1000) / 60)) : null;
+    const next = session.state.next_due ? timeShort(session.state.next_due) : "尚未安排";
+    const nextState = soonText(session.state.next_due);
+    const speakAt = session.state.next_speak_at;
     return `<article class="item">
       <div class="grow">
         <div class="item-title">${escapeHTML(displayName(session))}<span class="pill ${status[1]}">${status[0]}</span></div>
         <div class="item-sub mono">${escapeHTML(session.umo)}</div>
-        <div class="item-sub">下次判断 ${next}${inMin !== null ? `（约 ${inMin} 分钟后）` : ""} · ${escapeHTML(session.state.future_task || "没有固定计划，让想法自然发生")}</div>
-        ${session.state.last_error ? `<div class="item-sub" style="color:var(--bad)">${escapeHTML(session.state.last_error)}</div>` : ""}
+        <div class="item-sub">下次判断 ${next}${nextState ? `（${nextState}）` : ""} · ${escapeHTML(session.state.future_task || "没有固定计划，让想法自然发生")}</div>
+        ${speakAt ? `<div class="item-sub">她自己约定的开口时间 ${timeShort(speakAt)} · ${soonText(speakAt)}${session.state.next_speak_reason ? " · " + escapeHTML(clipText(session.state.next_speak_reason, 32)) : ""}</div>` : ""}
+        ${session.state.speak_wish ? `<div class="item-sub">心里存着想说的话（${agoText(session.state.speak_wish_at)}记下${session.state.speak_wish_kept ? `，已搁置 ${session.state.speak_wish_kept} 轮` : ""}）· ${escapeHTML(clipText(session.state.speak_wish, 40))}</div>` : ""}
+        ${session.state.last_error ? `<div class="item-sub error-text">${escapeHTML(session.state.last_error)}</div>` : ""}
       </div>
       <div class="actions">
         <button class="btn-small" data-action="now" data-umo="${escapeHTML(session.umo)}" ${(!data.enabled || session.running || paused) ? "disabled" : ""} type="button">立即判断</button>
@@ -142,7 +161,25 @@ function renderUsage() {
   const usage = session.state.usage || {};
   const config = data.config;
   const pause = session.state.pause_until > Date.now() / 1000;
-  const signature = [session.umo, usage, session.state.pause_until, session.state.pause_mode, session.state.available_tool_names, session.state.available_skill_names, config.daily_check_limit, config.daily_round_limit, config.daily_tool_limit, config.daily_message_limit];
+  const pool = session.pool || {};
+  const nightMode = pool.pool === "night";
+  const nightStart = String(config.night_window_start_hour ?? 23).padStart(2, "0");
+  const nightEnd = String(config.night_window_end_hour ?? 8).padStart(2, "0");
+  const nightPercent = config.night_budget_percent ?? 0;
+  const poolLine = nightMode
+    ? `夜间 ${nightStart}:00–${nightEnd}:00 · 判断 ${pool.checks || 0}/${pool.limit_checks || 0} · 执行 ${pool.rounds || 0}/${pool.limit_rounds || 0} · 工具 ${pool.tools || 0}/${pool.limit_tools || 0} · 发送 ${pool.messages || 0}/${pool.limit_messages || 0}`
+    : `白天 · 到 ${nightStart}:00 换成夜间额度（占白天 ${nightPercent}%）`;
+  const morning = session.state.morning_report || {};
+  const morningLine = !config.morning_report_enabled
+    ? "未开启"
+    : morning.day
+      ? `${morning.day} ${timeShort(morning.at)} 讲过一段（${String(morning.text || "").length} 字）`
+      : `每天 ${String(config.morning_report_hour ?? 8).padStart(2, "0")}:00 之后讲一次，今天还没讲`;
+  const segmentLine = config.proactive_segmented_reply
+    ? `分段发送 · 每段约 ${config.proactive_segment_chars ?? 0} 字 · 间隔 ${config.proactive_segment_interval_ms ?? 0} 毫秒`
+    : "一次发一整条";
+  const alerts = (session.state.security_alerts || []).filter(text => String(text || "").trim());
+  const signature = [session.umo, usage, pool, morning, alerts, session.state.pause_until, session.state.pause_mode, session.state.available_tool_names, session.state.available_skill_names, config.daily_check_limit, config.daily_round_limit, config.daily_tool_limit, config.daily_message_limit, config.split_night_budget, config.night_window_start_hour, config.night_window_end_hour, config.night_budget_percent, config.morning_report_enabled, config.morning_report_hour, config.proactive_segmented_reply, config.proactive_segment_chars, config.proactive_segment_interval_ms];
   if (!changed("usage", signature)) return;
   host.innerHTML = `
     <p class="hint">${escapeHTML(usage.day || "今日")} · 判断 ${usage.checks || 0}/${config.daily_check_limit || "∞"} · 执行 ${usage.rounds || 0}/${config.daily_round_limit || "∞"} · 工具 ${usage.tools || 0}/${config.daily_tool_limit || "∞"} · 发送尝试 ${usage.messages || 0}/${config.daily_message_limit || "∞"} · 失败 ${usage.failures || 0}</p>
@@ -153,6 +190,13 @@ function renderUsage() {
       <button data-pause="custom" type="button">自定义</button>
       <button data-pause="resume" type="button">恢复运行</button>
     </div>
+    <div class="kv">
+      <div class="kv-item"><span class="hint">额度池</span><b>${poolLine}</b></div>
+      <div class="kv-item"><span class="hint">晨间记录</span><b>${morningLine}</b></div>
+      <div class="kv-item"><span class="hint">发送方式</span><b>${segmentLine}</b></div>
+    </div>
+    ${morning.text ? `<details class="work"><summary><span class="work-kind">晨间</span><span class="work-title">${escapeHTML(morning.day || "")} 早上讲过的那段话</span><span class="work-meta">${String(morning.text).length} 字</span></summary><div class="work-detail"><pre class="text-preview">${escapeHTML(morning.text)}</pre></div></details>` : ""}
+    ${alerts.length ? `<div class="callout"><p class="hint">读到可疑内容，原文只留了摘要：</p>${alerts.slice(-3).map(text => `<p class="hint">${escapeHTML(clipText(String(text), 90))}</p>`).join("")}</div>` : ""}
     <details class="work"><summary><span class="work-kind">本轮</span><span class="work-title">可用工具与技能</span></summary><div class="work-detail"><div class="stack"><p class="hint">工具：${escapeHTML((session.state.available_tool_names || []).join("、") || "尚无记录")}</p><p class="hint">技能：${escapeHTML((session.state.available_skill_names || []).join("、") || "尚无记录")}</p></div></div></details>
   `;
   host.querySelectorAll("[data-pause]").forEach(button => {
@@ -207,7 +251,7 @@ function renderActivity() {
     <section class="panel">
       <div class="panel-head"><div><h2>行动记录</h2><p class="hint">最近 ${journal.length} 条决策与结果。</p></div></div>
       <div class="list">
-        ${journal.map(item => `<div class="item"><div class="grow"><div class="item-title"><span class="pill">${escapeHTML(labels[item.action] || item.action)}</span><span class="hint">${escapeHTML(item.time)}</span></div><pre class="text-preview" style="margin-top:6px;max-height:220px">${escapeHTML(item.summary)}</pre></div></div>`).join("") || '<p class="empty">还没有行动记录。</p>'}
+        ${journal.map(item => `<div class="item"><div class="grow"><div class="item-title"><span class="pill ${/^(speak|wish)_/.test(String(item.action || "")) ? "accent" : ""}">${escapeHTML(labels[item.action] || item.action)}</span><span class="hint">${escapeHTML(item.time)}</span></div><pre class="text-preview" style="margin-top:8px;max-height:220px">${escapeHTML(item.summary)}</pre></div></div>`).join("") || '<p class="empty">还没有行动记录。</p>'}
       </div>
     </section>
 
@@ -225,20 +269,48 @@ function renderActivity() {
 }
 
 const groups = [
-  ["陪伴对象与运行",["enabled","targets","platform_id","companion_integration","general_execution_contract","task_completion_message","natural_task_closing","check_comfyui_each_round","comfyui_url","template_mcp_server"]],
-  ["每日预算 · 每个对象独立计算",["ignore_budget_while_active","daily_check_limit","daily_round_limit","daily_tool_limit","daily_message_limit"]],
-  ["节奏与自主性",["manual_task_ttl_minutes","adaptive_frequency","frequency_min_minutes","frequency_max_minutes","interval_minutes","jitter_minutes","continuation_window_minutes","max_rounds","chat_planning","tool_event_wakeup","extra_prompt"]],
-  ["高级 · 工具与上下文",["max_tool_calls","max_agent_steps","turn_timeout_seconds","tool_timeout_seconds","recent_chat_grace_seconds","history_messages","history_chars","memory_timeout_seconds","allowed_tools"],true],
-  ["条件查询与作品目录",["condition_query_tools","condition_file_roots","work_library_roots"]]
+  ["对象与运行",["enabled","targets","platform_id"],"谁在被陪伴、总开关在哪。填好 QQ 号保存后即持续运行。"],
+  ["陪伴与人格",["companion_integration","livingmemory_integration","expose_plugin_hooks","proactive_segmented_reply","proactive_segment_chars","proactive_segment_interval_ms","general_execution_contract","task_completion_message","natural_task_closing","extra_prompt"],"和别的插件怎么配合、一句话要不要拆成几条发、做完事要不要交代一句、额外的语气要求。"],
+  ["节奏与自主性",["manual_task_ttl_minutes","adaptive_frequency","frequency_min_minutes","frequency_max_minutes","interval_minutes","jitter_minutes","continuation_window_minutes","max_rounds","tool_event_wakeup"],"多久判断一次、能不能自己调频率、一次主动能连续做多少事。"],
+  ["自己约定的开口",["self_scheduled_speak","next_speak_min_minutes","next_speak_max_minutes","speak_wish_ttl_hours"],"她自己约下次开口的时间（到点专门唤醒一次），以及心里存着的话保留多久。"],
+  ["夜间与晨间",["split_night_budget","night_window_start_hour","night_window_end_hour","night_budget_percent","morning_report_enabled","morning_report_hour","morning_report_min_gap_hours","morning_report_max_chars","morning_report_timeout_seconds"],"夜里单独算一份额度，免得半夜把白天的预算花光；早上醒来先用她自己的话讲一遍昨晚发生了什么。"],
+  ["记忆与整理",["chat_planning","preference_stale_days","activity_half_life_days","action_digest_chars","external_text_chars"],"从日常聊天整理计划与关于你的记录；读进来的外部文本最多塞多少字。"],
+  ["每日预算 · 每个对象独立",["ignore_budget_while_active","daily_check_limit","daily_round_limit","daily_tool_limit","daily_message_limit"],"保护阈值：判断、回合、工具、发送分开计数，用完就停，不跨天补。夜里的那份见「夜间与晨间」。"],
+  ["工具、超时与上下文",["max_tool_calls","max_agent_steps","turn_timeout_seconds","tool_timeout_seconds","recent_chat_grace_seconds","history_messages","history_chars","memory_timeout_seconds","allowed_tools","check_comfyui_each_round","comfyui_url","template_mcp_server"],"单轮工具上限、超时与上下文窗口。没有特殊需要不必改。",true],
+  ["文件与命令",["file_tools_enabled","file_tools_root","file_tools_extra_read_roots","file_tools_snapshot_before_write","allow_shell_commands","shell_command_timeout"],"让她读你本机的文件、必要时执行命令。改文件前先留快照；命令默认关闭，想开再开。",true],
+  ["条件查询与作品目录",["condition_query_tools","condition_file_roots","work_library_roots"],"允许她只读检查的服务与目录、补充的作品路径。"],
+  ["高级 · 发送守卫",["state_claim_guard","tool_work_message","delivery_tools","action_memory_write","pending_message_ttl_hours"],"发送前自检、工具回执与后台轮暂存策略。一般不用改。",true],
+  ["高级 · DSH 集成",["dsh_enabled","dsh_command","dsh_home","dsh_working_dir","dsh_timeout","dsh_snapshot_before_task","dsh_snapshot_keep","dsh_max_result_chars","dsh_max_concurrency","dsh_api_key","dsh_base_url"],"接入本机 DSH/DeepSeek 工具链时才需要；不接就保持关闭。",true],
 ];
 const names = {
   enabled: "持续运行", targets: "对象 QQ 号", platform_id: "QQ 平台实例",
-  companion_integration: "适配陪伴插件", general_execution_contract: "执行契约",
+  companion_integration: "适配陪伴插件", livingmemory_integration: "适配 LivingMemory",
+  expose_plugin_hooks: "对外暴露插件钩子",
+  proactive_segmented_reply: "她的消息分段发送",
+  proactive_segment_chars: "每段最多 / 字",
+  proactive_segment_interval_ms: "两段之间间隔 / 毫秒",
+  general_execution_contract: "执行契约",
   task_completion_message: "完成时交代一句", natural_task_closing: "允许自然收尾",
   check_comfyui_each_round: "每轮检查 ComfyUI", comfyui_url: "ComfyUI 地址",
   template_mcp_server: "模板 MCP 服务", manual_task_ttl_minutes: "手动任务有效期 / 分钟",
   adaptive_frequency: "自主调整间隔", frequency_min_minutes: "最短间隔 / 分钟",
   frequency_max_minutes: "最长间隔 / 分钟", interval_minutes: "基础检查间隔 / 分钟",
+  self_scheduled_speak: "自己约定开口时间", next_speak_min_minutes: "开口约定最短 / 分钟",
+  next_speak_max_minutes: "开口约定最长 / 分钟",
+  speak_wish_ttl_hours: "想说的话保留 / 小时",
+  split_night_budget: "夜里单独算一份额度",
+  night_window_start_hour: "夜里从几点算起",
+  night_window_end_hour: "夜里到几点结束",
+  night_budget_percent: "夜间额度占白天 / 百分比",
+  morning_report_enabled: "早上先讲一遍昨晚",
+  morning_report_hour: "几点算早上",
+  morning_report_min_gap_hours: "两次至少隔 / 小时",
+  morning_report_max_chars: "这段最多 / 字",
+  morning_report_timeout_seconds: "生成超时 / 秒",
+  preference_stale_days: "偏好多久算过时 / 天",
+  activity_half_life_days: "活跃统计多久淡化一半 / 天",
+  action_digest_chars: "做事摘要最多 / 字",
+  external_text_chars: "外部文本最多 / 字",
   jitter_minutes: "随机浮动 / 分钟", continuation_window_minutes: "短时续行窗口 / 分钟",
   max_rounds: "每个窗口最多回合", chat_planning: "从日常聊天整理计划",
   tool_event_wakeup: "工具返回触发事件", extra_prompt: "额外行为偏好",
@@ -251,9 +323,16 @@ const names = {
   history_chars: "上下文总字符数", memory_timeout_seconds: "记忆读取超时 / 秒",
   condition_query_tools: "只读查询工具", condition_file_roots: "允许检查的目录",
   work_library_roots: "补充作品目录",
+  file_tools_enabled: "允许她读写文件",
+  file_tools_root: "文件工具根目录",
+  file_tools_extra_read_roots: "额外可读目录",
+  file_tools_snapshot_before_write: "改文件前先留快照",
+  allow_shell_commands: "允许执行命令",
+  shell_command_timeout: "命令超时 / 秒",
+  dsh_snapshot_before_task: "接任务前留快照",
+  dsh_snapshot_keep: "保留几份快照",
 };
 names.companion_integration="可选适配我会永远陪着你";
-
 function fieldHTML(key) {
   const spec = data.schema[key];
   const value = data.config[key];
@@ -274,17 +353,13 @@ function fieldHTML(key) {
 }
 
 function renderSettings() {
-  for (const key of ["proactive_segmented_reply", "proactive_segment_chars", "proactive_segment_interval_ms"]) {
-    if (!groups[0][1].includes(key)) groups[0][1].push(key);
-  }
-  if (!groups[0][1].includes("livingmemory_integration")) groups[0][1].push("livingmemory_integration");
-  names.livingmemory_integration = "适配 LivingMemory";
-  $("config-fields").innerHTML = groups.map(([title, keys, collapsed]) => {
+  $("config-fields").innerHTML = groups.map(([title, keys, lead, collapsed]) => {
     const body = `<div class="field-grid">${keys.filter(key => data.schema[key]).map(fieldHTML).join("")}</div>`;
+    const sub = lead ? `<p class="hint">${escapeHTML(lead)}</p>` : "";
     if (collapsed) {
-      return `<details class="panel"><summary><span>${title}</span><span class="hint">${keys.length} 项</span></summary><div class="panel-body">${body}</div></details>`;
+      return `<details class="panel"><summary><span>${title}</span><span class="hint">${keys.length} 项 · 默认收起</span></summary><div class="panel-body stack">${sub}${body}</div></details>`;
     }
-    return `<section class="panel"><div class="panel-head"><h2>${title}</h2></div><div class="panel-body">${body}</div></section>`;
+    return `<section class="panel"><div class="panel-head"><div><h2>${title}</h2>${sub}</div></div>${body}</section>`;
   }).join("");
   loadedForm = true;
   dirty = false;
@@ -303,9 +378,9 @@ function renderView(name) {
     const signature = [session.umo, session.state.long_tasks, session.state.future_task, session.state.manual_plan_expires_at, session.state.plan_status, session.state.pending_message,
       session.state.projects, session.state.rhythm_minutes, session.state.rhythm_reason, session.state.rhythm_updated_at,
       session.state.rhythm_scope, session.state.rhythm_expires_at, session.state.rhythm_ignored_reason, session.state.rhythm_history,
-      session.state.preferences, session.state.conditions, session.state.condition_observations, session.state.appointments,
+      session.state.notes, session.state.activity, session.state.conditions, session.state.condition_observations, session.state.appointments,
       session.state.cancelled_tasks, session.state.execution_checkpoints, session.state.execution_checkpoint,
-      session.state.rounds, session.state.next_due, session.state.window_end, session.state.companion_status, session.state.next_task, session.state.continuation_status,
+      session.state.rounds, session.state.next_due, session.state.next_speak_at, session.state.next_speak_reason, session.state.speak_ignored_reason, session.state.speak_wish, session.state.speak_wish_at, session.state.speak_wish_kept, session.state.window_end, session.state.companion_status, session.state.next_task, session.state.continuation_status,
       data.config.max_rounds, data.config.adaptive_frequency, data.config.interval_minutes];
     if (!plansHasUnsaved() && !$("plans-content").contains(document.activeElement) && changed("plans", signature)) renderPlans();
   } else if (name === "works") {
