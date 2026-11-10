@@ -4,6 +4,10 @@ import copy
 import time
 import uuid
 
+# 一个待办断点被自动续跑的次数上限。断点没有时间过期机制，只要 pending 就会被
+# 下一轮选中；同一件事反复"再证明一次"能挂几个小时（2026-11-10 发歌那次就是）。
+MAX_CHECKPOINT_RESUMES = 4
+
 
 def save_checkpoint(event):
     task = getattr(event, "checkpoint_task", "")
@@ -22,6 +26,7 @@ def save_checkpoint(event):
             "pending": getattr(event, "checkpoint_pending", True),
             "project_id": getattr(event, "project_id", ""),
             "next_attempt_at": previous.get("next_attempt_at", 0),
+            "resume_count": previous.get("resume_count", 0),
         }
         checkpoints = event.state.setdefault("execution_checkpoints", {})
         identifier = getattr(event, "checkpoint_id", "")
@@ -77,6 +82,7 @@ def next_checkpoint(state, cid, now=None):
         for item in index.values()
         if item.get("pending")
         and item.get("cid") == cid
+        and int(item.get("resume_count", 0)) < MAX_CHECKPOINT_RESUMES
         and item.get("next_attempt_at", 0) <= now
         and (
             not item.get("project_id")
@@ -93,6 +99,28 @@ def next_checkpoint(state, cid, now=None):
         if candidates
         else None
     )
+
+
+def count_checkpoint_resume(state, task: str) -> int:
+    """Count one automatic resume against a pending checkpoint.
+
+    Args:
+        state: Per-target task index.
+        task: Task text identifying the resumed checkpoint.
+
+    Returns:
+        The highest resume count recorded for that task.
+    """
+    count = 0
+    legacy = state.get("execution_checkpoint", {})
+    if isinstance(legacy, dict) and legacy.get("task") == task:
+        legacy["resume_count"] = int(legacy.get("resume_count", 0)) + 1
+        count = legacy["resume_count"]
+    for item in (state.get("execution_checkpoints") or {}).values():
+        if item.get("task") == task:
+            item["resume_count"] = int(item.get("resume_count", 0)) + 1
+            count = max(count, item["resume_count"])
+    return count
 
 
 def checkpoint_context(event):
