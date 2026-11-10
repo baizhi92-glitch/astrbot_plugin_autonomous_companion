@@ -83,7 +83,7 @@ class SendArtifactTool(FunctionTool):
                 {"success": False, "reason": "产物不属于当前任务或已处理"},
                 ensure_ascii=False,
             )
-        first_delivery = event.state.get("first_media_delivery_at", 0)
+        first_delivery = getattr(event, "first_media_delivery_at", 0)
         registered_at = item.get("registered_at", 0)
         if first_delivery and registered_at and registered_at > first_delivery:
             # The task already delivered media; this artifact was regenerated
