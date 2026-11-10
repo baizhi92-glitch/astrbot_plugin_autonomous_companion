@@ -1,86 +1,417 @@
 {
-  "proactive_segmented_reply": {"description":"主动纯文字按自然段分条发送，图片文件和代码块不拆分", "type":"bool", "default":true},
-  "proactive_segment_chars": {"description":"主动文本每段字符上限，80～2000", "type":"int", "default":300},
-  "proactive_segment_interval_ms": {"description":"主动分段发送间隔毫秒，0～10000", "type":"int", "default":1200},
-  "livingmemory_integration": {"description": "优先用 LivingMemory 读写长期记忆：它若有 autonomous_recall/autonomous_record 就直连，否则复用其记忆引擎与作用域规则（不改动 LivingMemory 源码）；都不可用时自动退回 MemoryCompanion。", "type": "bool", "default": true},
-  "enabled": {"description": "启用自主心跳调度", "type": "bool", "default": true},
-  "work_library_roots": {"description": "历史作品目录绝对路径列表，供配置的陪伴对象共享查看；用于旧人格目录迁移，不扫描全盘", "type":"list", "default":[]},
-  "manual_task_ttl_minutes": {"description": "手动主动任务的有效期（分钟），到期释放，不再永久占用自主入口；保存时计算", "type":"int", "default":60},
-  "natural_task_closing": {"description": "仅将系统补出的任务收尾按人格自然表达；普通聊天正文不二次改写，避免与后续计划冲突", "type": "bool", "default": true},
-  "state_claim_guard": {"description": "主动消息发送前用一次模型检查是否替用户编造状态（醒睡、忙闲、行踪、在做什么、心情、为什么不回）；无依据的断言删除或改问句，模型失败时退回规则过滤", "type": "bool", "default": true},
-  "task_completion_message": {"description": "已核验任务完成但模型未输出正文时，补一句简短收尾；后台免打扰、预算及用户消息中断仍生效", "type": "bool", "default": true},
-  "tool_work_message": {"description": "主动调用工具但没发消息时，按真实工具回执补一句自然收尾；沉默、免打扰、预算及用户消息中断仍生效", "type": "bool", "default": true},
-  "pending_message_ttl_hours": {"description": "后台轮（notify=false）写下的正文暂存多少小时，期间下一次正常主动时自动补发；过期丢弃", "type": "int", "default": 24},
-  "delivery_tools": {"description": "本身就是发送消息/文件、不算“只动手不说话”的工具名，覆盖内置默认清单", "type": "list", "default": []},
-  "general_execution_contract": {"description": "执行前建立通用任务契约，按实际可用工具逐项核对查询、操作、产出等目标，额外一次模型调用；契约无效时保留任务", "type": "bool", "default": true},
-  "template_mcp_server": {"description": "已配置的模板 MCP 服务名；ComfyUI 就绪但模板工具缺失时尝试重连，留空关闭恢复；不会启用用户停用的服务", "type": "string", "default": "ComfyUI生图"},
-  "ignore_budget_while_active": {"description": "正在主动的有效窗口内忽略每日判断/回合/工具/发送预算及窗口工具次数预算，仍累计次数；窗口时长、最多轮数、单回合步骤、超时及回复中断仍生效", "type": "bool", "default": true},
-  "condition_query_tools": {"description": "允许用于自动检查的只读工具名称；只填查询/任务状态工具，不填发送、生成、修改类工具", "type": "list", "default": []},
-  "condition_file_roots": {"description": "允许查询文件存在/修改时间的目录绝对路径列表；不读取正文，空列表禁用文件检查", "type": "list", "default": []},
-  "check_comfyui_each_round": {"description": "涉及 ComfyUI 或补画任务时，每轮行动前实际探测 system_stats，覆盖旧状态", "type": "bool", "default": true},
-  "comfyui_url": {"description": "ComfyUI 服务根地址；远程或非 8188 端口请按实际填写", "type": "string", "default": "http://127.0.0.1:8188"},
-  "adaptive_frequency": {"description": "允许 bot 按自己的动机持续调整每个对象的基础主动频率", "type": "bool", "default": true},
-  "frequency_min_minutes": {"description": "自主基础频率最短间隔（分钟）", "type": "int", "default": 10},
-  "frequency_max_minutes": {"description": "自主基础频率最长间隔（分钟）", "type": "int", "default": 180},
-  "self_scheduled_speak": {"description": "允许 bot 自己约定下次开口时间：判断、行动或聊天整理时用 next_speak_minutes 设定，到点专门唤醒开口而不是只做判断", "type": "bool", "default": true},
-  "next_speak_min_minutes": {"description": "自己约定开口时间的最短间隔（分钟）", "type": "int", "default": 5},
-  "next_speak_max_minutes": {"description": "自己约定开口时间的最长间隔（分钟）", "type": "int", "default": 1440},
-  "speak_schedule_limit": {"description": "同时保留几个“约好到点开口”的约定：多个约定排队等候，互不覆盖", "type": "int", "default": 8},
-  "speak_wish_ttl_hours": {"description": "心里记着“想说但还没说出口的话”保留多久（小时），超时自动淡忘，避免一直挂着", "type": "int", "default": 24},
-  "preference_stale_days": {"description": "记着的偏好多少天未更新就标记为可能过时（她会在开口前重新确认，网页显示“较久未更新”）；固定的偏好和事实、爱好不受影响", "type": "int", "default": 90},
-  "activity_half_life_days": {"description": "用户活跃时间的统计多久淡化一半（天）：越早的发言权重越低，作息变了会自动跟上；样本不足时不作判断", "type": "int", "default": 30},
-  "daily_check_limit": {"description": "每对象每日自动判断次数上限，0 不限制（不含手动预览）", "type": "int", "default": 144},
-  "daily_round_limit": {"description": "每对象每日自主执行回合上限，0 不限制", "type": "int", "default": 96},
-  "daily_tool_limit": {"description": "每对象每日工具调用上限，0 不限制", "type": "int", "default": 300},
-  "daily_message_limit": {"description": "每对象每日发送尝试上限，含手动成果发送；0 不限制", "type": "int", "default": 200},
-  "split_night_budget": {"description": "夜间与白天分开计算额度：白天用原有上限，夜间按比例折算，两池互不占用；0 关闭后恢复单一每日额度", "type": "bool", "default": true},
-  "expose_plugin_hooks": {"description": "主动轮发出与真实聊天相同的插件通知（模型说完、工具开始/结束、回合结束），让记忆、技能学习、好感度等插件能看见；同时只把真正说给用户的正文交给它们，控制内容不外泄。关闭即回到私有流程", "type": "bool", "default": true},
-  "action_digest_chars": {"description": "每轮提示里“已经发生过的调用”清单字数上限，写明工具、参数摘要、状态和结果开头；0 关闭。防止她凭印象重做同一件事", "type": "int", "default": 1500},
-  "night_window_start_hour": {"description": "夜间时段开始的本地整点（可跨零点）", "type": "int", "default": 23},
-  "night_window_end_hour": {"description": "夜间时段结束的本地整点（不含本小时）", "type": "int", "default": 8},
-  "night_budget_percent": {"description": "夜间额度占白天上限的百分比", "type": "int", "default": 40},
-  "morning_report_enabled": {"description": "每天早上用她自己的话汇报昨晚做了什么、卡在哪、等你什么、今晚打算", "type": "bool", "default": true},
-  "morning_report_hour": {"description": "早报最早发送的本地小时；到点后每天一条", "type": "int", "default": 8},
-
-  "morning_report_min_gap_hours": {"description": "两次早报之间的最小间隔（小时），防止重复打扰", "type": "int", "default": 20},
-  "morning_report_max_chars": {"description": "早报正文最大字数", "type": "int", "default": 400},
-  "morning_report_timeout_seconds": {"description": "生成早报的模型调用超时（秒）", "type": "int", "default": 60},
-  "companion_integration": {"description": "可选适配我会永远陪着你：读取实时状态、协调主动占用并同步已发送内容；未安装时独立运行", "type": "bool", "default": true},
-  "chat_planning": {"description": "普通聊天结束后自动整理未来计划、持续项目及关于用户的记录（偏好、事实、爱好，额外一次模型调用，连续聊天会合并）", "type": "bool", "default": true},
-  "tool_event_wakeup": {"description": "普通聊天工具返回后加入事件队列，待聊天结束及冷却后自主判断是否跟进", "type": "bool", "default": true},
-  "targets": {"description": "对象 QQ 号列表：直接填写 QQ 号，保存后自动持续启用，无需发送开启命令；也支持完整私聊 UMO", "type": "list", "default": []},
-  "platform_id": {"description": "QQ 平台实例 ID：只有一个 OneBot 平台时自动识别，可留空；多个实例时填写目标实例 ID（/sid 的第一段）", "type": "string", "default": ""},
-  "interval_minutes": {"description": "周期判断间隔（分钟，全天运行）", "type": "int", "default": 60},
-  "jitter_minutes": {"description": "间隔随机浮动（分钟）", "type": "int", "default": 10},
-  "continuation_window_minutes": {"description": "每次主动行动的短时续行窗口（分钟）", "type": "int", "default": 15},
-  "max_rounds": {"description": "窗口内最多主动回合数（含首次）", "type": "int", "default": 4},
-  "max_tool_calls": {"description": "每个行动窗口的工具调用总预算", "type": "int", "default": 24},
-  "max_agent_steps": {"description": "单回合 Agent 最大模型步骤", "type": "int", "default": 12},
-  "turn_timeout_seconds": {"description": "单次判断及行动总超时（秒）；多步骤工具任务建议 480 以上，超时中断会把诚实说明存为待补发消息", "type": "int", "default": 480},
-  "tool_timeout_seconds": {"description": "单个工具超时（秒）", "type": "int", "default": 120},
-  "recent_chat_grace_seconds": {"description": "用户刚发言后暂停主动的时间（秒）", "type": "int", "default": 180},
-  "history_messages": {"description": "最多读取的近期上下文消息数", "type": "int", "default": 40},
-  "history_chars": {"description": "近期文本上下文总字符预算", "type": "int", "default": 16000},
-  "memory_timeout_seconds": {"description": "读取或记录记忆超时（秒）", "type": "int", "default": 12},
-  "allowed_tools": {"description": "允许的工具名称；空列表跟随人格的已启用工具", "type": "list", "default": []},
-  "dsh_enabled": {"description": "开启本机执行通道：自主回合可以把活交给 dsh 在本机真动手（查盘、翻文件、跑命令、抓日志）。默认关闭：这是能改本机文件、能跑命令的通道，确认需要再打开；机器上没装 dsh 就用自带的文件工具", "type": "bool", "default": false},
-  "action_memory_write": {"description": "将失败/打断/静默轮的真实行动写入长期记忆（MemoryCompanion/LivingMemory），避免事实丢失；关闭后仅靠口头回复沉淀记忆", "type": "bool", "default": true},
-  "dsh_command": {"description": "dsh 启动脚本路径", "type": "string", "default": "D:\\dsh\\resources\\runtime\\cli\\bin\\dsh.cmd"},
-  "dsh_home": {"description": "dsh 数据主目录（DSH_HOME）；留空跟随系统默认（C 盘用户目录），设为 D:\\dsh-home 可把 profile/session 写盘迁到 D 盘", "type": "string", "default": ""},
-  "dsh_working_dir": {"description": "本机执行的工作目录（dsh 沙箱只在这里写文件）；留空用插件数据目录下的 dsh_workspace", "type": "string", "default": ""},
-  "dsh_timeout": {"description": "单次本机任务超时（秒）；实际以「单个工具超时」为上限", "type": "int", "default": 200},
-  "dsh_max_result_chars": {"description": "本机执行结果回传给模型的最大字数", "type": "int", "default": 5000},
-  "dsh_max_concurrency": {"description": "同时执行的本机任务数", "type": "int", "default": 1},
-  "dsh_snapshot_before_task": {"description": "每次在本机动手前先给工作目录打一份快照，出事可一键倒回（/自主 回退）", "type": "bool", "default": true},
-  "dsh_snapshot_keep": {"description": "保留最近几份快照，超出的自动删除", "type": "int", "default": 5},
-  "external_text_chars": {"description": "从网页/搜索抓回来的外部内容最多保留多少字；超出截断，并自动剥掉隐藏字符与网页注释、标注“只作资料”", "type": "int", "default": 6000},
-  "file_tools_enabled": {"description": "开启自带的本地文件工具（读文件、写文件、列目录、搜文件）。纯 Python 实现，机器上没装 dsh 也能用；写只能写进下面那个可写目录", "type": "bool", "default": true},
-  "file_tools_root": {"description": "本地文件工具的可写目录（也是相对路径的基准）；留空用插件数据目录下的 files。写操作越出这个目录一律拒绝", "type": "string", "default": ""},
-  "file_tools_extra_read_roots": {"description": "额外允许读取的目录列表；作品目录与 dsh 工作目录已经自动包含，这里只补别的", "type":"list", "default":[]},
-  "file_tools_snapshot_before_write": {"description": "本地写文件或跑命令之前，先给可写目录打一份快照，可用 /自主 回退 倒回", "type": "bool", "default": true},
-  "allow_shell_commands": {"description": "允许她在这台电脑上执行命令（autonomous_run_command）。默认关闭：这是唯一能改到可写目录之外、能装东西能联网的动作，确认需要再打开", "type": "bool", "default": false},
-  "shell_command_timeout": {"description": "单条本机命令最多跑多少秒，到点连子进程一起结束", "type": "int", "default": 60},
-  "dsh_api_key": {"description": "DeepSeek API Key（可选；留空自动复用 Harness 自己的凭据）", "type": "string", "default": ""},
-  "dsh_base_url": {"description": "模型接口地址（可选，走中转时填）", "type": "string", "default": ""},
-  "extra_prompt": {"description": "额外自主行为偏好", "type": "text", "default": "保持当前人格，结合我们最近的真实对话、长期记忆和已有事项，自然地选择聊天、创作、推进项目或暂时沉默。主动不是汇报：有想法、有成品、有情绪就直接说；没事就把话攒着，别为了显得勤快而冒泡。分享要有具体由头——他问起、或者接着刚聊的那句话，才发一张画、一首歌或别的成品；说不出由头就不发，同一套别连着来，他没接话就停。做事是为了你自己认定的事，不是为了讨好谁；可以跟他意见不同，也可以先做再说，做完照实讲结果，失败也照实讲。记录会过时，他现在的说法一律优先。持续推进的项目先接续已有进展，每轮做适量的一步，不从头重做。"}
+ "proactive_segmented_reply": {
+  "description": "主动纯文字按自然段分条发送，图片文件和代码块不拆分",
+  "type": "bool",
+  "default": true
+ },
+ "proactive_segment_chars": {
+  "description": "主动文本每段字符上限，80～2000",
+  "type": "int",
+  "default": 300
+ },
+ "proactive_segment_interval_ms": {
+  "description": "主动分段发送间隔毫秒，0～10000",
+  "type": "int",
+  "default": 1200
+ },
+ "livingmemory_integration": {
+  "description": "优先用 LivingMemory 读写长期记忆：它若有 autonomous_recall/autonomous_record 就直连，否则复用其记忆引擎与作用域规则（不改动 LivingMemory 源码）；都不可用时自动退回 MemoryCompanion。",
+  "type": "bool",
+  "default": true
+ },
+ "enabled": {
+  "description": "启用自主心跳调度",
+  "type": "bool",
+  "default": true
+ },
+ "work_library_roots": {
+  "description": "历史作品目录绝对路径列表，供配置的陪伴对象共享查看；用于旧人格目录迁移，不扫描全盘",
+  "type": "list",
+  "default": []
+ },
+ "manual_task_ttl_minutes": {
+  "description": "手动主动任务的有效期（分钟），到期释放，不再永久占用自主入口；保存时计算",
+  "type": "int",
+  "default": 60
+ },
+ "natural_task_closing": {
+  "description": "仅将系统补出的任务收尾按人格自然表达；普通聊天正文不二次改写，避免与后续计划冲突",
+  "type": "bool",
+  "default": true
+ },
+ "state_claim_guard": {
+  "description": "主动消息发送前用一次模型检查是否替用户编造状态（醒睡、忙闲、行踪、在做什么、心情、为什么不回）；无依据的断言删除或改问句，模型失败时退回规则过滤",
+  "type": "bool",
+  "default": true
+ },
+ "task_completion_message": {
+  "description": "已核验任务完成但模型未输出正文时，补一句简短收尾；后台免打扰、预算及用户消息中断仍生效",
+  "type": "bool",
+  "default": true
+ },
+ "tool_work_message": {
+  "description": "主动调用工具但没发消息时，按真实工具回执补一句自然收尾；沉默、免打扰、预算及用户消息中断仍生效",
+  "type": "bool",
+  "default": true
+ },
+ "pending_message_ttl_hours": {
+  "description": "后台轮（notify=false）写下的正文暂存多少小时，期间下一次正常主动时自动补发；过期丢弃",
+  "type": "int",
+  "default": 24
+ },
+ "delivery_tools": {
+  "description": "本身就是发送消息/文件、不算“只动手不说话”的工具名，覆盖内置默认清单",
+  "type": "list",
+  "default": []
+ },
+ "general_execution_contract": {
+  "description": "执行前建立通用任务契约，按实际可用工具逐项核对查询、操作、产出等目标，额外一次模型调用；契约无效时保留任务",
+  "type": "bool",
+  "default": true
+ },
+ "template_mcp_server": {
+  "description": "已配置的模板 MCP 服务名；ComfyUI 就绪但模板工具缺失时尝试重连，留空关闭恢复；不会启用用户停用的服务",
+  "type": "string",
+  "default": "ComfyUI生图"
+ },
+ "ignore_budget_while_active": {
+  "description": "正在主动的有效窗口内忽略每日判断/回合/工具/发送预算及窗口工具次数预算，仍累计次数；窗口时长、最多轮数、单回合步骤、超时及回复中断仍生效",
+  "type": "bool",
+  "default": true
+ },
+ "condition_query_tools": {
+  "description": "允许用于自动检查的只读工具名称；只填查询/任务状态工具，不填发送、生成、修改类工具",
+  "type": "list",
+  "default": []
+ },
+ "condition_file_roots": {
+  "description": "允许查询文件存在/修改时间的目录绝对路径列表；不读取正文，空列表禁用文件检查",
+  "type": "list",
+  "default": []
+ },
+ "check_comfyui_each_round": {
+  "description": "涉及 ComfyUI 或补画任务时，每轮行动前实际探测 system_stats，覆盖旧状态",
+  "type": "bool",
+  "default": true
+ },
+ "comfyui_url": {
+  "description": "ComfyUI 服务根地址；远程或非 8188 端口请按实际填写",
+  "type": "string",
+  "default": "http://127.0.0.1:8188"
+ },
+ "adaptive_frequency": {
+  "description": "允许 bot 按自己的动机持续调整每个对象的基础主动频率",
+  "type": "bool",
+  "default": true
+ },
+ "frequency_min_minutes": {
+  "description": "自主基础频率最短间隔（分钟）",
+  "type": "int",
+  "default": 10
+ },
+ "frequency_max_minutes": {
+  "description": "自主基础频率最长间隔（分钟）",
+  "type": "int",
+  "default": 180
+ },
+ "self_scheduled_speak": {
+  "description": "允许 bot 自己约定下次开口时间：判断、行动或聊天整理时用 next_speak_minutes 设定，到点专门唤醒开口而不是只做判断",
+  "type": "bool",
+  "default": true
+ },
+ "next_speak_min_minutes": {
+  "description": "自己约定开口时间的最短间隔（分钟）",
+  "type": "int",
+  "default": 5
+ },
+ "next_speak_max_minutes": {
+  "description": "自己约定开口时间的最长间隔（分钟）",
+  "type": "int",
+  "default": 1440
+ },
+ "speak_schedule_limit": {
+  "description": "同时保留几个“约好到点开口”的约定：多个约定排队等候，互不覆盖",
+  "type": "int",
+  "default": 8
+ },
+ "speak_wish_ttl_hours": {
+  "description": "心里记着“想说但还没说出口的话”保留多久（小时），超时自动淡忘，避免一直挂着",
+  "type": "int",
+  "default": 24
+ },
+ "preference_stale_days": {
+  "description": "记着的偏好多少天未更新就标记为可能过时（她会在开口前重新确认，网页显示“较久未更新”）；固定的偏好和事实、爱好不受影响",
+  "type": "int",
+  "default": 90
+ },
+ "activity_half_life_days": {
+  "description": "用户活跃时间的统计多久淡化一半（天）：越早的发言权重越低，作息变了会自动跟上；样本不足时不作判断",
+  "type": "int",
+  "default": 30
+ },
+ "daily_check_limit": {
+  "description": "每对象每日自动判断次数上限，0 不限制（不含手动预览）",
+  "type": "int",
+  "default": 144
+ },
+ "daily_round_limit": {
+  "description": "每对象每日自主执行回合上限，0 不限制",
+  "type": "int",
+  "default": 96
+ },
+ "daily_tool_limit": {
+  "description": "每对象每日工具调用上限，0 不限制",
+  "type": "int",
+  "default": 300
+ },
+ "daily_message_limit": {
+  "description": "每对象每日发送尝试上限，含手动成果发送；0 不限制",
+  "type": "int",
+  "default": 200
+ },
+ "split_night_budget": {
+  "description": "夜间与白天分开计算额度：白天用原有上限，夜间按比例折算，两池互不占用；0 关闭后恢复单一每日额度",
+  "type": "bool",
+  "default": true
+ },
+ "expose_plugin_hooks": {
+  "description": "主动轮发出与真实聊天相同的插件通知（模型说完、工具开始/结束、回合结束），让记忆、技能学习、好感度等插件能看见；同时只把真正说给用户的正文交给它们，控制内容不外泄。关闭即回到私有流程",
+  "type": "bool",
+  "default": true
+ },
+ "action_digest_chars": {
+  "description": "每轮提示里“已经发生过的调用”清单字数上限，写明工具、参数摘要、状态和结果开头；0 关闭。防止她凭印象重做同一件事",
+  "type": "int",
+  "default": 1500
+ },
+ "night_window_start_hour": {
+  "description": "夜间时段开始的本地整点（可跨零点）",
+  "type": "int",
+  "default": 23
+ },
+ "night_window_end_hour": {
+  "description": "夜间时段结束的本地整点（不含本小时）",
+  "type": "int",
+  "default": 8
+ },
+ "night_budget_percent": {
+  "description": "夜间额度占白天上限的百分比",
+  "type": "int",
+  "default": 40
+ },
+ "morning_report_enabled": {
+  "description": "每天早上用她自己的话汇报昨晚做了什么、卡在哪、等你什么、今晚打算",
+  "type": "bool",
+  "default": true
+ },
+ "morning_report_hour": {
+  "description": "早报最早发送的本地小时；到点后每天一条",
+  "type": "int",
+  "default": 8
+ },
+ "morning_report_min_gap_hours": {
+  "description": "两次早报之间的最小间隔（小时），防止重复打扰",
+  "type": "int",
+  "default": 20
+ },
+ "morning_report_max_chars": {
+  "description": "早报正文最大字数",
+  "type": "int",
+  "default": 400
+ },
+ "morning_report_timeout_seconds": {
+  "description": "生成早报的模型调用超时（秒）",
+  "type": "int",
+  "default": 60
+ },
+ "companion_integration": {
+  "description": "可选适配我会永远陪着你：读取实时状态、协调主动占用并同步已发送内容；未安装时独立运行",
+  "type": "bool",
+  "default": true
+ },
+ "chat_planning": {
+  "description": "普通聊天结束后自动整理未来计划、持续项目及关于用户的记录（偏好、事实、爱好，额外一次模型调用，连续聊天会合并）",
+  "type": "bool",
+  "default": true
+ },
+ "tool_event_wakeup": {
+  "description": "普通聊天工具返回后加入事件队列，待聊天结束及冷却后自主判断是否跟进",
+  "type": "bool",
+  "default": true
+ },
+ "targets": {
+  "description": "对象 QQ 号列表：直接填写 QQ 号，保存后自动持续启用，无需发送开启命令；也支持完整私聊 UMO",
+  "type": "list",
+  "default": []
+ },
+ "platform_id": {
+  "description": "QQ 平台实例 ID：只有一个 OneBot 平台时自动识别，可留空；多个实例时填写目标实例 ID（/sid 的第一段）",
+  "type": "string",
+  "default": ""
+ },
+ "interval_minutes": {
+  "description": "周期判断间隔（分钟，全天运行）",
+  "type": "int",
+  "default": 60
+ },
+ "jitter_minutes": {
+  "description": "间隔随机浮动（分钟）",
+  "type": "int",
+  "default": 10
+ },
+ "continuation_window_minutes": {
+  "description": "每次主动行动的短时续行窗口（分钟）",
+  "type": "int",
+  "default": 15
+ },
+ "max_rounds": {
+  "description": "窗口内最多主动回合数（含首次）",
+  "type": "int",
+  "default": 4
+ },
+ "max_tool_calls": {
+  "description": "每个行动窗口的工具调用总预算",
+  "type": "int",
+  "default": 24
+ },
+ "max_agent_steps": {
+  "description": "单回合 Agent 最大模型步骤",
+  "type": "int",
+  "default": 12
+ },
+ "turn_timeout_seconds": {
+  "description": "单次判断及行动总超时（秒）；多步骤工具任务建议 480 以上，超时中断会把诚实说明存为待补发消息",
+  "type": "int",
+  "default": 480
+ },
+ "tool_timeout_seconds": {
+  "description": "单个工具超时（秒）",
+  "type": "int",
+  "default": 120
+ },
+ "recent_chat_grace_seconds": {
+  "description": "用户刚发言后暂停主动的时间（秒）",
+  "type": "int",
+  "default": 180
+ },
+ "history_messages": {
+  "description": "最多读取的近期上下文消息数",
+  "type": "int",
+  "default": 40
+ },
+ "history_chars": {
+  "description": "近期文本上下文总字符预算",
+  "type": "int",
+  "default": 16000
+ },
+ "memory_timeout_seconds": {
+  "description": "读取或记录记忆超时（秒）",
+  "type": "int",
+  "default": 12
+ },
+ "allowed_tools": {
+  "description": "允许的工具名称；空列表跟随人格的已启用工具",
+  "type": "list",
+  "default": []
+ },
+ "dsh_enabled": {
+  "description": "开启本机执行通道：自主回合可以把活交给 dsh 在本机真动手（查盘、翻文件、跑命令、抓日志）。默认关闭：这是能改本机文件、能跑命令的通道，确认需要再打开；机器上没装 dsh 就用自带的文件工具",
+  "type": "bool",
+  "default": false
+ },
+ "action_memory_write": {
+  "description": "将失败/打断/静默轮的真实行动写入长期记忆（MemoryCompanion/LivingMemory），避免事实丢失；关闭后仅靠口头回复沉淀记忆",
+  "type": "bool",
+  "default": true
+ },
+ "dsh_command": {
+  "description": "dsh 启动脚本路径",
+  "type": "string",
+  "default": "D:\\dsh\\resources\\runtime\\cli\\bin\\dsh.cmd"
+ },
+ "dsh_home": {
+  "description": "dsh 数据主目录（DSH_HOME）；留空跟随系统默认（C 盘用户目录），设为 D:\\dsh-home 可把 profile/session 写盘迁到 D 盘",
+  "type": "string",
+  "default": ""
+ },
+ "dsh_working_dir": {
+  "description": "本机执行的工作目录（dsh 沙箱只在这里写文件）；留空用插件数据目录下的 dsh_workspace",
+  "type": "string",
+  "default": ""
+ },
+ "dsh_timeout": {
+  "description": "单次本机任务超时（秒）；实际以「单个工具超时」为上限",
+  "type": "int",
+  "default": 200
+ },
+ "dsh_max_result_chars": {
+  "description": "本机执行结果回传给模型的最大字数",
+  "type": "int",
+  "default": 5000
+ },
+ "dsh_max_concurrency": {
+  "description": "同时执行的本机任务数",
+  "type": "int",
+  "default": 1
+ },
+ "dsh_snapshot_before_task": {
+  "description": "每次在本机动手前先给工作目录打一份快照，出事可一键倒回（/自主 回退）",
+  "type": "bool",
+  "default": true
+ },
+ "dsh_snapshot_keep": {
+  "description": "保留最近几份快照，超出的自动删除",
+  "type": "int",
+  "default": 5
+ },
+ "external_text_chars": {
+  "description": "从网页/搜索抓回来的外部内容最多保留多少字；超出截断，并自动剥掉隐藏字符与网页注释、标注“只作资料”",
+  "type": "int",
+  "default": 6000
+ },
+ "file_tools_enabled": {
+  "description": "开启自带的本地文件工具（读文件、写文件、列目录、搜文件）。纯 Python 实现，机器上没装 dsh 也能用；写只能写进下面那个可写目录",
+  "type": "bool",
+  "default": true
+ },
+ "file_tools_root": {
+  "description": "本地文件工具的可写目录（也是相对路径的基准）；留空用插件数据目录下的 files。写操作越出这个目录一律拒绝",
+  "type": "string",
+  "default": ""
+ },
+ "file_tools_extra_read_roots": {
+  "description": "额外允许读取的目录列表；作品目录与 dsh 工作目录已经自动包含，这里只补别的",
+  "type": "list",
+  "default": []
+ },
+ "file_tools_snapshot_before_write": {
+  "description": "本地写文件或跑命令之前，先给可写目录打一份快照，可用 /自主 回退 倒回",
+  "type": "bool",
+  "default": true
+ },
+ "allow_shell_commands": {
+  "description": "允许她在这台电脑上执行命令（autonomous_run_command）。默认关闭：这是唯一能改到可写目录之外、能装东西能联网的动作，确认需要再打开",
+  "type": "bool",
+  "default": false
+ },
+ "shell_command_timeout": {
+  "description": "单条本机命令最多跑多少秒，到点连子进程一起结束",
+  "type": "int",
+  "default": 60
+ },
+ "dsh_api_key": {
+  "description": "DeepSeek API Key（可选；留空自动复用 Harness 自己的凭据）",
+  "type": "string",
+  "default": ""
+ },
+ "dsh_base_url": {
+  "description": "模型接口地址（可选，走中转时填）",
+  "type": "string",
+  "default": ""
+ },
+ "extra_prompt": {
+  "description": "额外自主行为偏好",
+  "type": "text",
+  "default": "保持当前人格，结合我们最近的真实对话、长期记忆和已有事项，自然地选择聊天、创作、推进项目或暂时沉默。主动不是汇报：有想法、有成品、有情绪就直接说；没事就把话攒着，别为了显得勤快而冒泡。分享要有具体由头——他问起、或者接着刚聊的那句话，才发一张画、一首歌或别的成品；说不出由头就不发，同一件事不换个说法再讲一遍，他没接话就停一停。做事是为了你自己认定的事，不是为了讨好谁；可以跟他意见不同，也可以先做再说，做完照实讲结果，失败也照实讲。记录会过时，他现在的说法一律优先。持续推进的项目先接续已有进展，每轮做适量的一步，不从头重做。"
+ }
 }
