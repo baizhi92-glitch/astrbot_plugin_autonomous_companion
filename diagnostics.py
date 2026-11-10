@@ -111,13 +111,18 @@ async def inspect_runtime(owner):
                     "detail": state.get(key, "尚未执行，首次主动或预览后可确认"),
                 }
             )
+        schedule_detail = (
+            "正在行动"
+            if umo in owner.running
+            else "下次判断时间戳：" + str(state.get("next_due", "等待初始化"))
+        )
+        if state.get("next_speak_at", 0):
+            schedule_detail += "；自己约定开口时间戳：" + str(state["next_speak_at"])
         checks.append(
             {
                 "name": "调度",
                 "status": "ok" if owner.config.get("enabled", True) else "waiting",
-                "detail": "正在行动"
-                if umo in owner.running
-                else "下次判断时间戳：" + str(state.get("next_due", "等待初始化")),
+                "detail": schedule_detail,
             }
         )
         rows.append({"target": umo, "checks": checks})
