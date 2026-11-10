@@ -122,7 +122,7 @@ function renderWorks() {
       }).join("") || `<div class="empty">${library.length ? "当前筛选下没有作品。" : "还没有发现作品。可补录文本，或等待她完成新的创作。"}</div>`}
     </div>
 
-    <section class="panel" style="margin-top:14px">
+    <section class="panel" style="margin-top:16px">
       <div class="panel-head">
         <div><h2>成果箱</h2><p class="hint">发送前保存版本快照；结果不确定时不自动重发。</p></div>
         <span class="pill">${outbox.filter(item => item.status === "pending").length} 待分享</span>
