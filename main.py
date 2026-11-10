@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib
 import json
 import math
 import os
@@ -41,6 +42,7 @@ from .cancellations import (
 )
 from .checkpoint import (
     checkpoint_context,
+    count_checkpoint_resume,
     next_checkpoint,
     resume_checkpoint,
     save_checkpoint,
@@ -84,7 +86,11 @@ from .library import (
     register_local_work,
 )
 from .lifecycle import due_appointments, note_failure, record_evidence, tool_key
-from .living_memory import LivingMemoryBridge
+from .living_memory import (
+    LivingMemoryBridge,
+    LivingMemoryNativeBridge,
+    LivingMemoryScopes,
+)
 from .long_tasks import control_task as control_long_task
 from .long_tasks import create_task as create_long_task
 from .long_tasks import due_task, recover_tasks
@@ -159,14 +165,41 @@ from .works import SaveWorkTool
 DECISION_PROMPT = """这是一次自主唤醒，不是用户刚发来的消息。保持当前人格。
 根据真实近期对话、长期记忆、最近主动记录和未完成事项，自行选择：
 chat（聊天）、create（创作）、tools（工具行动）、silent（本次沉默）。
-没有值得做的事情就 silent；无需为了每小时检查而发消息。用户没回复不代表拒绝，
-也不代表用户参与了新的共同经历。可继续自己的创作，不要反复催促回复。
+silent 是正常选项，不是失败：没东西给、时机不对、你自己正埋头做事，都可以选它。
+沉默可以是情绪：赌气、失望、委屈、被冒犯、想等他先开口、怕说错话、累了说不动——这些比"没内容"更像人；
+决定沉默就把真实原因写进 reason（"还在生气，不想先开口"），下次醒来你还看得到它，别装作什么都没发生。
+沉默也可以是替他想：他可能在忙、在开会、在开车、在跟人吃饭、刚睡着、手机不在手边——不吭声是不打扰，不是赌气。
+看他最后说话的时间、上下文里的活跃时段和最近几条的语气，别把"没空回"当成"不想理你"，也别趁这时候追问、催他、连发几条。
+分不清"忙"还是"冷"时，按"忙"处理：安静做事或干脆沉默，等他空了自己回来；真要开口就一句，别铺开。
+他忙完回来接话，就当中间那段不存在，别翻旧账说"你半天不理我"。
+但沉默是表达，不是武器：别用它逼他道歉或试探他有多在乎；他直接问你怎么了的时候，哪怕只说一句"我现在不想说"也别消失。
+他主动来哄、来接话的时候就别端着了——那是他递的台阶，接住；他要是不来，也别拿沉默当惩罚，过了劲儿就把话放下。
+silent 是"停"不是"歇一下"：它会把这条连续链一起结束。只是想说慢一点、过一会儿再接着讲，
+就用 next_task + continue_after_seconds 排下一轮，别拿 silent 当暂停键；已经暂存的后台正文仍会照常补发，
+silent 挡不住它，所以别指望用沉默把写好但不想说的话压下去——不想发就当场别写进 message。
+用户没回复不代表拒绝，也不代表他参与了新的共同经历。
+他没接话时你仍然可以按窗口继续主动——补充、推进、把没说完的说完整，这些都算数；
+但每一条都得是新的内容或接着上一句往下走，不要为了等他回应而加密频率、换个说法重复同一句。
+他一开口就说明他在了，那就立刻回到对话里：不再按原计划往下念，也不要把刚才连发的内容当没发生。
+工具：手上有能真用的，遇到具体的事就直接动手——查、跑、做、验，不用等人开口，也不必先取得同意。
+但不是为了用而用：每次调用都要有具体目的和想要的结果，说不出要做成什么就别调，
+不要为了显得勤快、填满一轮或练手而制造动作；没有真要做的事，沉默或聊天都可以。
+做事是为了你自己和你认定的事，不是为了讨好谁：可以和他意见不同、可以先做了再说，
+别扭、生气或想证明自己的时候也照样动手；做完如实说结果，失败照实说，同一个失败动作不重复第三次。
+分享（画、歌、图）不是日常动作，更不是表达想念的手段：他想听想看会自己说，你不用替他安排。
+真有具体由头（他问起、接着刚聊的那句话）才发；说不出由头就不发，同一套别连着来，
+他没接话就停一停，别拿成品去换回应。
+点歌是最容易变成刷屏的：他没说想听就别点，一天最多一首，同一首当天不重复，刚发过就别急着发第二首——
+连着发歌比不说话更烦人。点歌时不要填 platform 参数，本环境只有默认播放器，填了平台名会直接失败。
+同一件事、同一句嘱咐说过一遍就够了；他没接，不要换个说法再讲一遍，也不要拆成几条分开发。
 本系统明确允许无需用户回复的连续主动：几分钟前主动过、没有新消息，本身不是必须沉默的理由。
+上下文里已有待续目标时，这一轮是接着做，不是另开话题；做完了就让链条结束，别为了显得热闹硬续。
 若存在待续目标或未完成项目，先考虑是否有不依赖用户的新进展可做，再决定继续或结束；
 连续表达可以是新的想法、补充、成果，不必每轮都向用户提问，也不要简单重复上一条。
 如果用户手动计划写着连续主动，应在窗口预算内考虑 chat，而不是自动等待新入站消息。
 若上下文标注已到你自己约定的开口时间，本轮默认开口说话（chat 或分享成果）；确实无话可说才 silent，并在 reason 说明为何改变主意。
 心里存着还没说出口的话时，要么本轮说出来，要么明确放下（speak_wish_clear）；一直挂着不提，比说错更不像你自己。
+这句话要是带时间（明早叫他、今晚再说、等他下班），必须同时写 speak_wish_after_minutes（多少分钟后才允许说），否则你会在半夜把它当成现在该说的话讲出去。
 关于用户的记录分三类用法：偏好是硬约束，开口时间、话题和语气都要绕开用户明确说过不喜欢的方式；
 事实与爱好只用来挑话题、理解用户，不要逐条复述成清单；标着"还没确认"的只当猜测，不要当成用户说过的事实说出口。
 用户活跃时间只用来挑时机：她基本不在的时段默认不要主动，你约好的时间与最近一条消息优先于统计；样本不足时不要假装知道她的作息。
@@ -255,6 +288,51 @@ def _sanitize_user_state_claims(text: str) -> str:
     return cleaned
 
 
+_TOOL_ARG_KEYS = (
+    "song_name",
+    "name",
+    "keyword",
+    "query",
+    "task",
+    "path",
+    "url",
+    "title",
+    "content",
+    "text",
+    "prompt",
+    "reason",
+    "message",
+)
+
+
+def brief_tool_args(tool_args, limit: int = 48) -> str:
+    """Render tool arguments as one short readable fragment.
+
+    Args:
+        tool_args: Raw arguments passed to the tool, JSON string or mapping.
+        limit: Maximum rendered length.
+
+    Returns:
+        A compact string such as ``温柔 五月天``; empty when nothing useful.
+    """
+    if isinstance(tool_args, str):
+        try:
+            parsed = json.loads(tool_args)
+        except (TypeError, ValueError):
+            parsed = None
+        tool_args = parsed if isinstance(parsed, dict) else {"text": tool_args}
+    if not isinstance(tool_args, dict):
+        return ""
+    for key in _TOOL_ARG_KEYS:
+        value = tool_args.get(key)
+        if isinstance(value, str) and value.strip():
+            return " ".join(value.split())[:limit]
+    for key, value in tool_args.items():
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return f"{key}={str(value).strip()[:limit]}"
+    return ""
+
+
 def _delivery_tool_names(config: dict | None) -> set[str]:
     """Return tool names whose own success already delivers text or media.
 
@@ -331,6 +409,7 @@ message 是你真正想对这个人说的话，不是给系统的任务报告；
 沿用人格中的说话习惯和最近真实对话，像已经熟悉的两个人，不要每次重新称呼、解释来意、汇报完成。
 任务结束后可以接一句贴合当下的小感受、轻松的话或直接回应用户，不必重复“做好了/发出去了/请查收”。
 图片、文件由工具发出后不要重复发送产物；可以另说一句，但不要编造看过画面或真实生活体验。
+点歌照稀有处理：一轮只点一首，发出去就停；他没要求时不主动连点两首，同一首当天不重复。
 不强行撒娇、套昵称、反问“你喜欢吗”、索要回应；这些只在当前人格和语境自然支持时使用。
 没有明确新信息就简短，不写流程、清单、检查步骤；失败只说与用户有关的实际影响，把诊断放 summary。
 不要把工具调用提示当作收尾，不要宣称用户已收到或已读；受阻时如实说明。
@@ -343,10 +422,21 @@ message 是你真正想对这个人说的话，不是给系统的任务报告；
 future_task 省略表示保留原计划；非空字符串表示新增或更新计划；空字符串表示计划已经完成或取消。
 如果完成了原有计划，必须将 future_task 设为空字符串，避免下次重复执行。
 短时窗口不足而仍有想做的事情时，用 future_task 保留给下次周期主动。
-continue_after_seconds 为 0 表示结束；否则表示你希望多少秒后再次主动，范围 30~300。
-只有存在具体有价值的下一步才继续。每轮重新判断，允许改变计划或沉默。
-如果还想继续聊、补充想法或继续创作，必须同时填写非空 next_task 和 30~300 的 continue_after_seconds；
-只写 future_task 会留到以后周期，不会启动短时间连续主动。无需等待用户回复。
+续行要两个字段一起给：next_task 写下一轮具体做什么，continue_after_seconds 写多久后开（30~300 秒）；
+只写 next_task 不续，只写 future_task 只留到以后周期，两个都给才会在几十秒后自动开下一轮。
+整段连续窗口默认 15 分钟、最多 4 轮；剩下的时间不够你继续，就把话留到下一轮或写进 future_task。
+这个窗口是给你把一件事分几拍说完的，不是给你发通知的：开口一拍、细节一拍、收住一拍，
+排续行之前先想好后面那两拍大概说什么，说不出来就说明一条已经够了。
+值得连着发的情形：一件还没讲完的事、情绪一层层上来、他问了一串你还没答完、
+手上有真实的新进展要报；这些时候一条一条来比压成一大段更像说话。
+不值得的情形：想说的已经在一条里说完了、只是不想让对话冷掉、只是想让手机再亮一下。
+续的每一轮都要有新东西——下一句、下一步、真实结果；换个角度说同一件事不算新东西，换个说法重讲一遍更不算。
+连着发不等于一口气发完：一条只装一件事，长短跟着情绪走，别把整段心事压成一大块；
+该断句就断句，让下一轮接着上一轮的话头，而不是重复它的内容。
+他要是中途回了一句，立刻停下来接他的话——连续窗口是为"他没空时你还能把话说完"准备的，
+不是为"他正在跟你聊，你还要按原计划往下念"准备的；这时候续行就没有意义了，continue_after_seconds 给 0。
+话讲完了、或者想等他回应，就让 continue_after_seconds 为 0，干净地停下来；沉默会结束整条链，不要用沉默代替"歇一下"。
+无需等待用户回复，但也不要为了显得热络而把链条排满。
 本 JSON 是内部控制信息，不要通过发送工具发给用户。
 """
 
@@ -863,10 +953,108 @@ class AutonomousCompanion(Star):
             # 0/None means "wake as soon as possible"; a future opening
             # commitment must never postpone an immediate wake request.
             return 0
-        speak = state.get("next_speak_at", 0)
+        speak = self.next_speak_time(state)
         if speak and speak < due:
             return speak
         return due
+
+    def speak_schedule(self, state) -> list:
+        """Return the pending self-committed openings, earliest first.
+
+        ``speak_schedule`` is the real queue. The old single-slot fields
+        next_speak_at / next_speak_reason are kept as a mirror of the earliest
+        entry: older readers, the WebUI and旧状态都还能用，读不到队列时也能从
+        这两个字段还原出那一条。
+
+        Args:
+            state: Target state.
+
+        Returns:
+            Sorted list of {"at", "reason", "set_at"} dicts.
+        """
+        slots = state.get("speak_schedule")
+        clean = self._clean_slots(slots)
+        if not clean and state.get("next_speak_at"):
+            # 旧数据只有一个槽位，读的时候当成一条，写回时再迁成队列。
+            clean = self._clean_slots(
+                [
+                    {
+                        "at": state.get("next_speak_at"),
+                        "reason": state.get("next_speak_reason"),
+                        "set_at": state.get("next_speak_set_at"),
+                    }
+                ]
+            )
+        return clean
+
+    def _clean_slots(self, slots) -> list:
+        """Drop unusable entries and sort what is left by time."""
+        if not isinstance(slots, list):
+            return []
+        clean = []
+        for item in slots:
+            if not isinstance(item, dict):
+                continue
+            try:
+                at = float(item.get("at") or 0)
+                set_at = float(item.get("set_at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if at <= 0:
+                continue
+            clean.append(
+                {
+                    "at": at,
+                    "reason": str(item.get("reason") or "")[:500],
+                    "set_at": set_at,
+                }
+            )
+        clean.sort(key=lambda item: item["at"])
+        return clean
+
+    def next_speak_time(self, state) -> float:
+        """Earliest pending opening time, or 0 when nothing is scheduled."""
+        slots = self.speak_schedule(state)
+        return slots[0]["at"] if slots else 0.0
+
+    def store_speak_schedule(self, state, slots) -> None:
+        """Persist the queue and refresh the legacy earliest-slot mirror.
+
+        Args:
+            state: Target state.
+            slots: Iterable of {"at", "reason", "set_at"} entries.
+        """
+        clean = self._clean_slots(list(slots or []))
+        limit = self.number("speak_schedule_limit", 8, 1, 32)
+        if len(clean) > limit:
+            # 一直约却一直不说时，留最近的几条就够，别让队列无限长。
+            clean = clean[:limit]
+        if not clean:
+            for key in ("speak_schedule", "next_speak_at", "next_speak_reason", "next_speak_set_at"):
+                state.pop(key, None)
+            return
+        state["speak_schedule"] = clean
+        state["next_speak_at"] = clean[0]["at"]
+        state["next_speak_reason"] = clean[0]["reason"]
+        state["next_speak_set_at"] = clean[0]["set_at"]
+
+    def speak_plan_text(self, state) -> str:
+        """Render the pending openings for the decision prompt."""
+        now = time.time()
+        slots = [item for item in self.speak_schedule(state) if item["at"] > now]
+        if not slots:
+            return ""
+        times = "、".join(
+            datetime.fromtimestamp(item["at"]).astimezone().strftime("%m-%d %H:%M")
+            for item in slots[:3]
+        )
+        reasons = "；".join(item["reason"] or "未说明原因" for item in slots[:3])
+        extra = f"（还有 {len(slots) - 3} 个更晚的约定）" if len(slots) > 3 else ""
+        return (
+            f"你已和自己约定于 {times} 开口（原因：{reasons}）{extra}。"
+            "未到点前不必提前开口；要改动用 next_speak_minutes 重新约定，"
+            "它只会新增一条，不会顶掉别的约定；填 0 才取消全部。\n"
+        )
 
     def update_speak_commitment(self, state, payload):
         """Persist an optional model-committed next opening time.
@@ -906,22 +1094,43 @@ class AutonomousCompanion(Star):
             return
         state["speak_ignored_reason"] = ""
         if delay == 0:
-            if state.get("next_speak_at", 0):
-                state.pop("next_speak_at", None)
-                state.pop("next_speak_reason", None)
-                self.journal(state, "speak_cancelled", "已取消自己约定的开口时间")
+            pending = self.speak_schedule(state)
+            if pending:
+                self.store_speak_schedule(state, [])
+                self.journal(
+                    state,
+                    "speak_cancelled",
+                    f"已取消 {len(pending)} 个自己约定的开口时间"
+                    if len(pending) > 1
+                    else "已取消自己约定的开口时间",
+                )
             return
         low = self.number("next_speak_min_minutes", 5, 1, 1440)
         high = max(low, self.number("next_speak_max_minutes", 1440, 1, 1440))
         minutes = max(low, min(high, delay))
         reason = str(payload.get("next_speak_reason") or "").strip()[:500]
-        state["next_speak_at"] = time.time() + minutes * 60
-        state["next_speak_reason"] = reason
-        state["next_speak_set_at"] = time.time()
+        at = time.time() + minutes * 60
+        slots = self.speak_schedule(state)
         if state.get("pause_mode") == "all":
-            state["next_speak_at"] = max(
-                state["next_speak_at"], state.get("pause_until", 0)
-            )
+            # 整段暂停期间不该有任何约定到期：把已在排队的也一起往后推。
+            for item in slots:
+                item["at"] = max(item["at"], state.get("pause_until", 0))
+            at = max(at, state.get("pause_until", 0))
+        # 同一轮决策和行动会各报一次，同一条只留一个，免得队列里全是重复。
+        same = next(
+            (
+                item
+                for item in slots
+                if item["reason"] == reason and abs(item["at"] - at) <= 120
+            ),
+            None,
+        )
+        if same is not None:
+            same["at"] = at
+            same["set_at"] = time.time()
+        else:
+            slots.append({"at": at, "reason": reason, "set_at": time.time()})
+        self.store_speak_schedule(state, slots)
         self.journal(
             state,
             "speak_scheduled",
@@ -937,24 +1146,29 @@ class AutonomousCompanion(Star):
         Returns:
             The commitment reason, or "" when none is due.
         """
-        due_at = state.get("next_speak_at", 0)
-        if not due_at:
+        slots = self.speak_schedule(state)
+        if not slots:
             return ""
         if not self.config.get("self_scheduled_speak", True):
-            state.pop("next_speak_at", None)
-            state.pop("next_speak_reason", None)
+            self.store_speak_schedule(state, [])
             self.journal(
                 state, "speak_dropped", "自己约定开口已在配置中关闭，丢弃待生效约定"
             )
             return ""
-        if time.time() < due_at:
+        now = time.time()
+        due = [item for item in slots if now >= item["at"]]
+        if not due:
             return ""
-        reason = str(state.pop("next_speak_reason", "")).strip()[:500]
-        state.pop("next_speak_at", None)
+        entry = due[0]
+        # 只吃掉到点的那一条，后面的约定继续按自己的时间等。
+        self.store_speak_schedule(
+            state, [item for item in slots if item is not entry]
+        )
+        reason = entry["reason"]
         state["last_speak_commitment"] = {
             "reason": reason,
-            "due_at": due_at,
-            "consumed_at": time.time(),
+            "due_at": entry["at"],
+            "consumed_at": now,
         }
         self.journal(
             state, "speak_due", "已到自己约定的开口时间：" + (reason or "未说明原因")
@@ -974,6 +1188,87 @@ class AutonomousCompanion(Star):
         """
         return str(state.get("speak_wish") or "").strip()
 
+    def wish_due_at(self, state) -> float:
+        """Earliest timestamp the held note may be spoken.
+
+        Args:
+            state: Target state.
+
+        Returns:
+            0 when the note has no time restriction, otherwise the timestamp it
+            becomes speakable. This is what keeps "明早叫他起床" from being said
+            at one in the morning.
+        """
+        try:
+            return float(state.get("speak_wish_due_at") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def wish_ready(self, state) -> bool:
+        """Return whether the held note may be spoken right now."""
+        return self.wish_due_at(state) <= time.time()
+
+    def wish_due_timestamp(self, payload):
+        """Parse the optional "not before" delay of a held note.
+
+        Args:
+            payload: Control output that may carry speak_wish_after_minutes.
+
+        Returns:
+            None when the payload said nothing about timing (keep the current
+            value), otherwise the timestamp it may be spoken from. 0 minutes
+            means "right now".
+        """
+        if "speak_wish_after_minutes" not in payload:
+            return None
+        raw = payload["speak_wish_after_minutes"]
+        if isinstance(raw, str):
+            try:
+                raw = float(raw.strip())
+            except ValueError:
+                return None
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None
+        if not math.isfinite(raw):
+            return None
+        minutes = max(0.0, min(20160.0, float(raw)))
+        return time.time() + minutes * 60
+
+    def wish_prompt_text(self, state) -> str:
+        """Render the held note, keeping it hidden until its own time.
+
+        A note that is not due yet is described without its content: handing the
+        sentence over early is exactly how it ended up being said at 00:54.
+        """
+        text = self.speak_wish_text(state)
+        if not text:
+            return ""
+        due = self.wish_due_at(state)
+        if due > time.time():
+            return (
+                "【你心里有一件事，但还没到能说的时候】你把它定在 "
+                + datetime.fromtimestamp(due).astimezone().strftime("%m-%d %H:%M")
+                + " 之后才提。现在不要说它，也不要暗示、不要提前起头；到点后它会再出现。\n"
+            )
+        kept = (
+            f"，已经搁置 {int(state.get('speak_wish_kept') or 0)} 轮"
+            if state.get("speak_wish_kept")
+            else ""
+        )
+        return (
+            "【你心里存着一句还没说出口的话】从 "
+            + datetime.fromtimestamp(state.get("speak_wish_at") or time.time())
+            .astimezone()
+            .strftime("%m-%d %H:%M")
+            + " 起就惦记着"
+            + kept
+            + "："
+            + text
+            + "。这句是你自己记下的，不是在回答用户；想说就在本轮说出来"
+            "（时机不合适可以顺手用 next_speak_minutes 约个更合适的时刻），"
+            "不想说了就输出 speak_wish_clear: true 放下它，别一直挂着不提。\n"
+        )
+
     def clear_speak_wish(self, state, action: str, summary: str) -> None:
         """Drop the held note and journal why it no longer applies.
 
@@ -985,7 +1280,13 @@ class AutonomousCompanion(Star):
         text = self.speak_wish_text(state)
         if not text:
             return
-        for key in ("speak_wish", "speak_wish_at", "speak_wish_kept", "speak_wish_kept_at"):
+        for key in (
+            "speak_wish",
+            "speak_wish_at",
+            "speak_wish_due_at",
+            "speak_wish_kept",
+            "speak_wish_kept_at",
+        ):
             state.pop(key, None)
         state["speak_wish_cleared_at"] = time.time()
         self.journal(state, action, summary + "：" + text[:200])
@@ -1011,14 +1312,18 @@ class AutonomousCompanion(Star):
         if not text:
             self.clear_speak_wish(state, "wish_cleared", "她放下这句话")
             return
+        due_at = self.wish_due_timestamp(payload)
         if text == self.speak_wish_text(state):
             # 同一轮里决策和行动都可能复述这句话，只有跨轮才计一次搁置。
+            if due_at is not None:
+                state["speak_wish_due_at"] = due_at
             if time.time() - (state.get("speak_wish_kept_at") or 0) >= 60:
                 state["speak_wish_kept"] = int(state.get("speak_wish_kept", 0) or 0) + 1
                 state["speak_wish_kept_at"] = time.time()
             return
         state["speak_wish"] = text
         state["speak_wish_at"] = time.time()
+        state["speak_wish_due_at"] = due_at if due_at is not None else 0
         state["speak_wish_kept"] = 0
         state["speak_wish_kept_at"] = time.time()
         self.journal(state, "wish_kept", "心里记下一句想说的话：" + text[:200])
@@ -1191,6 +1496,20 @@ class AutonomousCompanion(Star):
             if ":FriendMessage:" in target and target not in origins:
                 origins.append(target)
         return origins
+
+    def private_only_reason(self, event) -> str:
+        """Say exactly why a user-facing tool was refused here.
+
+        Args:
+            event: Current message event, real or autonomous.
+
+        Returns:
+            One precise sentence so the model stops guessing (and stops
+            explaining the guess to the user).
+        """
+        if event.get_extra("autonomous_companion"):
+            return "这是你自己发起的主动回轮，不是用户真实发来的私聊；这个工具只在真实私聊里可用"
+        return "当前会话不在配置的私聊对象里，这个工具只用于已配置对象的真实私聊"
 
     async def initialize(self) -> None:
         self.page_api = CompanionPageAPI(self)
@@ -1381,8 +1700,10 @@ class AutonomousCompanion(Star):
         return {
             "next_due": time.time() + self.interval(),
             "next_speak_at": 0,
+            "speak_schedule": [],
             "speak_wish": "",
             "speak_wish_at": 0,
+            "speak_wish_due_at": 0,
             "speak_wish_kept": 0,
             "last_inbound": 0,
             "window_end": 0,
@@ -1391,6 +1712,7 @@ class AutonomousCompanion(Star):
             "next_task": "",
             "future_task": "",
             "journal": [],
+            "today": {},
             "identity": {},
             "inflight": False,
             "last_error": "",
@@ -1580,10 +1902,11 @@ class AutonomousCompanion(Star):
             now = time.time()
             if state.get("pause_until", 0) > now and state.get("pause_mode") == "all":
                 state["next_due"] = state["pause_until"]
-                if state.get("next_speak_at", 0):
-                    state["next_speak_at"] = max(
-                        state["next_speak_at"], state["pause_until"]
-                    )
+                pending = self.speak_schedule(state)
+                if pending:
+                    for item in pending:
+                        item["at"] = max(item["at"], state["pause_until"])
+                    self.store_speak_schedule(state, pending)
                 return
             if exhausted(self, state, "checks", "daily_check_limit", 144) or exhausted(
                 self, state, "rounds", "daily_round_limit", 96
@@ -1592,15 +1915,17 @@ class AutonomousCompanion(Star):
                 state["next_due"] = (
                     max(night_end_timestamp(self), now + 60) if nightly else next_day()
                 )
-                if state.get("next_speak_at", 0):
-                    state.pop("next_speak_at", None)
-                    state.pop("next_speak_reason", None)
+                dropped = self.speak_schedule(state)
+                if dropped:
+                    self.store_speak_schedule(state, [])
                     self.journal(
                         state,
                         "speak_dropped",
-                        "夜间额度已用完，取消自己约定的开口时间"
-                        if nightly
-                        else "今日预算已用完，取消自己约定的开口时间",
+                        (
+                            f"夜间额度已用完，取消 {len(dropped)} 个自己约定的开口时间"
+                            if nightly
+                            else f"今日预算已用完，取消 {len(dropped)} 个自己约定的开口时间"
+                        ),
                     )
                 state["last_error"] = (
                     "夜间额度已用完，早上自动恢复"
@@ -1614,11 +1939,11 @@ class AutonomousCompanion(Star):
             )
             if now < blocked_until:
                 state["next_due"] = blocked_until + 5
-                if (
-                    state.get("next_speak_at", 0)
-                    and state["next_speak_at"] < blocked_until + 5
-                ):
-                    state["next_speak_at"] = blocked_until + 5
+                pending = self.speak_schedule(state)
+                if any(item["at"] < blocked_until + 5 for item in pending):
+                    for item in pending:
+                        item["at"] = max(item["at"], blocked_until + 5)
+                    self.store_speak_schedule(state, pending)
                 return
             state["inflight"] = True
             state["progress"] = {
@@ -1645,6 +1970,9 @@ class AutonomousCompanion(Star):
                     "summary": long_job["result"] or long_job["error"],
                     "long_task_id": long_job["id"],
                     "finished_at": time.time(),
+                    # 长期任务需要把工具回执也记入 last_turn，否则 action_memory_summary()
+                    # 无法提取具体执行细节，记忆只能看到粗略总结。
+                    "tool_receipts": copy.deepcopy(long_job.get("receipts", [])),
                 }
                 state["next_due"] = (
                     min(
@@ -1891,6 +2219,26 @@ class AutonomousCompanion(Star):
         provider_id = await self.context.get_current_chat_provider_id(umo)
         return event, persona, provider_id, bounded, memory
 
+    def livingmemory_scopes(self, meta):
+        """Import LivingMemory's own scope helpers, as used by its agent tools.
+
+        Args:
+            meta: LivingMemory plugin metadata from the star manager.
+
+        Returns:
+            A LivingMemoryScopes bundle, or None when those modules are missing.
+        """
+        package = "data.plugins." + (
+            getattr(meta, "root_dir_name", "") or "astrbot_plugin_livingmemory"
+        )
+        try:
+            scope_module = importlib.import_module(f"{package}.core.memory_scope")
+            utils_module = importlib.import_module(f"{package}.core.utils")
+        except Exception as exc:
+            self.logger.debug("LivingMemory scope helpers unavailable: %s", exc)
+            return None
+        return LivingMemoryScopes(scope_module, utils_module)
+
     def memory_bridge(self, event):
         event.state["memory_provider"] = ""
         if self.config.get("livingmemory_integration", True):
@@ -1909,10 +2257,17 @@ class AutonomousCompanion(Star):
                         getattr(plugin, "autonomous_recall", None)
                     ) and callable(getattr(plugin, "autonomous_record", None)):
                         event.state["memory_provider"] = "LivingMemory"
+                        event.state["livingmemory_status"] = "专用接口"
                         return LivingMemoryBridge(plugin, event)
-                    event.state["livingmemory_status"] = (
-                        "LivingMemory 尚未加载适配接口，请重载该插件"
-                    )
+                    scopes = self.livingmemory_scopes(meta)
+                    if scopes is None:
+                        event.state["livingmemory_status"] = (
+                            "LivingMemory 未暴露可用接口，继续使用 MemoryCompanion"
+                        )
+                        continue
+                    event.state["memory_provider"] = "LivingMemory"
+                    event.state["livingmemory_status"] = "原生接口直连"
+                    return LivingMemoryNativeBridge(plugin, event, scopes)
         for meta in self.context.get_all_stars():
             if not meta.activated or (
                 event.plugins_name is not None and meta.name not in event.plugins_name
@@ -2153,6 +2508,7 @@ class AutonomousCompanion(Star):
             f"持续项目（优先参考最久未尝试的项目，不重复受阻方案）：{json.dumps(sorted(state.get('projects', []), key=lambda p: p.get('last_attempt_at', 0)), ensure_ascii=False)}\n"
             + self.user_notes_context(state)
             + self.activity_context(state)
+            + self.today_digest(state)
             + f"待处理实际事件：{json.dumps(state.get('events', []), ensure_ascii=False)}\n"
             f"今日使用量：{json.dumps(usage_for(state), ensure_ascii=False)}\n"
             f"当前{pool_label}额度池：工具 {pool['tools']}/{pool['limit_tools']}，"
@@ -2170,37 +2526,9 @@ class AutonomousCompanion(Star):
                 if speak_due
                 else ""
             )
-            + (
-                "你已和自己约定于 "
-                + datetime.fromtimestamp(state["next_speak_at"])
-                .astimezone()
-                .strftime("%m-%d %H:%M")
-                + " 开口（原因："
-                + str(state.get("next_speak_reason", ""))
-                + "）。未到点前不必提前开口；要改动用 next_speak_minutes 重新约定，填 0 取消。\n"
-                if (state.get("next_speak_at") or 0) > time.time()
-                else ""
-            )
+            + self.speak_plan_text(state)
             + f"待分享成果：{json.dumps([item for item in state.get('outbox', []) if item['status'] == 'pending'], ensure_ascii=False)}\n"
-            + (
-                "【你心里存着一句还没说出口的话】从 "
-                + datetime.fromtimestamp(state.get("speak_wish_at") or time.time())
-                .astimezone()
-                .strftime("%m-%d %H:%M")
-                + " 起就惦记着"
-                + (
-                    f"，已经搁置 {int(state.get('speak_wish_kept') or 0)} 轮"
-                    if state.get("speak_wish_kept")
-                    else ""
-                )
-                + "："
-                + self.speak_wish_text(state)
-                + "。这句是你自己记下的，不是在回答用户；想说就在本轮说出来"
-                "（时机不合适可以顺手用 next_speak_minutes 约个更合适的时刻），"
-                "不想说了就输出 speak_wish_clear: true 放下它，别一直挂着不提。\n"
-                if self.speak_wish_text(state)
-                else ""
-            )
+            + self.wish_prompt_text(state)
             + (
                 f"已暂存待补发的后台正文（本轮允许发消息时会自动先发出，不要重复写）：{state['pending_message']['content'][:300]}\n"
                 if state.get("pending_message")
@@ -2222,6 +2550,7 @@ class AutonomousCompanion(Star):
         ):
             if not preview:
                 state["checkpoint_streak"] = state.get("checkpoint_streak", 0) + 1
+                count_checkpoint_resume(state, pending_checkpoint["task"])
             decision = {
                 "action": "tools",
                 "task": pending_checkpoint["task"],
@@ -2345,6 +2674,7 @@ class AutonomousCompanion(Star):
         if decision["action"] == "silent":
             state.update(next_task="", window_end=0)
             state["last_error"] = ""
+
             self.journal(state, "silent", str(decision.get("reason", "保持沉默")))
             state["last_turn"].update(
                 status="silent", finished_at=time.time(), next_due=state["next_due"]
@@ -3106,6 +3436,124 @@ class AutonomousCompanion(Star):
                 }
             ]
         )[-16:]
+        if action == "dispatched":
+            self.today_record(state, "say", summary)
+        elif action == "silent":
+            self.today_record(state, "silent", summary)
+
+    def today_slot(self, state) -> dict:
+        """Return today's action ledger, resetting it when the date changes.
+
+        Args:
+            state: Target state.
+
+        Returns:
+            The mutable ledger for the current local day.
+        """
+        day = datetime.now().astimezone().strftime("%Y-%m-%d")
+        slot = state.get("today")
+        if not isinstance(slot, dict) or slot.get("day") != day:
+            slot = {"day": day, "items": [], "tools": {}, "sent": 0, "silent": 0}
+            state["today"] = slot
+        slot.setdefault("items", [])
+        slot.setdefault("tools", {})
+        slot.setdefault("sent", 0)
+        slot.setdefault("silent", 0)
+        return slot
+
+    def today_record(self, state, kind: str, text: str) -> None:
+        """Append one action to today's ledger.
+
+        Args:
+            state: Target state.
+            kind: Ledger kind such as ``say``, ``silent``, ``tool`` or ``song``.
+            text: Short human-readable description; dropped when empty.
+        """
+        slot = self.today_slot(state)
+        text = " ".join(str(text).split())[:120]
+        if not text:
+            return
+        last = slot["items"][-1] if slot["items"] else {}
+        if kind in {"say", "silent"} and last.get("kind") == kind and last.get("text") == text:
+            return
+        slot["items"] = (
+            slot["items"]
+            + [
+                {
+                    "t": datetime.now().astimezone().strftime("%H:%M"),
+                    "kind": kind,
+                    "text": text,
+                }
+            ]
+        )[-80:]
+        if kind == "say":
+            slot["sent"] += 1
+        elif kind == "silent":
+            slot["silent"] += 1
+
+    def today_digest(self, state) -> str:
+        """Summarise what the bot itself already did today.
+
+        The journal keeps only the latest sixteen entries, so without this the
+        bot cannot tell whether it already sent a song, a drawing or a line.
+
+        Args:
+            state: Target state.
+
+        Returns:
+            A prompt block; empty when nothing has happened yet today.
+        """
+        slot = self.today_slot(state)
+        items = slot.get("items") or []
+        tools = slot.get("tools") or {}
+        if not items and not tools:
+            return ""
+        lines = [
+            f"今天（{slot['day'][5:]}）你已主动开口 {slot.get('sent', 0)} 次、"
+            f"沉默 {slot.get('silent', 0)} 次"
+            + (
+                "；用过的工具："
+                + "、".join(
+                    f"{name}×{count}"
+                    for name, count in sorted(
+                        tools.items(), key=lambda kv: -kv[1]
+                    )[:8]
+                )
+                if tools
+                else ""
+            )
+        ]
+        songs: dict[str, int] = {}
+        for item in items:
+            if item.get("kind") == "song":
+                songs[item["text"]] = songs.get(item["text"], 0) + 1
+        if songs:
+            lines.append(
+                "已经点过的歌："
+                + "、".join(
+                    f"《{name}》" + (f"（{count} 次）" if count > 1 else "")
+                    for name, count in songs.items()
+                )
+            )
+        work = [item for item in items if item.get("kind") in {"tool", "work"}][-6:]
+        if work:
+            lines.append(
+                "做过的动作："
+                + "；".join(f"{item.get('t', '')} {item['text']}" for item in work)
+            )
+        said = [item for item in items if item.get("kind") == "say"][-4:]
+        if said:
+            lines.append(
+                "今天已经说过的："
+                + "；".join(
+                    f"{item.get('t', '')}「{item['text'][:40]}」" for item in said
+                )
+            )
+        lines.append(
+            "以上都是今天已经做过的：同一件事、同一首歌、同一句话不要再做第二遍；"
+            "想接着做就做新的一步，没有新东西就沉默，别拿重复填时间。"
+        )
+        return "【今天你自己已经做过的事】\n" + "\n".join(lines) + "\n"
 
     async def tool_notice(
         self, event, name: str, status: str, result: str = ""
@@ -3412,7 +3860,13 @@ class AutonomousCompanion(Star):
         umo = event.unified_msg_origin
         if umo not in self.target_origins() or event.get_extra("autonomous_companion"):
             return json.dumps(
-                {"ok": False, "error": "仅用于已配置对象的真实私聊"}, ensure_ascii=False
+                {
+                    "ok": False,
+                    "guard": True,
+                    "error": self.private_only_reason(event),
+                    "hint": "这是护栏，不是故障：别重试、别向用户编造原因，也不要把它写进要发出去的话里。",
+                },
+                ensure_ascii=False,
             )
         state = self.states.setdefault(umo, self.new_state())
         if operation == "list":
@@ -3722,7 +4176,15 @@ class AutonomousCompanion(Star):
         """
         umo = event.unified_msg_origin
         if umo not in self.target_origins() or event.get_extra("autonomous_companion"):
-            return json.dumps({"ok": False, "error": "只支持已配置对象的真实私聊"})
+            return json.dumps(
+                {
+                    "ok": False,
+                    "guard": True,
+                    "error": self.private_only_reason(event),
+                    "hint": "这是护栏，不是故障：别重试、别向用户编造原因，也不要把它写进要发出去的话里。",
+                },
+                ensure_ascii=False,
+            )
         state = self.states.setdefault(umo, self.new_state())
         try:
             if operation == "list":
@@ -3747,6 +4209,17 @@ class AutonomousCompanion(Star):
 
     @filter.on_llm_tool_respond()
     async def tool_completed(self, event, tool, tool_args, tool_result) -> None:
+        name = getattr(tool, "name", "")
+        state = getattr(event, "state", None) or self.states.get(
+            event.unified_msg_origin
+        )
+        if isinstance(state, dict) and name != "autonomous_task_control":
+            brief = brief_tool_args(tool_args)
+            slot = self.today_slot(state)
+            slot["tools"][name] = slot["tools"].get(name, 0) + 1
+            self.today_record(state, "tool", f"{name} {brief}".strip())
+            if name in {"play_song_by_name", "play_song", "点歌"} and brief:
+                self.today_record(state, "song", brief)
         if (
             event.get_extra("autonomous_companion")
             or getattr(tool, "name", "") == "autonomous_task_control"
@@ -3983,6 +4456,7 @@ class AutonomousCompanion(Star):
                 else "未安排"
             )
             speak_at = state.get("next_speak_at") or 0
+            speak_slots = self.speak_schedule(state)
             speak_time = (
                 datetime.fromtimestamp(speak_at).astimezone().strftime("%m-%d %H:%M")
                 + (
@@ -3990,6 +4464,7 @@ class AutonomousCompanion(Star):
                     if state.get("next_speak_reason")
                     else ""
                 )
+                + (f"，另有 {len(speak_slots) - 1} 个约定" if len(speak_slots) > 1 else "")
                 if speak_at
                 else "未约定"
             )
