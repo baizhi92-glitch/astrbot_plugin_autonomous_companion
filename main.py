@@ -2232,10 +2232,15 @@ class AutonomousCompanion(Star):
         try:
             scope_module = importlib.import_module(f"{package}.core.memory_scope")
             utils_module = importlib.import_module(f"{package}.core.utils")
+            scopes = LivingMemoryScopes(scope_module, utils_module)
         except Exception as exc:
             self.logger.debug("LivingMemory scope helpers unavailable: %s", exc)
             return None
-        return LivingMemoryScopes(scope_module, utils_module)
+        if not scopes.usable:
+            # 版本过旧，或更新插件后进程里还缓存着旧模块：缺最小助手集时不硬连。
+            self.logger.debug("LivingMemory scope helpers incomplete; bridge off")
+            return None
+        return scopes
 
     def memory_bridge(self, event):
         event.state["memory_provider"] = ""
@@ -2260,7 +2265,7 @@ class AutonomousCompanion(Star):
                     scopes = self.livingmemory_scopes(meta)
                     if scopes is None:
                         event.state["livingmemory_status"] = (
-                            "LivingMemory 未暴露可用接口，继续使用 MemoryCompanion"
+                            "LivingMemory 接口不完整（更新或重装后重启 AstrBot），继续使用 MemoryCompanion"
                         )
                         continue
                     event.state["memory_provider"] = "LivingMemory"
