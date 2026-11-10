@@ -609,10 +609,11 @@ class CompanionPageAPI:
                 if umo in owner.running:
                     owner.running[umo].cancel()
                 state["next_due"] = state["pause_until"]
-                if state.get("next_speak_at", 0):
-                    state["next_speak_at"] = max(
-                        state["next_speak_at"], state["pause_until"]
-                    )
+                slots = owner.speak_schedule(state)
+                if slots:
+                    for item in slots:
+                        item["at"] = max(item["at"], state["pause_until"])
+                    owner.store_speak_schedule(state, slots)
                 state.update(next_task="", window_end=0, window_admitted=False)
         elif action == "resume":
             state.update(pause_until=0, pause_mode="", next_due=time.time() + 30)
