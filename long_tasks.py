@@ -124,6 +124,14 @@ async def run_task(owner, umo, job):
                 for word in ("send", "poke", "proactive", "task_control")
             )
         ]
+        # 下游插件（技能学习、记忆、好感）靠这些钩子采集本轮工具证据；不传
+        # 就退回空通知器，长期任务再丰富的工具工作也一个都学不到。开关与
+        # 主动轮共用 expose_plugin_hooks。任务文本用长期任务自己的目标，别
+        # 让学习侧只看到占位的“自主心跳”。
+        event.message_str = job["goal"][:200]
+        message_obj = getattr(event, "message_obj", None)
+        if message_obj is not None:
+            message_obj.message_str = event.message_str
         prompt = {
             "task_id": job["id"],
             "goal": job["goal"],
@@ -143,6 +151,7 @@ async def run_task(owner, umo, job):
             prompt=json.dumps(prompt, ensure_ascii=False),
             max_steps=owner.number("max_agent_steps", 12, 1, 30),
             tool_call_timeout=owner.number("tool_timeout_seconds", 120, 5, 600),
+            agent_hooks=owner.notification_hooks,
         )
         await owner.check_current(event)
         from .main import parse_object
