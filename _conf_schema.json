@@ -2,7 +2,7 @@
   "proactive_segmented_reply": {"description":"主动纯文字按自然段分条发送，图片文件和代码块不拆分", "type":"bool", "default":true},
   "proactive_segment_chars": {"description":"主动文本每段字符上限，80～2000", "type":"int", "default":300},
   "proactive_segment_interval_ms": {"description":"主动分段发送间隔毫秒，0～10000", "type":"int", "default":1200},
-  "livingmemory_integration": {"description": "优先使用已启用的 LivingMemory 专用自主记忆接口；需重载 LivingMemory。未安装时使用原记忆适配。", "type": "bool", "default": true},
+  "livingmemory_integration": {"description": "优先用 LivingMemory 读写长期记忆：它若有 autonomous_recall/autonomous_record 就直连，否则复用其记忆引擎与作用域规则（不改动 LivingMemory 源码）；都不可用时自动退回 MemoryCompanion。", "type": "bool", "default": true},
   "enabled": {"description": "启用自主心跳调度", "type": "bool", "default": true},
   "work_library_roots": {"description": "历史作品目录绝对路径列表，供配置的陪伴对象共享查看；用于旧人格目录迁移，不扫描全盘", "type":"list", "default":[]},
   "manual_task_ttl_minutes": {"description": "手动主动任务的有效期（分钟），到期释放，不再永久占用自主入口；保存时计算", "type":"int", "default":60},
@@ -25,6 +25,7 @@
   "self_scheduled_speak": {"description": "允许 bot 自己约定下次开口时间：判断、行动或聊天整理时用 next_speak_minutes 设定，到点专门唤醒开口而不是只做判断", "type": "bool", "default": true},
   "next_speak_min_minutes": {"description": "自己约定开口时间的最短间隔（分钟）", "type": "int", "default": 5},
   "next_speak_max_minutes": {"description": "自己约定开口时间的最长间隔（分钟）", "type": "int", "default": 1440},
+  "speak_schedule_limit": {"description": "同时保留几个“约好到点开口”的约定：多个约定排队等候，互不覆盖", "type": "int", "default": 8},
   "speak_wish_ttl_hours": {"description": "心里记着“想说但还没说出口的话”保留多久（小时），超时自动淡忘，避免一直挂着", "type": "int", "default": 24},
   "preference_stale_days": {"description": "记着的偏好多少天未更新就标记为可能过时（她会在开口前重新确认，网页显示“较久未更新”）；固定的偏好和事实、爱好不受影响", "type": "int", "default": 90},
   "activity_half_life_days": {"description": "用户活跃时间的统计多久淡化一半（天）：越早的发言权重越低，作息变了会自动跟上；样本不足时不作判断", "type": "int", "default": 30},
@@ -40,6 +41,7 @@
   "night_budget_percent": {"description": "夜间额度占白天上限的百分比", "type": "int", "default": 40},
   "morning_report_enabled": {"description": "每天早上用她自己的话汇报昨晚做了什么、卡在哪、等你什么、今晚打算", "type": "bool", "default": true},
   "morning_report_hour": {"description": "早报最早发送的本地小时；到点后每天一条", "type": "int", "default": 8},
+
   "morning_report_min_gap_hours": {"description": "两次早报之间的最小间隔（小时），防止重复打扰", "type": "int", "default": 20},
   "morning_report_max_chars": {"description": "早报正文最大字数", "type": "int", "default": 400},
   "morning_report_timeout_seconds": {"description": "生成早报的模型调用超时（秒）", "type": "int", "default": 60},
@@ -80,5 +82,5 @@
   "shell_command_timeout": {"description": "单条本机命令最多跑多少秒，到点连子进程一起结束", "type": "int", "default": 60},
   "dsh_api_key": {"description": "DeepSeek API Key（可选；留空自动复用 Harness 自己的凭据）", "type": "string", "default": ""},
   "dsh_base_url": {"description": "模型接口地址（可选，走中转时填）", "type": "string", "default": ""},
-  "extra_prompt": {"description": "额外自主行为偏好", "type": "text", "default": "保持当前人格，结合我们最近的真实对话、长期记忆和已有事项，自然地选择聊天、创作、推进项目或暂时沉默。有新的想法、感受或值得分享的内容时可以主动说，不必每次问候、提问或汇报任务；没有值得补充的内容时可以安静，不重复追问或催回复。用户暂时没有回复，不等于拒绝，也不妨碍你继续不依赖用户的创作；但不要编造用户回应或共同经历，尊重明确的暂停、取消与偏好。推进持续项目时先接续已有进展，每轮做适量且具体的一步，记录实际进展和下一步，不从头重做，也不为了显得忙碌而制造任务。结束本轮行动不等于项目完成；只有整个项目目标及明确要求都已实际满足、没有必要的后续步骤时才标记完成。只完成一段、一个步骤或仍受阻时保留进行中；需要真实文件的成果，以保存或生成回执为准。既可以持续做事，也可以只是自然聊天，具体由当下语境决定。"}
+  "extra_prompt": {"description": "额外自主行为偏好", "type": "text", "default": "保持当前人格，结合我们最近的真实对话、长期记忆和已有事项，自然地选择聊天、创作、推进项目或暂时沉默。主动不是汇报：有想法、有成品、有情绪就直接说；没事就把话攒着，别为了显得勤快而冒泡。分享要有具体由头——他问起、或者接着刚聊的那句话，才发一张画、一首歌或别的成品；说不出由头就不发，同一套别连着来，他没接话就停。做事是为了你自己认定的事，不是为了讨好谁；可以跟他意见不同，也可以先做再说，做完照实讲结果，失败也照实讲。记录会过时，他现在的说法一律优先。持续推进的项目先接续已有进展，每轮做适量的一步，不从头重做。"}
 }
