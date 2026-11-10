@@ -2885,7 +2885,8 @@ async def test_post_delivery_regenerated_artifact_is_not_sent():
     batch = register_artifacts(event, "run_template", receipt("first", "second"))
     tool = SendArtifactTool(event)
     assert json.loads(await tool.call(None, batch[0]["id"]))["sent"]
-    assert state.get("first_media_delivery_at")
+    # 拦截基准随事件走：产物登记和首次投递同属一轮事件（artifacts.py 读 event）。
+    assert getattr(event, "first_media_delivery_at", 0)
     # Same-batch siblings were registered before the first delivery: allowed.
     assert json.loads(await tool.call(None, batch[1]["id"]))["sent"]
     assert event.media_deliveries == 2
@@ -2893,7 +2894,7 @@ async def test_post_delivery_regenerated_artifact_is_not_sent():
     # A new generation registered after the delivery (e.g. an interrupted extra
     # call that later resumed) must not become an unexpected extra picture.
     later = register_artifacts(event, "run_template", receipt("third"))
-    later[0]["registered_at"] = state["first_media_delivery_at"] + 1
+    later[0]["registered_at"] = event.first_media_delivery_at + 1
     blocked = json.loads(await tool.call(None, later[0]["id"]))
     assert not blocked["success"]
     assert "拦截" in blocked["reason"]
@@ -3272,7 +3273,10 @@ def test_silent_work_receipts_selection():
 @pytest.mark.asyncio
 async def test_companion_shelf_import_keeps_full_body_and_deduplicates(monkeypatch):
     from contextlib import asynccontextmanager
-    from data.plugins.astrbot_plugin_private_companion import external_work_import as importer
+    try:
+        from data.plugins.astrbot_plugin_private_companion import external_work_import as importer
+    except ModuleNotFoundError:
+        pytest.skip("astrbot_plugin_private_companion 未安装，书架导入测试随之跳过")
 
     @asynccontextmanager
     async def authority(_):
@@ -3301,7 +3305,7 @@ async def test_timeout_killed_round_leaves_honest_pending_message():
         "tool_receipts": [{"tool": "safe_write", "status": "verified"}],
     }
 
-    async def timing_out_turn(umo, preview=False):
+    async def timing_out_turn(umo, preview=False, **kwargs):
         await asyncio.sleep(60)
 
     plugin.turn = timing_out_turn
@@ -3317,7 +3321,7 @@ async def test_timeout_note_not_added_for_quiet_or_receiptless_rounds():
     """No pending note when the round was quiet or did no real work."""
     plugin, state, event = make_plugin()
 
-    async def timing_out_turn(umo, preview=False):
+    async def timing_out_turn(umo, preview=False, **kwargs):
         await asyncio.sleep(60)
 
     plugin.turn = timing_out_turn
@@ -3682,5 +3686,5 @@ def test_schema_default_extra_prompt_encourages_tools():
     assert "意见不同" in default
     # 默认行为偏好不该把沉默说成"要避免的事"，也不该鼓励无由头的分享。
     assert "别为了显得勤快而冒泡" in default
-    assert "同一套别连着来" in default
+    assert "同一件事不换个说法再讲一遍" in default
     assert "才发一张画、一首歌或别的成品" in default
