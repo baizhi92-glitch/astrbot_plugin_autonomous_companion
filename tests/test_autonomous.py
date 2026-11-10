@@ -3640,7 +3640,7 @@ async def test_memory_bridge_prefers_hooks_then_native_then_companion():
     ]
     bridge = plugin.memory_bridge(event)
     assert bridge == "companion-api"
-    assert "未暴露可用接口" in event.state["livingmemory_status"]
+    assert "接口不完整" in event.state["livingmemory_status"]
 
 
 @pytest.mark.asyncio
@@ -3673,6 +3673,89 @@ def test_native_bridge_detects_group_chat_from_event_or_origin():
     assert bridge._is_group_chat() is False
     bridge.event = SimpleNamespace(unified_msg_origin="香夜梨:GroupMessage:999")
     assert bridge._is_group_chat() is True
+
+
+@pytest.mark.asyncio
+async def test_native_bridge_falls_back_to_older_livingmemory_helpers():
+    class _OldEngine:
+        def __init__(self):
+            self.search_kwargs = None
+            self.add_kwargs = None
+
+        async def search_memories(self, *, query, k, session_id, persona_id=None):
+            if persona_id is not None:
+                raise TypeError("unexpected keyword argument 'persona_id'")
+            self.search_kwargs = {"query": query, "k": k, "session_id": session_id}
+            return [SimpleNamespace(content="旧版记忆", metadata={})]
+
+        async def add_memory(self, *, content, session_id, importance, metadata):
+            self.add_kwargs = {
+                "content": content,
+                "session_id": session_id,
+                "importance": importance,
+                "metadata": metadata,
+            }
+            return 11
+
+    engine = _OldEngine()
+    living = SimpleNamespace(
+        initializer=SimpleNamespace(memory_engine=engine, memory_processor=None),
+        config_manager={},
+        context=object(),
+    )
+    event = SimpleNamespace(
+        unified_msg_origin="香夜梨:FriendMessage:123", persona_id="persona-from-event"
+    )
+    # 旧版 LivingMemory：没有合并解析入口，也没有 get_persona_id。
+    scopes = SimpleNamespace(
+        adapter_access=lambda *a, **k: _ScopeGuard(),
+        resolve_event_memory_access=None,
+        is_event_memory_allowed=lambda *a, **k: True,
+        resolve_memory_scope=lambda *a, **k: "scoped",
+        get_persona_id=None,
+    )
+    bridge = module.LivingMemoryNativeBridge(living, event, scopes)
+
+    text = await bridge.compose_context(query="旧版", top_k=5, max_chars=100)
+    assert text == "- 旧版记忆"
+    assert engine.search_kwargs == {"query": "旧版", "k": 5, "session_id": "scoped"}
+
+    await bridge.record_visible_turn(role="assistant", content="旧版写入")
+    assert engine.add_kwargs["content"] == "旧版写入"
+    assert engine.add_kwargs["session_id"] == "scoped"
+    assert engine.add_kwargs["metadata"]["memory_origin"] == "autonomous_companion"
+
+
+def test_livingmemory_scopes_bundle_tolerates_missing_helpers():
+    empty = module.LivingMemoryScopes(SimpleNamespace(), SimpleNamespace())
+    assert not empty.usable
+    assert empty.resolve_event_memory_access is None
+
+    def _noop(*args, **kwargs):
+        return None
+
+    full = module.LivingMemoryScopes(
+        SimpleNamespace(
+            adapter_access=_noop,
+            resolve_event_memory_access=_noop,
+            is_event_memory_allowed=_noop,
+            resolve_memory_scope=_noop,
+        ),
+        SimpleNamespace(get_persona_id=_noop),
+    )
+    assert full.usable
+
+
+def test_livingmemory_scopes_returns_none_when_helpers_incomplete(monkeypatch):
+    plugin, _, _ = make_plugin()
+    meta = SimpleNamespace(root_dir_name="astrbot_plugin_livingmemory")
+
+    def fake_import(name):
+        return SimpleNamespace()
+
+    monkeypatch.setattr(module, "importlib", SimpleNamespace(import_module=fake_import))
+    # 旧版模块缺助手时降级返回 None，而不是把 AttributeError 炸穿整轮。
+    assert plugin.livingmemory_scopes(meta) is None
 
 
 def test_schema_default_extra_prompt_encourages_tools():
