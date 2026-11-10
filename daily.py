@@ -55,11 +55,149 @@ def active_budget_override(owner, state):
     )
 
 
+def night_bounds(owner):
+    """Return the configured night window as local whole hours.
+
+    Args:
+        owner: Plugin runtime and configuration.
+
+    Returns:
+        Tuple of start and end hour; the window is left-inclusive, right-exclusive
+        and may wrap past midnight.
+    """
+    start = owner.number("night_window_start_hour", 23, 0, 23)
+    end = owner.number("night_window_end_hour", 8, 0, 23)
+    return start, end
+
+
+def night_pool_key(owner, now=None):
+    """Return the identifier of the night pool currently in effect.
+
+    A night that wraps past midnight stays one pool: hours after the start hour
+    use today's date, hours before the end hour use yesterday's date, so the
+    counter does not reset at 00:00 in the middle of a night.
+
+    Args:
+        owner: Plugin runtime and configuration.
+        now: Optional aware local datetime for deterministic verification.
+
+    Returns:
+        Night pool identifier, or an empty string during the day.
+    """
+    if not owner.config.get("split_night_budget", True):
+        return ""
+    now = now or datetime.now().astimezone()
+    start, end = night_bounds(owner)
+    if start == end:
+        return ""
+    if start > end:
+        if now.hour >= start:
+            return now.date().isoformat()
+        if now.hour < end:
+            return (now.date() - timedelta(days=1)).isoformat()
+        return ""
+    if start <= now.hour < end:
+        return now.date().isoformat()
+    return ""
+
+
+def night_end_timestamp(owner, now=None):
+    """Return when the current or next night window ends, as an epoch value."""
+    now = now or datetime.now().astimezone()
+    _, end = night_bounds(owner)
+    candidate = now.replace(hour=end, minute=0, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate.timestamp()
+
+
+def pool_usage(owner, state):
+    """Return the counters of the pool that currently applies.
+
+    Args:
+        owner: Plugin runtime and configuration.
+        state: Persistent per-target state.
+
+    Returns:
+        Today's counters during the day, or the current night pool at night.
+    """
+    key = night_pool_key(owner)
+    if not key:
+        return usage_for(state)
+    pools = state.setdefault("night_usage", {})
+    if pools.get("pool") != key:
+        state["night_usage"] = pools = {
+            "pool": key,
+            "checks": 0,
+            "rounds": 0,
+            "tools": 0,
+            "messages": 0,
+            "failures": 0,
+            "previews": 0,
+        }
+    return pools
+
+
+def count(owner, state, counter, amount=1):
+    """Count an occurrence in both today's totals and the active pool.
+
+    Args:
+        owner: Plugin runtime and configuration.
+        state: Persistent per-target state.
+        counter: Counter name such as tools, rounds, checks or messages.
+        amount: Increment size.
+
+    Returns:
+        The new today total for that counter.
+    """
+    usage = usage_for(state)
+    usage[counter] = usage.get(counter, 0) + amount
+    pool = pool_usage(owner, state)
+    if pool is not usage:
+        pool[counter] = pool.get(counter, 0) + amount
+    return usage[counter]
+
+
+def pool_limit(owner, setting, default):
+    """Return the effective limit for the active pool.
+
+    Args:
+        owner: Plugin runtime and configuration.
+        setting: Daily limit configuration key.
+        default: Fallback when the key is missing.
+
+    Returns:
+        The nightly share of the daily limit at night, otherwise the daily limit.
+    """
+    limit = owner.number(setting, default, 0, 100000)
+    if not limit or not night_pool_key(owner):
+        return limit
+    percent = owner.number("night_budget_percent", 40, 0, 200)
+    return max(1, limit * percent // 100)
+
+
+def pool_snapshot(owner, state):
+    """Return both pool usages and limits for pages and the morning report."""
+    pool = pool_usage(owner, state)
+    return {
+        "pool": "night" if night_pool_key(owner) else "day",
+        "checks": pool.get("checks", 0),
+        "rounds": pool.get("rounds", 0),
+        "tools": pool.get("tools", 0),
+        "messages": pool.get("messages", 0),
+        "limit_checks": pool_limit(owner, "daily_check_limit", 144),
+        "limit_rounds": pool_limit(owner, "daily_round_limit", 96),
+        "limit_tools": pool_limit(owner, "daily_tool_limit", 300),
+        "limit_messages": pool_limit(owner, "daily_message_limit", 200),
+        "today": dict(usage_for(state)),
+    }
+
+
 def exhausted(owner, state, counter, setting, default):
     if active_budget_override(owner, state):
         return False
-    limit = owner.number(setting, default, 0, 100000)
-    return bool(limit and usage_for(state).get(counter, 0) >= limit)
+    limit = pool_limit(owner, setting, default)
+    return bool(limit and pool_usage(owner, state).get(counter, 0) >= limit)
 
 
 def retain_outputs(state, outputs):
