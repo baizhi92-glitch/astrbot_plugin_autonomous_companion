@@ -24,6 +24,9 @@ def make_plugin():
     plugin.config["ignore_budget_while_active"] = False
     plugin.config["general_execution_contract"] = False
     plugin.config["natural_task_closing"] = False
+    # 默认关闭昼夜分池，让既有预算用例与真实时钟无关；分池与早报另有专门用例。
+    plugin.config["split_night_budget"] = False
+    plugin.config["morning_report_enabled"] = False
     plugin.logger = logging.getLogger("test")
     plugin.stopping = False
     plugin.revisions = {}
@@ -47,6 +50,10 @@ def make_plugin():
         clear_result=lambda: None,
         plugins_name=None,
         get_sender_id=lambda: "123",
+        get_sender_name=lambda: "朋友",
+        get_self_id=lambda: "999",
+        get_message_str=lambda: "在",
+        get_extra=lambda *_: False,
     )
     plugin.prepare = AsyncMock(return_value=(event, {"prompt": "persona"}, "provider", [], "memory"))
     plugin.tools = lambda *_: module.ToolSet()
@@ -786,16 +793,6 @@ async def test_pause_project_stops_queued_checkpoint_and_preserves_draft():
     assert next_checkpoint(state, "cid")["task"] == "chapter two"
 
 
-def test_preferences_require_user_evidence():
-    state = {}
-    module.apply_plan(state, {"preference_updates": [
-        {"key": "style", "value": "prefer finished work", "evidence": "show me the finished work"},
-        {"key": "silence", "value": "dislikes chat", "evidence": "no reply"},
-    ]}, user_text="Please show me the finished work.")
-    assert "style" in state["preferences"]
-    assert "silence" not in state["preferences"]
-
-
 @pytest.mark.asyncio
 async def test_model_can_schedule_later_check_without_sending():
     plugin, state, event = make_plugin()
@@ -855,11 +852,13 @@ async def test_chat_planning_stores_real_preferences_and_project(monkeypatch):
     plugin.context.get_current_chat_provider_id = AsyncMock(return_value="provider")
     plugin.context.llm_generate.return_value = SimpleNamespace(completion_text=json.dumps({
         "future_task": "write a story", "project_updates": [{"title": "Story", "next_step": "draft"}],
-        "preference_updates": [{"key": "topic", "value": "stories", "evidence": "prefer stories"}]
+        "note_updates": [{"key": "topic", "value": "stories", "kind": "preference",
+                          "evidence": "prefer stories"}]
     }))
     await plugin.plan_from_chat(event, "I could write one.", 0)
     assert state["future_task"] == "write a story"
-    assert state["preferences"]["topic"]["value"] == "stories"
+    assert state["notes"]["topic"]["value"] == "stories"
+    assert state["notes"]["topic"]["kind"] == "preference"
 
 
 @pytest.mark.asyncio
@@ -879,14 +878,37 @@ class PageConfig(dict):
         self.saved = True
 
 
-def test_companion_integration_is_in_page_settings_group():
-    import re
+def page_settings_groups(page: str) -> str:
+    """返回 app.js 里设置分组表的源码片段（分组改名不该让测试失效）。"""
+    start = page.index("const groups = [")
+    return page[start:page.index("const names = {")]
 
+
+def test_companion_integration_is_in_page_settings_group():
     page = (Path(__file__).parents[1] / "pages" / "我只在乎你" / "app.js").read_text(encoding="utf-8")
-    group = re.search(r'\["陪伴对象与运行",\[([^\]]+)\]\]', page)
-    assert group is not None
-    assert '"companion_integration"' in group.group(1)
+    assert '"companion_integration"' in page_settings_groups(page)
     assert 'names.companion_integration="可选适配我会永远陪着你"' in page
+
+
+def test_self_scheduled_speak_settings_are_exposed_in_page():
+    page = (Path(__file__).parents[1] / "pages" / "我只在乎你" / "app.js").read_text(encoding="utf-8")
+    groups = page_settings_groups(page)
+    for key in (
+        "self_scheduled_speak",
+        "next_speak_min_minutes",
+        "next_speak_max_minutes",
+        "speak_wish_ttl_hours",
+    ):
+        assert '"' + key + '"' in groups
+        assert key + ":" in page
+    schema = json.loads((Path(__file__).parents[1] / "_conf_schema.json").read_text(encoding="utf-8"))
+    for key in (
+        "self_scheduled_speak",
+        "next_speak_min_minutes",
+        "next_speak_max_minutes",
+        "speak_wish_ttl_hours",
+    ):
+        assert key in schema
 
 
 @pytest.mark.asyncio
@@ -900,6 +922,24 @@ async def test_page_config_validates_entire_patch_before_save():
     await page.update_config({"targets": ["123"], "platform_id": "test"})
     assert plugin.target_origins() == ["test:FriendMessage:123"]
     assert plugin.config.saved
+
+
+@pytest.mark.asyncio
+async def test_page_config_rejects_out_of_range_speak_window():
+    plugin, _, _ = make_plugin()
+    plugin.config = PageConfig(plugin.config)
+    page = module.CompanionPageAPI(plugin)
+    with pytest.raises(ValueError):
+        await page.update_config({"next_speak_max_minutes": 5000})
+    with pytest.raises(ValueError):
+        await page.update_config({"next_speak_min_minutes": 600, "next_speak_max_minutes": 60})
+    with pytest.raises(ValueError):
+        await page.update_config({"self_scheduled_speak": "yes"})
+    await page.update_config(
+        {"self_scheduled_speak": False, "next_speak_min_minutes": 10, "next_speak_max_minutes": 720}
+    )
+    assert plugin.config["self_scheduled_speak"] is False
+    assert plugin.config["next_speak_max_minutes"] == 720
 
 
 @pytest.mark.asyncio
@@ -1211,28 +1251,509 @@ def test_topic_cancellation_cannot_reduce_global_contact_frequency():
     assert "单一主题" in state["rhythm_ignored_reason"]
 
 
-def test_pinned_preferences_survive_capacity_and_updated_values_keep_pin():
-    state={"preferences":{"keep":{"value":"old","evidence":"old","pinned":True,"updated_at":1}}}
-    for i in range(15):
-        text=f"new preference {i}"
-        module.apply_plan(state,{"preference_updates":[{"key":str(i),"value":text,"evidence":text}]},user_text=text)
-    assert len(state["preferences"])==12
-    assert state["preferences"]["keep"]["pinned"]
-    module.apply_plan(state,{"preference_updates":[{"key":"keep","value":"changed","evidence":"changed"}]},user_text="changed")
-    assert state["preferences"]["keep"]["value"]=="changed"
-    assert state["preferences"]["keep"]["pinned"]
+def test_pinned_notes_survive_updates_and_are_kept_without_a_cap():
+    state = {"notes": {"keep": {"value": "old", "kind": "preference", "confirmed": True,
+                                "evidence": "old", "pinned": True, "updated_at": 1}}}
+    for index in range(15):
+        text = f"new preference {index}"
+        module.apply_plan(
+            state,
+            {"note_updates": [{"key": str(index), "value": text, "kind": "preference", "evidence": text}]},
+            user_text=text,
+        )
+    # 不再有条数上限，固定项也不会被挤掉
+    assert len(state["notes"]) == 16
+    assert state["notes"]["keep"]["pinned"]
+    module.apply_plan(
+        state,
+        {"note_updates": [{"key": "keep", "value": "changed", "kind": "preference", "evidence": "changed"}]},
+        user_text="changed",
+    )
+    assert state["notes"]["keep"]["value"] == "changed"
+    assert state["notes"]["keep"]["pinned"]
+
+
+def test_note_updates_need_user_evidence_and_keep_previous():
+    state = {
+        "notes": {
+            "语气": {"value": "别用感叹号", "kind": "preference", "confirmed": True,
+                     "evidence": "别用感叹号", "created_at": 1, "updated_at": 1}
+        }
+    }
+    module.apply_plan(
+        state,
+        {
+            "note_updates": [
+                # 原话里没有这句（是助手或推测），整条丢弃
+                {"key": "工作", "value": "在设计公司上班", "kind": "fact",
+                 "confirmed": True, "evidence": "她应该在设计公司上班"},
+                {"key": "语气", "value": "说话别那么正式", "kind": "preference",
+                 "evidence": "说话别那么正式"},
+                {"key": "宠物", "value": "养了一只叫团子的橘猫", "kind": "fact",
+                 "confirmed": True, "evidence": "我家团子"},
+            ]
+        },
+        user_text="说话别那么正式，我家团子又打翻水了",
+    )
+    assert set(state["notes"]) == {"语气", "宠物"}
+    assert state["notes"]["语气"]["previous"] == "别用感叹号"
+    assert state["notes"]["宠物"]["kind"] == "fact"
+    assert state["notes"]["宠物"]["source"] == "chat"
+    assert state["notes"]["宠物"]["confirmed"] is True
+
+
+def test_note_kind_defaults_to_fact_and_preference_is_always_confirmed():
+    state = {}
+    module.apply_plan(
+        state,
+        {
+            "note_updates": [
+                {"key": "作息", "value": "十一点后别发消息", "kind": "preference",
+                 "evidence": "十一点以后别理我"},
+                {"key": "工作", "value": "可能在做设计", "evidence": "又要改稿"},
+                {"key": "音乐", "value": "喜欢 city pop", "kind": "interest",
+                 "confirmed": True, "evidence": "最近在循环"},
+            ]
+        },
+        user_text="十一点以后别理我，又要改稿，最近在循环 city pop",
+    )
+    assert state["notes"]["作息"]["kind"] == "preference"
+    # 偏好只来自用户明确表达，天然是已确认的
+    assert state["notes"]["作息"]["confirmed"] is True
+    # 没写 kind 时按事实处理，不会擅自变成约束
+    assert state["notes"]["工作"]["kind"] == "fact"
+    assert state["notes"]["工作"]["confirmed"] is False
+    assert state["notes"]["音乐"]["kind"] == "interest"
+
+
+def test_note_updates_skip_duplicate_values():
+    state = {
+        "notes": {
+            "语气": {"value": "别用感叹号", "kind": "preference", "confirmed": True,
+                     "evidence": "别用感叹号", "updated_at": 1}
+        }
+    }
+    module.apply_plan(
+        state,
+        {"note_updates": [
+            {"key": "风格", "value": "别用感叹号", "kind": "fact", "evidence": "别用感叹号"}
+        ]},
+        user_text="别用感叹号",
+    )
+    assert set(state["notes"]) == {"语气"}
+
+
+def test_note_updates_apply_instead_of_silently_dropping_the_batch():
+    state = {}
+    module.apply_plan(
+        state,
+        {
+            "future_task": "保留这条计划",
+            "note_updates": [
+                {"key": "k1", "value": "v1", "evidence": "a1"},
+                {"key": "k2", "value": "v2", "evidence": "b2"},
+                {"key": "k3", "value": "v3", "evidence": "c3"},
+                {"key": "k4", "value": "v4", "evidence": "d4"},
+            ],
+        },
+        user_text="a1 b2 c3 d4",
+    )
+    assert set(state["notes"]) == {"k1", "k2", "k3", "k4"}
+    assert state["future_task"] == "保留这条计划"
+
+
+def test_notes_have_no_cap_and_the_bot_can_rewrite_or_drop():
+    state = {
+        "notes": {
+            f"k{index}": {
+                "value": f"v{index}",
+                "kind": "fact",
+                "confirmed": index % 2 == 0,
+                "updated_at": index,
+            }
+            for index in range(40)
+        }
+    }
+    module.apply_plan(
+        state,
+        {
+            "note_updates": [
+                {"key": "k39", "value": "换工作了，现在在教育行业", "kind": "fact",
+                 "confirmed": True, "evidence": "我换工作了"},
+                {"key": "k0", "value": "", "evidence": "已经没有猫了", "drop": True},
+            ]
+        },
+        user_text="我换工作了，已经没有猫了",
+    )
+    notes = state["notes"]
+    # 不设条数上限：40 条都在，删掉一条就是 39 条
+    assert len(notes) == 39
+    assert "k0" not in notes
+    assert notes["k39"]["value"] == "换工作了，现在在教育行业"
+    assert notes["k39"]["previous"] == "v39"
+    assert notes["k39"]["confirmed"] is True
+
+
+def test_note_drop_needs_user_evidence_and_value_is_required():
+    state = {
+        "notes": {"宠物": {"value": "养猫", "kind": "fact", "confirmed": True, "updated_at": 1}}
+    }
+    module.apply_plan(
+        state,
+        {"note_updates": [{"key": "宠物", "evidence": "助手觉得不该记这条", "drop": True}]},
+        user_text="今天好累",
+    )
+    assert "宠物" in state["notes"]
+    with pytest.raises(ValueError):
+        module.apply_plan(
+            state,
+            {"note_updates": [{"key": "居住", "evidence": "今天好累"}]},
+            user_text="今天好累",
+        )
+
+
+def test_legacy_preferences_and_impressions_fold_into_one_note_list():
+    state = {
+        "preferences": {
+            "作息": {"value": "十一点后别发消息", "evidence": "十一点以后别理我",
+                     "updated_at": 5, "pinned": True}
+        },
+        "impressions": {
+            "宠物": {"value": "养了一只叫团子的橘猫", "kind": "fact", "confirmed": True,
+                     "evidence": "我家团子", "updated_at": 6},
+            "工作": {"value": "可能在做设计", "kind": "fact", "confirmed": False,
+                     "evidence": "又要改稿", "updated_at": 7},
+        },
+    }
+    assert module.migrate_user_notes(state) is True
+    assert "preferences" not in state and "impressions" not in state
+    assert state["notes"]["作息"]["kind"] == "preference"
+    assert state["notes"]["作息"]["confirmed"] is True
+    assert state["notes"]["作息"]["pinned"] is True
+    assert state["notes"]["宠物"]["kind"] == "fact"
+    assert state["notes"]["宠物"]["confirmed"] is True
+    assert state["notes"]["工作"]["confirmed"] is False
+    # 迁移可重复执行，不会翻倍
+    assert module.migrate_user_notes(state) is False
+    assert len(state["notes"]) == 3
+    # 同名不同来源不互相覆盖
+    state["preferences"] = {"宠物": {"value": "用户手动改过", "evidence": "用户手动添加"}}
+    assert module.migrate_user_notes(state) is True
+    assert len(state["notes"]) == 4
+    assert state["notes"]["宠物"]["value"] == "养了一只叫团子的橘猫"
+
+
+def test_user_notes_context_separates_the_three_groups():
+    plugin, state, _ = make_plugin()
+    now = time.time()
+    state["notes"] = {
+        "作息": {"value": "十一点后别发消息", "kind": "preference", "confirmed": True,
+                 "evidence": "十一点以后别理我", "updated_at": now},
+        "宠物": {"value": "养了一只叫团子的橘猫", "kind": "fact", "confirmed": True,
+                 "evidence": "我家团子", "updated_at": now},
+        "音乐": {"value": "喜欢 city pop", "kind": "interest", "confirmed": True,
+                 "evidence": "最近在循环", "updated_at": now},
+        "工作": {"value": "可能在做设计", "kind": "fact", "confirmed": False,
+                 "evidence": "又要改稿", "updated_at": now},
+    }
+    block = plugin.user_notes_context(state)
+    preference_part, _, rest = block.partition("已确认的事实与爱好")
+    known_part, _, guess_part = rest.partition("还没确认")
+    assert "作息（偏好）：十一点后别发消息" in preference_part
+    assert "宠物（事实）" in known_part and "音乐（爱好）" in known_part
+    assert "可能在做设计" in guess_part
+    assert "可能在做设计" not in preference_part + known_part
+    assert "必须遵守" in block
+    assert "用户现在的说法一律优先于记录" in block
+    empty = plugin.user_notes_context({})
+    assert "暂无记录" in empty and "不要编造" in empty
+
+
+def test_user_notes_context_flags_only_stale_unpinned_preferences():
+    plugin, state, _ = make_plugin()
+    old = time.time() - 200 * 86400
+    state["notes"] = {
+        "作息": {"value": "十一点后别发消息", "kind": "preference", "confirmed": True, "updated_at": old},
+        "称呼": {"value": "叫她小满", "kind": "preference", "confirmed": True, "updated_at": old, "pinned": True},
+        "宠物": {"value": "养猫", "kind": "fact", "confirmed": True, "updated_at": old},
+    }
+    block = plugin.user_notes_context(state)
+    assert block.count("天未更新，可能过时") == 1
 
 
 @pytest.mark.asyncio
-async def test_preference_management_does_not_clear_task():
-    plugin,state,event=make_plugin()
-    state.update(preferences={"style":{"value":"natural","evidence":"自然点"}},manual_plan="keep task")
-    page=module.CompanionPageAPI(plugin)
-    await page.perform({"umo":event.unified_msg_origin,"action":"preference_pin","key":"style","pinned":True})
-    assert state["preferences"]["style"]["pinned"]
-    await page.perform({"umo":event.unified_msg_origin,"action":"preference_delete","key":"style"})
-    assert not state["preferences"]
-    assert state["manual_plan"]=="keep task"
+async def test_decision_prompt_carries_notes_and_keeps_guesses_out_of_facts():
+    plugin, state, event = make_plugin()
+    now = time.time()
+    state["notes"] = {
+        "作息": {"value": "十一点后别发消息", "kind": "preference", "confirmed": True,
+                 "evidence": "十一点以后别理我", "updated_at": now},
+        "宠物": {"value": "养了一只叫团子的橘猫", "kind": "fact", "confirmed": True,
+                 "evidence": "我家团子", "updated_at": now},
+        "工作": {"value": "可能在做设计", "kind": "fact", "confirmed": False,
+                 "evidence": "又要改稿", "updated_at": now},
+    }
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text='{"action":"silent","reason":"她在忙"}'
+    )
+    await plugin.turn(event.unified_msg_origin)
+    call = plugin.context.llm_generate.call_args.kwargs
+    assert "- 作息（偏好）：十一点后别发消息" in call["prompt"]
+    assert "- 宠物（事实）：养了一只叫团子的橘猫" in call["prompt"]
+    assert "还没确认" in call["prompt"]
+    # 原话不外泄，只留整理后的结论
+    assert "我家团子" not in call["prompt"]
+    assert "偏好是硬约束" in call["system_prompt"]
+    assert "只当猜测" in call["system_prompt"]
+
+
+def test_chat_planning_prompt_defines_one_note_field_with_three_kinds():
+    prompt = module.CHAT_PLANNING_PROMPT
+    assert "note_updates" in prompt
+    assert "preference_updates" not in prompt and "impression_updates" not in prompt
+    for kind in ("preference", "fact", "interest"):
+        assert kind in prompt
+    assert "偏好是" not in prompt or "preference 是" in prompt
+    assert "不限条数" in prompt
+    assert "人是会变的" in prompt
+    assert '"drop": true' in prompt
+    assert "身份证号" in prompt
+    assert "每轮最多 3 条改动" in prompt
+
+
+@pytest.mark.asyncio
+async def test_note_page_actions_save_edit_pin_confirm_delete():
+    plugin, state, event = make_plugin()
+    page = module.CompanionPageAPI(plugin)
+    umo = event.unified_msg_origin
+    await page.perform({"umo": umo, "action": "note_save", "key": "宠物",
+                        "value": "养了一只叫团子的橘猫", "kind": "fact"})
+    note = state["notes"]["宠物"]
+    assert note["kind"] == "fact" and note["confirmed"] is False
+    assert note["source"] == "manual" and note["evidence"] == "用户手动添加"
+    await page.perform({"umo": umo, "action": "note_confirm", "key": "宠物", "confirmed": True})
+    assert state["notes"]["宠物"]["confirmed"] is True
+    assert "confirmed_at" in state["notes"]["宠物"]
+    await page.perform({"umo": umo, "action": "note_pin", "key": "宠物", "pinned": True})
+    assert state["notes"]["宠物"]["pinned"] is True
+    await page.perform({"umo": umo, "action": "note_save", "key": "养宠", "replace_key": "宠物",
+                        "value": "养了两只猫", "kind": "fact"})
+    assert "宠物" not in state["notes"]
+    assert state["notes"]["养宠"]["previous"] == "养了一只叫团子的橘猫"
+    # 偏好类型自动视为已确认，且不会被降级成猜测
+    await page.perform({"umo": umo, "action": "note_save", "key": "作息",
+                        "value": "十一点后别发消息", "kind": "preference", "confirmed": False})
+    assert state["notes"]["作息"]["kind"] == "preference"
+    assert state["notes"]["作息"]["confirmed"] is True
+    with pytest.raises(ValueError):
+        await page.perform({"umo": umo, "action": "note_save", "key": "空内容", "value": ""})
+    with pytest.raises(ValueError):
+        await page.perform({"umo": umo, "action": "note_save", "key": "x", "value": "y", "kind": "mood"})
+    with pytest.raises(ValueError):
+        await page.perform({"umo": umo, "action": "note_confirm", "key": "不存在", "confirmed": True})
+    with pytest.raises(ValueError):
+        await page.perform({"umo": umo, "action": "note_confirm", "key": "养宠", "confirmed": "yes"})
+    with pytest.raises(ValueError):
+        await page.perform({"umo": umo, "action": "note_pin", "key": "养宠", "pinned": "yes"})
+    state["manual_plan"] = "keep task"
+    state["notes"] = {
+        f"k{index}": {"value": f"v{index}", "kind": "fact", "confirmed": True} for index in range(24)
+    }
+    # 没有条数上限：第 25 条照样能加
+    await page.perform({"umo": umo, "action": "note_save", "key": "第二十五条", "value": "也记着"})
+    assert len(state["notes"]) == 25
+    await page.perform({"umo": umo, "action": "note_delete", "key": "k0"})
+    assert "k0" not in state["notes"] and len(state["notes"]) == 24
+    assert state["manual_plan"] == "keep task"
+
+
+@pytest.mark.asyncio
+async def test_old_preference_and_impression_actions_still_work_as_aliases():
+    plugin, state, event = make_plugin()
+    page = module.CompanionPageAPI(plugin)
+    umo = event.unified_msg_origin
+    await page.perform({"umo": umo, "action": "preference_save", "key": "作息", "value": "十一点后别发消息"})
+    assert state["notes"]["作息"]["kind"] == "preference"
+    assert state["notes"]["作息"]["confirmed"] is True
+    await page.perform({"umo": umo, "action": "preference_pin", "key": "作息", "pinned": True})
+    assert state["notes"]["作息"]["pinned"] is True
+    await page.perform({"umo": umo, "action": "impression_save", "key": "宠物",
+                        "value": "养猫", "kind": "interest"})
+    assert state["notes"]["宠物"]["kind"] == "interest"
+    await page.perform({"umo": umo, "action": "impression_confirm", "key": "宠物", "confirmed": True})
+    assert state["notes"]["宠物"]["confirmed"] is True
+    await page.perform({"umo": umo, "action": "impression_delete", "key": "宠物"})
+    await page.perform({"umo": umo, "action": "preference_delete", "key": "作息"})
+    assert not state["notes"]
+
+def _at(weekday, hour):
+    """构造某个星期几的整点时间戳（从周一起算，避开具体日历）。"""
+    from datetime import datetime, timedelta
+
+    base = datetime(2026, 11, 2, hour, 30)
+    return time.mktime((base + timedelta(days=(weekday - base.weekday()) % 7)).timetuple())
+
+
+def test_activity_records_by_hour_and_keeps_weekends_separate():
+    state = {}
+    # 半衰期拉到十年，先把衰减放到一边，只看分桶是否正确
+    for _ in range(6):
+        module.record_activity(state, _at(0, 21), 3650)
+    for _ in range(3):
+        module.record_activity(state, _at(5, 23), 3650)
+    activity = state["activity"]
+    assert activity["samples"] == 9
+    assert activity["weekday"][21] == pytest.approx(6, rel=0.01)
+    assert activity["weekend"][23] == pytest.approx(3, rel=0.01)
+    # 工作日的二十三点不会被周末的发言污染
+    assert activity["weekday"][23] == pytest.approx(0, abs=0.001)
+    info = module.activity_summary(state, 3650)
+    assert info["enough"] is True
+    assert "21:00–22:00" in info["active"]
+
+
+def test_activity_says_nothing_before_enough_samples():
+    plugin, state, _ = make_plugin()
+    for _ in range(3):
+        module.record_activity(state, _at(1, 9), 30)
+    info = module.activity_summary(state, 30)
+    assert info["enough"] is False
+    assert info["active"] == []
+    block = plugin.activity_context(state)
+    assert "看不出规律" in block
+    assert "用户常在线：" not in block
+    assert "默认不要主动开口" in block
+
+
+def test_activity_fades_old_samples_but_keeps_the_shape():
+    now = time.time()
+    bins = [0.0] * 24
+    bins[9] = 10.0
+    state = {
+        "activity": {
+            "weekday": bins,
+            "weekend": [0.0] * 24,
+            "samples": 10,
+            "updated_at": now - 60 * 86400,
+        }
+    }
+    short_half = module.activity_summary(state, 30)
+    long_half = module.activity_summary(state, 60)
+    # 半衰期 30 天，60 天前的样本只剩四分之一
+    assert short_half["hours"][9] == pytest.approx(2.5, rel=0.03)
+    assert long_half["hours"][9] == pytest.approx(5.0, rel=0.03)
+    assert short_half["active"] == ["09:00–10:00"]
+
+
+def test_activity_merges_a_range_that_crosses_midnight():
+    bins = [0.0] * 24
+    for hour in (22, 23, 0, 1):
+        bins[hour] = 5.0
+    state = {
+        "activity": {
+            "weekday": bins,
+            "weekend": [0.0] * 24,
+            "samples": 20,
+            "updated_at": time.time(),
+        }
+    }
+    info = module.activity_summary(state, 30)
+    assert "22:00–02:00" in info["active"]
+
+
+def test_activity_does_not_invent_a_weekend_shift_from_two_peaks():
+    weekday = [0.0] * 24
+    for hour in (8, 12, 21):
+        weekday[hour] = 6.0
+    weekend = [0.0] * 24
+    for hour in (23, 0):
+        weekend[hour] = 6.0
+    state = {
+        "activity": {
+            "weekday": weekday,
+            "weekend": weekend,
+            "samples": 30,
+            "updated_at": time.time(),
+        }
+    }
+    info = module.activity_summary(state, 30)
+    # 一天分成好几簇时，圆均值会算出没意义的偏移，宁可不提
+    assert info["weekend_shift"] == ""
+
+
+def test_activity_reports_the_shift_when_both_sides_are_tight():
+    weekday = [0.0] * 24
+    weekday[8] = 20.0
+    weekend = [0.0] * 24
+    weekend[11] = 20.0
+    state = {
+        "activity": {
+            "weekday": weekday,
+            "weekend": weekend,
+            "samples": 40,
+            "updated_at": time.time(),
+        }
+    }
+    assert module.activity_summary(state, 30)["weekend_shift"] == "周末比工作日晚约 3.0 小时"
+
+
+def test_activity_keeps_the_longest_quiet_stretches_only():
+    bins = [0.0] * 24
+    for hour in (9, 13, 21):
+        bins[hour] = 10.0
+    state = {
+        "activity": {
+            "weekday": bins,
+            "weekend": [0.0] * 24,
+            "samples": 40,
+            "updated_at": time.time(),
+        }
+    }
+    info = module.activity_summary(state, 30)
+    assert info["quiet"] == ["14:00–21:00", "22:00–09:00"]
+
+
+def test_activity_context_quotes_the_user_words_and_keeps_the_rules():
+    plugin, state, _ = make_plugin()
+    state["activity"] = {
+        "weekday": [0.0] * 24,
+        "weekend": [0.0] * 24,
+        "samples": 0,
+        "updated_at": 0.0,
+        "note": "我通常凌晨一点才睡，七点起",
+    }
+    block = plugin.activity_context(state)
+    assert "用户自己说的作息：我通常凌晨一点才睡，七点起" in block
+    assert "看不出规律" in block
+    assert "不要用作息推断她的心情" in block
+
+
+@pytest.mark.asyncio
+async def test_observe_records_activity_for_each_inbound_message():
+    plugin, state, event = make_plugin()
+    await plugin.observe(event)
+    activity = state["activity"]
+    assert activity["samples"] == 1
+    stamp = time.localtime(activity["updated_at"])
+    bins = activity["weekend"] if stamp.tm_wday >= 5 else activity["weekday"]
+    assert bins[stamp.tm_hour] == pytest.approx(1.0)
+    assert state["last_inbound"] > 0
+
+
+@pytest.mark.asyncio
+async def test_activity_page_actions_save_note_and_reset_statistics():
+    plugin, state, event = make_plugin()
+    page = module.CompanionPageAPI(plugin)
+    umo = event.unified_msg_origin
+    for _ in range(4):
+        module.record_activity(state, _at(2, 8), 30)
+    await page.perform({"umo": umo, "action": "activity_note", "note": "  我一般八点到公司  "})
+    assert state["activity"]["note"] == "我一般八点到公司"
+    await page.perform({"umo": umo, "action": "activity_reset"})
+    assert state["activity"]["samples"] == 0
+    assert state["activity"]["weekday"][8] == 0
+    # 清空统计不等于抹掉用户说过的作息
+    assert state["activity"]["note"] == "我一般八点到公司"
 
 
 def test_global_frequency_requires_user_evidence_and_expires():
@@ -1266,6 +1787,326 @@ def test_rhythm_preserves_one_shot_and_event_priority():
     state["events"] = [{"id":"event"}]
     plugin.update_rhythm(state, {"rhythm_minutes":90,"rhythm_reason":"slower"})
     assert state["next_due"] - time.time() <= 30
+
+
+def test_speak_commitment_bounds_cancel_and_gate():
+    plugin, state, _ = make_plugin()
+    plugin.update_speak_commitment(state, {"next_speak_minutes": True})
+    assert not state.get("next_speak_at")
+    assert state["journal"][-1]["action"] == "speak_ignored"
+    plugin.update_speak_commitment(state, {"next_speak_minutes": 2})
+    assert 5 * 60 - 1 < state["next_speak_at"] - time.time() <= 5 * 60
+    plugin.update_speak_commitment(state, {"next_speak_minutes": 9999})
+    assert state["next_speak_at"] - time.time() <= 1440 * 60
+    plugin.update_speak_commitment(
+        state, {"next_speak_minutes": 45, "next_speak_reason": "晚饭后想聊聊今天的进展"}
+    )
+    # 新约定排队，不再顶掉最早那条：45 分钟这条要在队列里，真正唤醒仍看最早。
+    scheduled = [
+        item
+        for item in plugin.speak_schedule(state)
+        if item["reason"] == "晚饭后想聊聊今天的进展"
+    ]
+    assert scheduled and 44 * 60 < scheduled[0]["at"] - time.time() <= 45 * 60
+    assert 5 * 60 - 1 < state["next_speak_at"] - time.time() <= 5 * 60
+    assert state["journal"][-1]["action"] == "speak_scheduled"
+    plugin.update_speak_commitment(state, {"next_speak_minutes": 0})
+    assert not state.get("next_speak_at")
+    assert state["journal"][-1]["action"] == "speak_cancelled"
+    plugin.config["self_scheduled_speak"] = False
+    plugin.update_speak_commitment(state, {"next_speak_minutes": 30})
+    assert not state.get("next_speak_at")
+
+
+def test_speak_commitment_accepts_numeric_strings_from_models():
+    plugin, state, _ = make_plugin()
+    plugin.update_speak_commitment(state, {"next_speak_minutes": "45"})
+    assert 44 * 60 < state["next_speak_at"] - time.time() <= 45 * 60
+    plugin.update_speak_commitment(state, {"next_speak_minutes": "0"})
+    assert not state.get("next_speak_at")
+    plugin.update_speak_commitment(state, {"next_speak_minutes": "soon"})
+    assert not state.get("next_speak_at")
+    assert state["journal"][-1]["action"] == "speak_ignored"
+    plugin.update_speak_commitment(state, {"next_speak_minutes": float("nan")})
+    assert not state.get("next_speak_at")
+    assert state["journal"][-1]["action"] == "speak_ignored"
+
+
+def test_bad_speak_value_never_breaks_a_round_that_already_produced_a_reply():
+    plugin, state, _ = make_plugin()
+    # 行动路径在发送消息前写入约定；无法识别的值必须只是忽略，不能抛错。
+    plugin.update_speak_commitment(state, {"next_speak_minutes": {"bad": 1}})
+    assert not state.get("next_speak_at")
+    assert state["speak_ignored_reason"]
+
+
+def test_speak_commitment_waits_for_pause():
+    plugin, state, _ = make_plugin()
+    state.update(pause_until=time.time() + 3600, pause_mode="all")
+    plugin.update_speak_commitment(state, {"next_speak_minutes": 30, "next_speak_reason": "想分享进展"})
+    assert state["next_speak_at"] == state["pause_until"]
+
+
+def test_wake_at_honors_self_scheduled_opening():
+    plugin, state, _ = make_plugin()
+    state["next_due"] = time.time() + 3600
+    state["next_speak_at"] = time.time() + 600
+    assert plugin.wake_at(state) == state["next_speak_at"]
+    state["next_speak_at"] = time.time() + 7200
+    assert plugin.wake_at(state) == state["next_due"]
+    state.pop("next_speak_at")
+    assert plugin.wake_at(state) == state["next_due"]
+
+
+def test_wake_at_never_delays_immediate_wake():
+    plugin, state, _ = make_plugin()
+    # next_due 0 means "wake now" (立即判断 / page "now"); a pending future
+    # opening must not postpone it.
+    state["next_due"] = 0
+    state["next_speak_at"] = time.time() + 60
+    assert plugin.wake_at(state) == 0
+    state.pop("next_due")
+    assert plugin.wake_at(state) == 0
+    state["next_speak_at"] = time.time() - 5
+    assert plugin.wake_at(state) == 0
+
+
+def test_disabled_self_scheduled_speak_drops_pending_commitment():
+    plugin, state, _ = make_plugin()
+    state["next_speak_at"] = time.time() - 1
+    state["next_speak_reason"] = "想聊聊"
+    plugin.config["self_scheduled_speak"] = False
+    assert plugin.consume_speak_commitment(state) == ""
+    assert not state.get("next_speak_at")
+    assert state["journal"][-1]["action"] == "speak_dropped"
+
+
+def test_consume_speak_commitment_pops_due_only():
+    plugin, state, _ = make_plugin()
+    assert plugin.consume_speak_commitment(state) == ""
+    state["next_speak_at"] = time.time() + 600
+    assert plugin.consume_speak_commitment(state) == ""
+    assert state["next_speak_at"]
+    state["next_speak_at"] = time.time() - 1
+    state["next_speak_reason"] = "想分享刚写完的一段"
+    reason = plugin.consume_speak_commitment(state)
+    assert reason == "想分享刚写完的一段"
+    assert not state.get("next_speak_at")
+    assert state["last_speak_commitment"]["reason"] == "想分享刚写完的一段"
+    assert state["journal"][-1]["action"] == "speak_due"
+
+
+@pytest.mark.asyncio
+async def test_speak_due_round_shows_commitment_in_decision_prompt():
+    plugin, state, event = make_plugin()
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text='{"action":"silent","reason":"暂时没有新内容"}'
+    )
+    await plugin.turn(event.unified_msg_origin, speak_due="想分享刚想到的结尾")
+    prompt = plugin.context.llm_generate.call_args.kwargs["prompt"]
+    assert "你自己约定的开口时间" in prompt
+    assert "想分享刚想到的结尾" in prompt
+
+
+@pytest.mark.asyncio
+async def test_pending_speak_commitment_visible_and_decision_can_reschedule():
+    plugin, state, event = make_plugin()
+    state["next_speak_at"] = time.time() + 1800
+    state["next_speak_reason"] = "睡前道晚安"
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text='{"action":"silent","reason":"等到约定时间再说","next_speak_minutes":60,"next_speak_reason":"晚安提前一点"}'
+    )
+    await plugin.turn(event.unified_msg_origin)
+    prompt = plugin.context.llm_generate.call_args.kwargs["prompt"]
+    assert "已和自己约定" in prompt
+    assert "睡前道晚安" in prompt
+    # 新的约定排在原有那条后面，两条都在；唤醒时间仍取最早的"睡前道晚安"。
+    reasons = [item["reason"] for item in plugin.speak_schedule(state)]
+    assert "睡前道晚安" in reasons and "晚安提前一点" in reasons
+    rescheduled = next(
+        item for item in plugin.speak_schedule(state) if item["reason"] == "晚安提前一点"
+    )
+    assert 59 * 60 < rescheduled["at"] - time.time() <= 60 * 60
+    assert state["next_speak_reason"] == "睡前道晚安"
+
+
+@pytest.mark.asyncio
+async def test_action_result_can_schedule_next_speak():
+    plugin, state, event = make_plugin()
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text='{"action":"create","task":"写一段短文","reason":"有想写的内容"}'
+    )
+    plugin.context.tool_loop_agent.return_value = SimpleNamespace(
+        completion_text='{"message":"跟你说个刚想到的点子","summary":"分享了点子","next_speak_minutes":120,"next_speak_reason":"两小时后说读后感"}'
+    )
+    await plugin.turn(event.unified_msg_origin)
+    assert 119 * 60 < state["next_speak_at"] - time.time() <= 120 * 60
+    assert state["next_speak_reason"] == "两小时后说读后感"
+
+
+@pytest.mark.asyncio
+async def test_preview_does_not_store_speak_commitment():
+    plugin, state, event = make_plugin()
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text='{"action":"silent","reason":"preview only","next_speak_minutes":30}'
+    )
+    await plugin.turn(event.unified_msg_origin, preview=True)
+    assert not state.get("next_speak_at")
+    await plugin.turn(event.unified_msg_origin)
+    assert state["next_speak_at"] > time.time()
+
+
+@pytest.mark.asyncio
+async def test_run_due_defers_and_drops_speak_commitment():
+    plugin, state, _ = make_plugin()
+    umo = "test:FriendMessage:123"
+    state.update(
+        pause_until=time.time() + 3600,
+        pause_mode="all",
+        next_due=time.time() + 3600,
+    )
+    state["next_speak_at"] = time.time() + 60
+    await plugin.run_due(umo)
+    assert state["next_speak_at"] == state["pause_until"]
+    state.update(pause_until=0, pause_mode="", next_due=time.time() + 60)
+    state["usage"] = {"day": time.strftime("%Y-%m-%d"), "checks": 999}
+    state["next_speak_at"] = time.time() + 60
+    state["next_speak_reason"] = "想聊聊"
+    await plugin.run_due(umo)
+    assert not state.get("next_speak_at")
+    assert state["journal"][-1]["action"] == "speak_dropped"
+
+
+@pytest.mark.asyncio
+async def test_run_due_fires_committed_opening_and_actually_speaks():
+    """到点真正唤醒并开口：约定被消耗、提示词带标记、消息真的发出。"""
+    plugin, state, event = make_plugin()
+    state["next_due"] = time.time() + 3600
+    state["next_speak_at"] = time.time() - 1
+    state["next_speak_reason"] = "想聊聊今天的小事"
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text='{"action":"chat","task":"说说今天的小事","reason":"到点开口"}'
+    )
+    plugin.context.tool_loop_agent.return_value = SimpleNamespace(
+        completion_text='{"message":"刚才突然想起一件小事，想说说。","summary":"到点说了句话"}'
+    )
+    await plugin.run_due(event.unified_msg_origin)
+    assert not state.get("next_speak_at")
+    assert state["last_turn"]["trigger"] == "speak"
+    prompt = plugin.context.llm_generate.call_args.kwargs["prompt"]
+    assert "已到你自己约定的开口时间" in prompt
+    assert "想聊聊今天的小事" in prompt
+    texts = [
+        "".join(getattr(part, "text", "") for part in call.args[0].chain)
+        for call in event.send.await_args_list
+    ]
+    assert any("刚才突然想起一件小事" in text for text in texts)
+
+
+@pytest.mark.asyncio
+async def test_speak_wish_is_kept_across_rounds_and_shown_to_her():
+    """她想说却没说出口的话要跨轮保留，并在下一轮提示词里让她自己看到。"""
+    plugin, state, event = make_plugin()
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text='{"action":"silent","reason":"还没到时候","speak_wish":"想问问她面试结果，别显得催"}'
+    )
+    await plugin.turn(event.unified_msg_origin)
+    assert state["speak_wish"] == "想问问她面试结果，别显得催"
+    assert state["speak_wish_at"] <= time.time()
+    assert any(item["action"] == "wish_kept" for item in state["journal"])
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text='{"action":"silent","reason":"还是先不说"}'
+    )
+    await plugin.turn(event.unified_msg_origin)
+    prompt = plugin.context.llm_generate.call_args.kwargs["prompt"]
+    assert "你心里存着一句还没说出口的话" in prompt
+    assert "面试结果" in prompt
+    assert state["speak_wish"] == "想问问她面试结果，别显得催"
+
+
+def test_speak_wish_repeat_counts_shelvings_and_replaces_on_new_note():
+    plugin, state, _ = make_plugin()
+    plugin.update_speak_wish(state, {"speak_wish": "想聊聊那本书的结尾"})
+    first = state["speak_wish_at"]
+    # 同一轮内决策与行动都复述同一句，不该重复计数
+    plugin.update_speak_wish(state, {"speak_wish": "想聊聊那本书的结尾"})
+    assert state["speak_wish_kept"] == 0
+    # 到了下一轮还惦记着，才算搁置一轮
+    state["speak_wish_kept_at"] = time.time() - 120
+    plugin.update_speak_wish(state, {"speak_wish": "想聊聊那本书的结尾"})
+    assert state["speak_wish_kept"] == 1
+    assert state["speak_wish_at"] == first
+    plugin.update_speak_wish(state, {"speak_wish": "换成想问问她今天累不累"})
+    assert state["speak_wish"] == "换成想问问她今天累不累"
+    assert state["speak_wish_kept"] == 0
+
+
+def test_speak_wish_can_be_dropped_expired_and_gated():
+    plugin, state, _ = make_plugin()
+    plugin.update_speak_wish(state, {"speak_wish": "想说的话"})
+    plugin.update_speak_wish(state, {"speak_wish_clear": True})
+    assert not state.get("speak_wish")
+    assert state["journal"][-1]["action"] == "wish_cleared"
+    plugin.update_speak_wish(state, {"speak_wish": "还惦记着一句晚安"})
+    state["speak_wish_at"] = time.time() - 25 * 3600
+    plugin.expire_speak_wish(state)
+    assert not state.get("speak_wish")
+    assert state["journal"][-1]["action"] == "wish_faded"
+    plugin.update_speak_wish(state, {"speak_wish": "新念头"})
+    plugin.config["self_scheduled_speak"] = False
+    plugin.update_speak_wish(state, {"speak_wish": "关掉后不该记"})
+    assert state["speak_wish"] == "新念头"
+
+
+@pytest.mark.asyncio
+async def test_committed_opening_releases_the_held_note():
+    """到点真的说了话，心里那句话就算说完了，不能继续挂着提醒她。"""
+    plugin, state, event = make_plugin()
+    state.update(
+        next_due=time.time() + 3600,
+        next_speak_at=time.time() - 1,
+        speak_wish="想跟她说说今天的小事",
+        speak_wish_at=time.time() - 600,
+    )
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text='{"action":"chat","task":"说说今天的小事","reason":"到点开口"}'
+    )
+    plugin.context.tool_loop_agent.return_value = SimpleNamespace(
+        completion_text='{"message":"今天有件小事想跟你说。","summary":"说了"}'
+    )
+    await plugin.run_due(event.unified_msg_origin)
+    assert not state.get("speak_wish")
+    assert any(item["action"] == "wish_spoken" for item in state["journal"])
+
+
+@pytest.mark.asyncio
+async def test_opening_without_reason_still_counts_as_her_own_commitment():
+    """只约了时间没写原因时，这一轮仍是"到点开口"，不能被当成普通唤醒。"""
+    plugin, state, event = make_plugin()
+    state.update(next_due=time.time() + 3600, next_speak_at=time.time() - 1)
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text='{"action":"silent","reason":"暂时没话"}'
+    )
+    await plugin.run_due(event.unified_msg_origin)
+    prompt = plugin.context.llm_generate.call_args.kwargs["prompt"]
+    assert "已到你自己约定的开口时间" in prompt
+    assert state["last_turn"]["trigger"] == "speak"
+
+
+@pytest.mark.asyncio
+async def test_silent_round_keeps_the_held_note():
+    plugin, state, event = make_plugin()
+    state.update(
+        next_due=time.time() + 3600,
+        next_speak_at=time.time() - 1,
+        speak_wish="想跟她说说今天的小事",
+        speak_wish_at=time.time() - 60,
+    )
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text='{"action":"silent","reason":"她好像很忙，先不说"}'
+    )
+    await plugin.run_due(event.unified_msg_origin)
+    assert state["speak_wish"] == "想跟她说说今天的小事"
 
 
 @pytest.mark.asyncio
@@ -2532,3 +3373,314 @@ async def test_dispatched_remote_media_is_not_registered(tmp_path):
     )
 
     assert state.get("work_library", []) == []
+
+@pytest.mark.asyncio
+async def test_proactive_round_gets_a_precise_refusal_from_private_only_tools():
+    plugin, state, event = make_plugin()
+    event.get_extra = lambda key: key == "autonomous_companion"
+    refused = json.loads(
+        await module.AutonomousCompanion.autonomous_long_task(plugin, event, "list")
+    )
+    assert refused["ok"] is False and refused["guard"] is True
+    assert "主动回轮" in refused["error"] and "真实私聊" in refused["error"]
+    assert "别重试" in refused["hint"]
+    refused = json.loads(
+        await module.AutonomousCompanion.autonomous_task_control(
+            plugin, event, "list", []
+        )
+    )
+    assert refused["ok"] is False and refused["guard"] is True
+    # 没登记的会话也要说清是"不在名单里"，而不是含糊的"只支持已配置对象"。
+    event.get_extra = lambda key: False
+    event.unified_msg_origin = "test:FriendMessage:999"
+    refused = json.loads(
+        await module.AutonomousCompanion.autonomous_long_task(plugin, event, "list")
+    )
+    assert refused["guard"] is True
+    assert "不在配置的私聊对象里" in refused["error"]
+
+def test_default_prompts_encourage_real_tool_use_without_flattery():
+    from data.plugins.astrbot_plugin_autonomous_companion import planning
+
+    text = module.DECISION_PROMPT
+    # 有具体的事就动手，不用等人开口、也不必先取得同意。
+    assert "查、跑、做、验" in text and "不必先取得同意" in text
+    # 但不是"讨好主人"：允许分歧，也允许带着情绪做事。
+    assert "不是为了讨好谁" in text and "意见不同" in text
+    # 也不许为了用而用：每次调用要有具体目的。
+    assert "不是为了用而用" in text and "说不出要做成什么就别调" in text
+    # 沉默是正常选项，不能被挤成"必须开口"。
+    assert "silent 是正常选项" in text
+    # 沉默的理由要写全：情绪 + 他在忙，不能只有"没内容"。
+    assert "沉默可以是情绪" in text and "沉默也可以是替他想" in text
+    assert "按\"忙\"处理" in text and "别翻旧账" in text
+    # 但连续主动是插件自带的，不能被写成"攒着等回来"。
+    assert "仍然可以按窗口继续主动" in text
+    assert "不要为了等他回应而加密频率" in text
+    # 也别把"分享"只停在嘴上：能做出成品给他的工具要真用起来，但要有由头。
+    assert "分享（画、歌、图）不是日常动作" in text
+    assert "说不出由头就不发" in text
+    assert "比空口说" not in text
+    assert "说不出由头就不发" in text
+    # 同一件事不换个说法再讲一遍（凌晨那次连着两条几乎一样的叫起床）。
+    assert "同一句嘱咐说过一遍就够了" in text
+    # 点歌是最容易变成刷屏的分享：一天一首、不重复、不连发。
+    assert "点歌是最容易变成刷屏的" in text and "连着发歌比不说话更烦人" in text and "不要填 platform" in text
+    # 计划阶段也别把能做的活只写成设想，但同样不许空转。
+    assert "本轮就动手做" in planning.PLANNING_PROMPT
+    assert "没有实际推进就不要为了填满一轮而调用" in planning.PLANNING_PROMPT
+
+
+def test_silence_and_continuation_semantics_are_spelled_out():
+    decision = module.DECISION_PROMPT
+    # 沉默是"停"：会结束整条链，不能当暂停键用。
+    assert "silent 是\"停\"不是\"歇一下\"" in decision
+    assert "silent 挡不住它" in decision
+    # 已有待续目标时是接着做，不是另开话题。
+    assert "这一轮是接着做，不是另开话题" in decision
+    action = module.ACTION_PROMPT
+    # 续行要把两个字段一起给，且每轮都要有新东西。
+    assert "续行要两个字段一起给" in action
+    assert "换个角度说同一件事不算新东西" in action
+    assert "不要用沉默代替\"歇一下\"" in action
+    # 连续发送：一条一件事、他回话就停、别把心事压成一大块。
+    assert "一条只装一件事" in action
+    assert "立刻停下来接他的话" in action
+    assert "给你把一件事分几拍说完" in action
+    # 但也要说清什么时候值得连着发，不能只写"别发"。
+    assert "值得连着发的情形" in action
+    assert "不值得的情形" in action
+    assert "换个角度说同一件事不算新东西" in action
+    # 决策层也要知道：他在的时候不按原计划念稿。
+    assert "立刻回到对话里" in module.DECISION_PROMPT
+
+
+def test_pending_checkpoint_stops_auto_resuming_after_the_cap():
+    from data.plugins.astrbot_plugin_autonomous_companion import checkpoint as checkpoint_module
+
+    plugin, state, event = make_plugin()
+    state["execution_checkpoints"] = {
+        "cp1": {
+            "task": "证明发歌功能正常",
+            "task_id": "cp1",
+            "cid": "cid",
+            "updated_at": time.time(),
+            "contract": {"mode": "action", "steps": [{"goal": "放一首新歌", "tools": ["play_song_by_name"]}]},
+            "receipts": [],
+            "media_deliveries": 0,
+            "pending": True,
+            "project_id": "",
+            "next_attempt_at": 0,
+        }
+    }
+    # 断点没有时间过期机制：不限次数的话，同一件事能被自动续跑几个小时。
+    for _ in range(checkpoint_module.MAX_CHECKPOINT_RESUMES):
+        assert module.next_checkpoint(state, "cid") is not None
+        module.count_checkpoint_resume(state, "证明发歌功能正常")
+    assert module.next_checkpoint(state, "cid") is None
+
+
+def test_today_digest_lists_what_the_bot_already_did():
+    plugin, state, event = make_plugin()
+    # 还没做过任何事：不占位、不编内容。
+    assert plugin.today_digest(state) == ""
+
+    plugin.today_record(state, "song", "温柔 五月天")
+    plugin.today_record(state, "song", "温柔 五月天")
+    plugin.today_record(state, "song", "倔强 五月天")
+    plugin.today_slot(state)["tools"]["play_song_by_name"] = 3
+    plugin.journal(state, "dispatched", "今天发了两首歌")
+    plugin.journal(state, "silent", "他在忙，不打扰")
+
+    text = plugin.today_digest(state)
+    assert "【今天你自己已经做过的事】" in text
+    # 同一首重复发过两次，必须自己看得见。
+    assert "《温柔 五月天》（2 次）" in text
+    assert "《倔强 五月天》" in text
+    assert "play_song_by_name×3" in text
+    assert "主动开口 1 次" in text and "沉默 1 次" in text
+    # 汇总末尾要给出"别重做"的用法，否则只是罗列。
+    assert "不要再做第二遍" in text
+
+
+def test_today_ledger_resets_on_a_new_day():
+    plugin, state, event = make_plugin()
+    plugin.today_record(state, "song", "倔强 五月天")
+    assert state["today"]["items"]
+    state["today"]["day"] = "2000-01-01"
+    # 换天就清空，不能把昨天的账算到今天头上。
+    assert plugin.today_digest(state) == ""
+    assert plugin.today_slot(state)["day"] != "2000-01-01"
+
+
+def test_brief_tool_args_keeps_the_meaningful_argument():
+    assert (
+        module.brief_tool_args({"song_name": "温柔 五月天", "platform": "网易点歌"})
+        == "温柔 五月天"
+    )
+    assert module.brief_tool_args('{"path": "D:/a/b.txt"}') == "D:/a/b.txt"
+    assert module.brief_tool_args({}) == ""
+    assert module.brief_tool_args("not json") == "not json"
+
+
+class _ScopeGuard:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _native_scopes():
+    return SimpleNamespace(
+        adapter_access=lambda *a, **k: _ScopeGuard(),
+        resolve_event_memory_access=AsyncMock(
+            return_value=SimpleNamespace(allowed=True, scope="scoped", persona_id="persona")
+        ),
+        is_event_memory_allowed=lambda *a, **k: True,
+        resolve_memory_scope=lambda *a, **k: "scoped",
+        get_persona_id=AsyncMock(return_value="persona"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_livingmemory_native_bridge_recalls_and_records_inside_its_scope():
+    engine = SimpleNamespace(
+        search_memories=AsyncMock(
+            return_value=[
+                SimpleNamespace(content="白喜欢五月天", metadata={}),
+                SimpleNamespace(content="  ", metadata={}),
+            ]
+        ),
+        add_memory=AsyncMock(return_value=7),
+    )
+    processor = SimpleNamespace(
+        build_memory_from_structured_data=lambda **kw: (
+            "MEM:" + kw["structured_data"]["summary"],
+            {"importance": 0.4},
+            0.4,
+        )
+    )
+    living = SimpleNamespace(
+        initializer=SimpleNamespace(memory_engine=engine, memory_processor=processor),
+        config_manager={"filtering_settings": {}},
+        context=object(),
+    )
+    event = SimpleNamespace(unified_msg_origin="香夜梨:FriendMessage:123")
+    bridge = module.LivingMemoryNativeBridge(living, event, _native_scopes())
+
+    text = await bridge.compose_context(query="音乐 偏好", top_k=6, max_chars=100)
+    # 空内容不占行；作用域和人格按 LivingMemory 自己解析的结果传下去。
+    assert text == "- 白喜欢五月天"
+    assert engine.search_memories.await_args.kwargs["session_id"] == "scoped"
+    assert engine.search_memories.await_args.kwargs["persona_id"] == "persona"
+
+    await bridge.record_visible_turn(role="assistant", content="  我刚放了首歌  ")
+    written = engine.add_memory.await_args.kwargs
+    assert written["content"] == "MEM:我刚放了首歌"
+    assert written["session_id"] == "scoped" and written["persona_id"] == "persona"
+    assert written["metadata"]["memory_origin"] == "autonomous_companion"
+
+    with pytest.raises(ValueError):
+        await bridge.record_visible_turn(role="user", content="不该只记用户这边")
+
+
+@pytest.mark.asyncio
+async def test_memory_bridge_prefers_hooks_then_native_then_companion():
+    plugin, state, event = make_plugin()
+
+    hooked = SimpleNamespace(
+        autonomous_recall=AsyncMock(return_value="x"), autonomous_record=AsyncMock()
+    )
+    plugin.context.get_all_stars = lambda: [
+        SimpleNamespace(
+            activated=True,
+            name="LivingMemory",
+            root_dir_name="astrbot_plugin_livingmemory",
+            star_cls=hooked,
+        )
+    ]
+    bridge = plugin.memory_bridge(event)
+    assert isinstance(bridge, module.LivingMemoryBridge)
+    assert event.state["memory_provider"] == "LivingMemory"
+
+    bare = SimpleNamespace(initializer=SimpleNamespace())
+    plugin.context.get_all_stars = lambda: [
+        SimpleNamespace(
+            activated=True,
+            name="LivingMemory",
+            root_dir_name="astrbot_plugin_livingmemory",
+            star_cls=bare,
+        )
+    ]
+    plugin.livingmemory_scopes = lambda meta: _native_scopes()
+    bridge = plugin.memory_bridge(event)
+    # 没有专用接口时用原生服务，而不是悄悄退回 MemoryCompanion。
+    assert isinstance(bridge, module.LivingMemoryNativeBridge)
+    assert event.state["memory_provider"] == "LivingMemory"
+
+    plugin.livingmemory_scopes = lambda meta: None
+    plugin.context.get_all_stars = lambda: [
+        SimpleNamespace(
+            activated=True,
+            name="LivingMemory",
+            root_dir_name="astrbot_plugin_livingmemory",
+            star_cls=bare,
+        ),
+        SimpleNamespace(
+            activated=True,
+            name="MemoryCompanion",
+            root_dir_name="astrbot_plugin_memory_companion",
+            star_cls=SimpleNamespace(memory_companion="companion-api"),
+        ),
+    ]
+    bridge = plugin.memory_bridge(event)
+    assert bridge == "companion-api"
+    assert "未暴露可用接口" in event.state["livingmemory_status"]
+
+
+@pytest.mark.asyncio
+async def test_inactive_livingmemory_does_not_hijack_the_memory_bridge():
+    plugin, state, event = make_plugin()
+    plugin.context.get_all_stars = lambda: [
+        SimpleNamespace(
+            activated=False,
+            name="LivingMemory",
+            root_dir_name="astrbot_plugin_livingmemory",
+            star_cls=SimpleNamespace(),
+        ),
+        SimpleNamespace(
+            activated=True,
+            name="MemoryCompanion",
+            root_dir_name="astrbot_plugin_memory_companion",
+            star_cls=SimpleNamespace(memory_companion="companion-api"),
+        ),
+    ]
+    # 只开一个记忆插件时，停用的 LivingMemory 不能把桥抢走。
+    assert plugin.memory_bridge(event) == "companion-api"
+    assert event.state["memory_provider"] == "MemoryCompanion"
+
+
+def test_native_bridge_detects_group_chat_from_event_or_origin():
+    bridge = module.LivingMemoryNativeBridge(None, SimpleNamespace(), None)
+    bridge.event = SimpleNamespace(get_message_type=lambda: "GroupMessage")
+    assert bridge._is_group_chat() is True
+    bridge.event = SimpleNamespace(unified_msg_origin="香夜梨:FriendMessage:123")
+    assert bridge._is_group_chat() is False
+    bridge.event = SimpleNamespace(unified_msg_origin="香夜梨:GroupMessage:999")
+    assert bridge._is_group_chat() is True
+
+
+def test_schema_default_extra_prompt_encourages_tools():
+    schema = json.loads(
+        (Path(module.__file__).parent / "_conf_schema.json").read_text(
+            encoding="utf-8-sig"
+        )
+    )
+    default = schema["extra_prompt"]["default"]
+    assert "不是为了讨好谁" in default
+    assert "意见不同" in default
+    # 默认行为偏好不该把沉默说成"要避免的事"，也不该鼓励无由头的分享。
+    assert "别为了显得勤快而冒泡" in default
+    assert "同一套别连着来" in default
+    assert "才发一张画、一首歌或别的成品" in default
