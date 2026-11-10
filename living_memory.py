@@ -24,15 +24,33 @@ class LivingMemoryScopes:
 
     Imported from the third-party package at runtime so this plugin keeps
     working whether or not LivingMemory is installed, enabled or updated.
+    Different releases expose different helper sets, so every helper is bound
+    defensively; ``usable`` reports whether the minimum set is present.
     """
 
     def __init__(self, scope_module, utils_module):
-        """Bind the exact helpers LivingMemory's own tools call."""
-        self.adapter_access = scope_module.adapter_access
-        self.resolve_event_memory_access = scope_module.resolve_event_memory_access
-        self.is_event_memory_allowed = scope_module.is_event_memory_allowed
-        self.resolve_memory_scope = scope_module.resolve_memory_scope
-        self.get_persona_id = utils_module.get_persona_id
+        """Bind the helpers LivingMemory's own tools call, tolerating old versions."""
+        self.adapter_access = getattr(scope_module, "adapter_access", None)
+        self.resolve_event_memory_access = getattr(
+            scope_module, "resolve_event_memory_access", None
+        )
+        self.is_event_memory_allowed = getattr(
+            scope_module, "is_event_memory_allowed", None
+        )
+        self.resolve_memory_scope = getattr(scope_module, "resolve_memory_scope", None)
+        self.get_persona_id = getattr(utils_module, "get_persona_id", None)
+
+    @property
+    def usable(self) -> bool:
+        """Report whether the helpers the bridge requires are all callable."""
+        return all(
+            callable(item)
+            for item in (
+                self.adapter_access,
+                self.is_event_memory_allowed,
+                self.resolve_memory_scope,
+            )
+        )
 
 
 class LivingMemoryNativeBridge:
@@ -42,7 +60,9 @@ class LivingMemoryNativeBridge:
     agent tool uses: ``adapter_access`` -> ``resolve_event_memory_access`` ->
     ``memory_engine.search_memories``. Writes reuse its memorize tool path:
     ``build_memory_from_structured_data`` -> ``add_memory``. Both therefore obey
-    LivingMemory's whitelist, scope and persona filtering settings.
+    LivingMemory's whitelist, scope and persona filtering settings. Older
+    releases lack some of these entry points; the bridge degrades to the
+    equivalents their own tools use instead of raising.
     """
 
     def __init__(self, plugin, event, scopes):
@@ -62,6 +82,50 @@ class LivingMemoryNativeBridge:
         return getattr(
             getattr(self.plugin, "initializer", None), "memory_processor", None
         )
+
+    async def _persona_id(self, context):
+        """Resolve the persona id, falling back to the event's own value.
+
+        Args:
+            context: LivingMemory plugin context.
+
+        Returns:
+            The persona id LivingMemory should filter by, or the event's value.
+        """
+        getter = getattr(self.scopes, "get_persona_id", None)
+        if callable(getter):
+            try:
+                return await getter(context, self.event)
+            except Exception:
+                pass
+        return getattr(self.event, "persona_id", None)
+
+    async def _recall_target(self, config, context):
+        """Resolve (allowed, scope, persona) with whichever API this version has.
+
+        Newer releases expose one combined ``resolve_event_memory_access``;
+        older ones only the separate whitelist and scope helpers their memorize
+        tool uses. Both paths end in the same LivingMemory filtering rules.
+
+        Args:
+            config: LivingMemory ConfigManager.
+            context: LivingMemory plugin context.
+
+        Returns:
+            (allowed, scope_id, persona_id); allowed=False when filtered out.
+        """
+        scopes = self.scopes
+        if callable(scopes.resolve_event_memory_access):
+            access = await scopes.resolve_event_memory_access(
+                config, context, self.event
+            )
+            if not getattr(access, "allowed", False):
+                return False, None, None
+            return True, access.scope, access.persona_id
+        if not scopes.is_event_memory_allowed(config, self.event):
+            return False, None, None
+        scope_id = scopes.resolve_memory_scope(config, self.event)
+        return True, scope_id, await self._persona_id(context)
 
     async def compose_context(self, *, query, top_k=6, max_chars=5000, **_):
         """Recall scoped memories and render them as one prompt block.
@@ -85,17 +149,22 @@ class LivingMemoryNativeBridge:
         except (TypeError, ValueError):
             limit = 6
         with self.scopes.adapter_access(config, self.event):
-            access = await self.scopes.resolve_event_memory_access(
-                config, context, self.event
-            )
-            if not access.allowed:
+            allowed, scope_id, persona_id = await self._recall_target(config, context)
+            if not allowed:
                 return ""
-            memories = await engine.search_memories(
-                query=query,
-                k=limit,
-                session_id=access.scope,
-                persona_id=access.persona_id,
-            )
+            scope_id = scope_id or self.event.unified_msg_origin
+            try:
+                memories = await engine.search_memories(
+                    query=query,
+                    k=limit,
+                    session_id=scope_id,
+                    persona_id=persona_id,
+                )
+            except TypeError:
+                # 旧版引擎的检索签名没有 persona_id 参数。
+                memories = await engine.search_memories(
+                    query=query, k=limit, session_id=scope_id
+                )
         lines = []
         used = 0
         for memory in memories or []:
@@ -144,12 +213,9 @@ class LivingMemoryNativeBridge:
             raise ValueError("Autonomous memory records must be assistant messages")
         text = " ".join(str(content or "").split())
         engine = self.engine
-        processor = self.processor
         config = getattr(self.plugin, "config_manager", None)
         context = getattr(self.plugin, "context", None)
-        if not text or engine is None or processor is None or config is None:
-            return
-        if context is None:
+        if not text or engine is None or config is None or context is None:
             return
         with self.scopes.adapter_access(config, self.event, write=True):
             if not self.scopes.is_event_memory_allowed(config, self.event):
@@ -158,19 +224,24 @@ class LivingMemoryNativeBridge:
             memory_scope = (
                 self.scopes.resolve_memory_scope(config, self.event) or session_id
             )
-            persona_id = await self.scopes.get_persona_id(context, self.event)
+            persona_id = await self._persona_id(context)
             summary = text[:600]
-            built, metadata, importance = processor.build_memory_from_structured_data(
-                structured_data={
-                    "summary": summary,
-                    "topics": [],
-                    "key_facts": [],
-                    "sentiment": "neutral",
-                    "importance": None,
-                },
-                is_group_chat=self._is_group_chat(),
-                fallback_excerpt=summary,
-            )
+            build = getattr(self.processor, "build_memory_from_structured_data", None)
+            if callable(build):
+                built, metadata, importance = build(
+                    structured_data={
+                        "summary": summary,
+                        "topics": [],
+                        "key_facts": [],
+                        "sentiment": "neutral",
+                        "importance": None,
+                    },
+                    is_group_chat=self._is_group_chat(),
+                    fallback_excerpt=summary,
+                )
+            else:
+                # 旧版没有结构化构建入口：直接存原文，标记来源即可。
+                built, metadata, importance = summary, {}, 0.5
             if not isinstance(metadata, dict):
                 metadata = {}
             metadata["source_window"] = {
@@ -179,10 +250,19 @@ class LivingMemoryNativeBridge:
             }
             metadata["memory_origin"] = "autonomous_companion"
             metadata["source_session_id"] = session_id
-            await engine.add_memory(
-                content=built,
-                session_id=memory_scope,
-                persona_id=persona_id,
-                importance=importance,
-                metadata=metadata,
-            )
+            try:
+                await engine.add_memory(
+                    content=built,
+                    session_id=memory_scope,
+                    persona_id=persona_id,
+                    importance=importance,
+                    metadata=metadata,
+                )
+            except TypeError:
+                # 旧版引擎的写入签名没有 persona_id 参数。
+                await engine.add_memory(
+                    content=built,
+                    session_id=memory_scope,
+                    importance=importance,
+                    metadata=metadata,
+                )
