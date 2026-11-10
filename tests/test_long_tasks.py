@@ -29,11 +29,13 @@ def test_lifecycle_and_restart():
 async def test_isolated_executor(tmp_path, monkeypatch):
     monkeypatch.setattr(long_tasks.StarTools, "get_data_dir", lambda _: tmp_path)
     state = {}
-    event = SimpleNamespace(state=state, action_receipts=[])
+    hooks = object()
+    event = SimpleNamespace(state=state, action_receipts=[], message_str="自主心跳")
     owner = SimpleNamespace(
         states={"umo": state},
         save=AsyncMock(),
         check_current=AsyncMock(),
+        notification_hooks=hooks,
         prepare=AsyncMock(
             return_value=(
                 event,
@@ -57,7 +59,12 @@ async def test_isolated_executor(tmp_path, monkeypatch):
     await long_tasks.run_task(owner, "umo", job)
     assert job["status"] == "completed"
     assert Path(job["workspace"]).is_dir()
-    assert owner.context.tool_loop_agent.call_args.kwargs["contexts"] == []
+    kwargs = owner.context.tool_loop_agent.call_args.kwargs
+    assert kwargs["contexts"] == []
+    # 长期任务必须把通知器接进工具 Agent，否则下游学习插件采集不到证据；
+    # 任务文本用任务目标，而不是占位的“自主心跳”。
+    assert kwargs["agent_hooks"] is hooks
+    assert event.message_str == "Write report"
 
 
 def test_semantic_cancel_includes_long_task():
