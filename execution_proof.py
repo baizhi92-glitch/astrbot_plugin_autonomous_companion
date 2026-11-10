@@ -80,11 +80,18 @@ def validate_contract(value, tool_names):
 
 
 def required_action(text):
-    if re.search(r"画(?:一|个|张|幅|图)|绘图|生图|补画|生成.*(?:图|视频|音频)", text):
+    # Negated mentions ("不提绘图失败") explicitly avoid a topic instead of
+    # performing it; strip those clauses before classifying the task.
+    cleaned = re.sub(
+        r"(?:不|别|未|无需?|没有?|不再)(?:重?提|谈|说|讲|问|涉及|催|追问)[^，。；;！？\s]*",
+        "",
+        str(text),
+    )
+    if re.search(r"画(?:一|个|张|幅|图)|绘图|生图|补画|生成.*(?:图|视频|音频)", cleaned):
         return "media"
-    if re.search(r"保存|写入|落盘|存到|存入", text):
+    if re.search(r"保存|写入|落盘|存到|存入", cleaned):
         return "save"
-    if re.search(r"发送文件|上传|下载|戳一戳", text):
+    if re.search(r"发送文件|上传|下载|戳一戳", cleaned):
         return "external"
     return ""
 
@@ -185,6 +192,16 @@ def execution_verdict(event, family):
                 missing.append(step["goal"])
         if not missing:
             return "verified", "契约各目标已有对应工具回执；语义条件仍以实际结果为准"
+        if media_goal_satisfied:
+            # The core media deliverable was generated and actually delivered.
+            # A pending media checkpoint is retried wholesale, which re-sends
+            # media the user already received, so auxiliary step failures
+            # must not keep the checkpoint pending.
+            return (
+                "verified",
+                "核心媒体已生成并实际投递；辅助步骤未全部完成，为避免重复投递不再重试。未完成项："
+                + "；".join(missing),
+            )
         return (
             "unexecuted"
             if not receipts
