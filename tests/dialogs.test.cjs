@@ -43,3 +43,31 @@ test('second dialog does not stack and escape cancels',async()=>{
   h.document.body.children[0].onkeydown({key:'Escape',preventDefault(){}});
   assert.equal(await pending,false);assert.equal(h.run('activePageDialogs'),0);
 });
+test('form field with options renders a select and returns the chosen value',async()=>{
+  const h=harness();
+  const pending=h.run('pageForm("印象",[{label:"主题",value:"宠物"},{label:"类型",value:"interest",options:[{label:"事实",value:"fact"},{label:"爱好",value:"interest"}]}])');
+  const select=h.elements.find(e=>e.tag==='select');
+  assert.ok(select,'select rendered for options field');
+  assert.equal(select.value,'interest');
+  h.document.body.children[0].onkeydown({key:'Enter',preventDefault(){}});
+  const values=await pending;
+  assert.equal(values.join('|'),'宠物|interest');
+});
+test('form collects several fields, enter submits and cancel returns null',async()=>{
+  const h=harness();
+  const pending=h.run('pageForm("偏好",[{label:"主题",value:"语气"},{label:"内容",value:"别用感叹号"}])');
+  const inputs=h.elements.filter(e=>e.tag==='input');
+  assert.equal(inputs.length,2);
+  assert.equal(inputs[0].value,'语气');
+  assert.equal(inputs[1].value,'别用感叹号');
+  h.document.body.children[0].onkeydown({key:'Enter',preventDefault(){}});
+  const values=await pending;
+  assert.equal(values.length,2);
+  assert.equal(values[0],'语气');
+  assert.equal(values[1],'别用感叹号');
+  assert.equal(h.run('activePageDialogs'),0);
+  const cancelled=h.run('pageForm("偏好",[{label:"主题"}])');
+  h.elements.filter(e=>e.textContent==='取消').pop().click();
+  assert.equal(await cancelled,null);
+  assert.equal(h.run('activePageDialogs'),0);
+});
