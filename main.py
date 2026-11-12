@@ -725,7 +725,7 @@ class BudgetTool(FunctionTool):
                 self.event.clear_result()
 
 
-@register("AutonomousCompanion", "local", "我只在乎你：自主心跳与无回复续行", "1.12.0")
+@register("AutonomousCompanion", "local", "我只在乎你：自主心跳与无回复续行", "1.13.1")
 class AutonomousCompanion(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
