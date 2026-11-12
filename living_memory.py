@@ -1,5 +1,8 @@
 """Optional LivingMemory bridges without synthesizing incoming user messages."""
 
+import json
+from datetime import datetime
+
 
 class LivingMemoryBridge:
     """Preferred bridge: LivingMemory's dedicated autonomous_* hooks."""
@@ -28,7 +31,7 @@ class LivingMemoryScopes:
     defensively; ``usable`` reports whether the minimum set is present.
     """
 
-    def __init__(self, scope_module, utils_module):
+    def __init__(self, scope_module, utils_module, formatting_module=None):
         """Bind the helpers LivingMemory's own tools call, tolerating old versions."""
         self.adapter_access = getattr(scope_module, "adapter_access", None)
         self.resolve_event_memory_access = getattr(
@@ -39,6 +42,11 @@ class LivingMemoryScopes:
         )
         self.resolve_memory_scope = getattr(scope_module, "resolve_memory_scope", None)
         self.get_persona_id = getattr(utils_module, "get_persona_id", None)
+        # 复用 LivingMemory 自己的记忆渲染器：它会带上写入日期与注入说明，
+        # 缺了时间模型就只能猜，把今天的事说成"昨天"。
+        self.format_memories_for_injection = getattr(
+            formatting_module, "format_memories_for_injection", None
+        )
 
     @property
     def usable(self) -> bool:
@@ -165,17 +173,77 @@ class LivingMemoryNativeBridge:
                 memories = await engine.search_memories(
                     query=query, k=limit, session_id=scope_id
                 )
-        lines = []
-        used = 0
+        memory_list = []
         for memory in memories or []:
             text = " ".join(str(getattr(memory, "content", "") or "").split())
             if not text:
                 continue
-            if used + len(text) > max_chars:
+            metadata = getattr(memory, "metadata", None) or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (ValueError, TypeError):
+                    metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            memory_list.append(
+                {
+                    "content": text,
+                    "score": getattr(memory, "final_score", 0.0) or 0.0,
+                    "metadata": metadata,
+                    "timestamp": metadata.get("create_time"),
+                }
+            )
+        if not memory_list:
+            return ""
+        formatter = getattr(self.scopes, "format_memories_for_injection", None)
+        if callable(formatter):
+            try:
+                return formatter(memory_list, max_chars=max_chars) or ""
+            except Exception:
+                pass
+        # 降级路径也要带时间：没有日期，模型会把今天说过的话当成"昨天"。
+        lines = []
+        used = 0
+        for item in memory_list:
+            stamp = self._stamp_label(item.get("timestamp"))
+            line = f"- [{stamp}] {item['content']}" if stamp else f"- {item['content']}"
+            if used + len(line) > max_chars:
                 break
-            used += len(text)
-            lines.append(f"- {text}")
+            used += len(line)
+            lines.append(line)
         return "\n".join(lines)
+
+    @staticmethod
+    def _stamp_label(value) -> str:
+        """Render a memory write time as MM-DD HH:MM.
+
+        Args:
+            value: Epoch seconds, milliseconds, or an ISO string.
+
+        Returns:
+            A short local-time label, or "" when unusable.
+        """
+        if value in (None, ""):
+            return ""
+        moment = None
+        try:
+            number = float(value)
+            if number > 100_000_000_000:
+                number /= 1000.0
+            if number > 0:
+                moment = datetime.fromtimestamp(number)
+        except (TypeError, ValueError):
+            moment = None
+        if moment is None:
+            try:
+                moment = datetime.fromisoformat(str(value))
+            except (TypeError, ValueError):
+                return ""
+        try:
+            return moment.astimezone().strftime("%m-%d %H:%M")
+        except (ValueError, OSError):
+            return moment.strftime("%m-%d %H:%M")
 
     def _is_group_chat(self) -> bool:
         """Report whether the current event is a group message.
