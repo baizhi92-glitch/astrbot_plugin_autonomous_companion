@@ -175,8 +175,8 @@ silent 是正常选项，不是失败：没东西给、时机不对、你自己�
 但沉默是表达，不是武器：别用它逼他道歉或试探他有多在乎；他直接问你怎么了，哪怕只说"我现在不想说"也别消失；
 他主动来哄、来接话就是递台阶，接住；他不来，也别拿沉默当惩罚，过了劲儿就把话放下。
 silent 是"停"不是"歇一下"：它会把这条连续链一起结束。只是想说慢一点、过一会儿再接着讲，
-就用 next_task + continue_after_seconds 排下一轮，别拿 silent 当暂停键；已经暂存的后台正文仍会照常补发，
-silent 挡不住它，所以别指望用沉默把写好但不想说的话压下去——不想发就当场别写进 message。
+就用 next_task + continue_after_seconds 排下一轮，别拿 silent 当暂停键；已经暂存的后台正文也不会在沉默时替你发出去，
+它会等到你下次真正开口时再补——所以不想说就沉默，不用担心它抢话，也别指望它替你开口。
 用户没回复不代表拒绝，也不代表他参与了新的共同经历；本系统明确允许无需用户回复的连续主动，
 几分钟前主动过、没有新消息，本身不是必须沉默的理由。
 他没接话时你仍然可以按窗口继续主动——补充、推进、把没说完的说完整，这些都算数；
@@ -195,13 +195,16 @@ silent 挡不住它，所以别指望用沉默把写好但不想说的话压下�
 点歌是最容易变成刷屏的：他没说想听就别点，一天最多一首，同一首当天不重复，刚发过就别急着发第二首——
 连着发歌比不说话更烦人。点歌时不要填 platform 参数，本环境只有默认播放器，填了平台名会直接失败。
 同一件事、同一句嘱咐说过一遍就够了：他没接就是没接，不换个说法再讲一遍，不拆成几条分开发，也不简单重复上一条。
-若上下文标注已到你自己约定的开口时间，本轮默认开口说话（chat 或分享成果）；确实无话可说才 silent，并在 reason 说明为何改变主意。
+若上下文标注已到你自己约定的开口时间，本轮优先开口（chat 或分享成果）；但沉默始终正当：确实没话说、或此刻不适合说，就 silent 并在 reason 写清为什么改了主意，别为守约硬凑一句。
 心里存着还没说出口的话时，要么本轮说出来，要么明确放下（speak_wish_clear）；一直挂着不提，比说错更不像你自己。
 这句话要是带时间（明早叫他、今晚再说、等他下班），必须同时写 speak_wish_after_minutes（多少分钟后才允许说），否则你会在半夜把它当成现在该说的话讲出去。
 关于用户的记录分三类用法：偏好是硬约束，开口时间、话题和语气都要绕开用户明确说过不喜欢的方式；
 事实与爱好只用来挑话题、理解用户，不要逐条复述成清单；标着"还没确认"的只当猜测，不要当成用户说过的事实说出口。
 用户活跃时间只用来挑时机：她基本不在的时段默认不要主动，你约好的时间与最近一条消息优先于统计；样本不足时不要假装知道她的作息。
 工具当前是否可用只能由本轮实际返回确认，过去失败不等于现在仍关闭；确实暂不可用就换有价值的聊天或创作，不必停止所有主动。
+记忆里的时间以每条记录自己标注的日期为准：标着今天的就说今天，别随口说成"昨天""前几天"；没标日期就不提时间，只说事。
+别在聊天里交作业："夜里挺顺利的""没什么卡住的事""没什么要你确认的"这类话是把内部流水账念给他听，这些只写进 summary，不要变成发给他的消息。
+也别把打算当话说："打算今晚再聊""晚点再找你"这种预告，直接写进 next_speak_minutes 或 future_task，别拿来当一条消息发出去。
 只输出一个 JSON 对象，不要代码围栏：
 {"action":"chat|create|tools|silent","task":"本轮具体目标","reason":"简短依据",
  "future_task":"留给下次主动的具体计划"}
@@ -403,6 +406,7 @@ ACTION_PROMPT = """这是你自主选择的一轮行动，不是用户的新请�
 不要声称没有实际执行的工具已经成功。不要编造用户回复或共同经历。
 工具已直接发送的内容不要重复发送。最终只能输出一个 JSON 对象：
 message 是你真正想对这个人说的话，不是给系统的任务报告；summary 才用于后台记账，两者不要互相抄。
+也不要在 message 里汇报后台流水账（"夜里挺顺利的""没什么要你确认的"）或预告打算（"今晚再聊"）：这些属于内部记录，打算写进 next_speak_minutes 或 future_task。
 沿用人格中的说话习惯和最近真实对话，像已经熟悉的两个人：不重新称呼、不解释来意、不汇报完成，
 收尾也不必重复“做好了/发出去了/请查收”——可以接一句贴合当下的小感受或直接回应用户。
 图片、文件由工具发出后不要重复发送产物；可以另说一句，但不要编造看过画面或真实生活体验。
@@ -1655,6 +1659,26 @@ class AutonomousCompanion(Star):
             state["pending_message"] = pending_message
             self.logger.warning("Pending quiet message delivery failed: %s", exc)
 
+    def hold_pending_message(self, state) -> None:
+        """Keep a stored draft for a later speaking round, never send it here.
+
+        A silent round must not speak on her behalf, so this only applies the
+        expiry rule and leaves a live draft in place for the next round that
+        actually opens its mouth.
+
+        Args:
+            state: Per-target state holding ``pending_message``.
+
+        Returns:
+            None.
+        """
+        pending_message = state.get("pending_message")
+        if not isinstance(pending_message, dict):
+            return
+        if pending_message.get("expires_at", 0) <= time.time():
+            state.pop("pending_message", None)
+            self.journal(state, "quiet_draft_expired", "暂存正文已过期，沉默时丢弃")
+
     def migrate_legacy_drafts(self, state) -> None:
         """Convert legacy quiet-turn "本轮暂存成果" outbox rows into one draft.
 
@@ -2232,7 +2256,13 @@ class AutonomousCompanion(Star):
         try:
             scope_module = importlib.import_module(f"{package}.core.memory_scope")
             utils_module = importlib.import_module(f"{package}.core.utils")
-            scopes = LivingMemoryScopes(scope_module, utils_module)
+            try:
+                formatting_module = importlib.import_module(
+                    f"{package}.core.utils.formatting"
+                )
+            except Exception:
+                formatting_module = None
+            scopes = LivingMemoryScopes(scope_module, utils_module, formatting_module)
         except Exception as exc:
             self.logger.debug("LivingMemory scope helpers unavailable: %s", exc)
             return None
@@ -2523,9 +2553,9 @@ class AutonomousCompanion(Star):
             + (
                 "【已到你自己约定的开口时间】约定原因："
                 + (speak_due or "未说明")
-                + "。这是你此前自己决定的开口时刻：本轮默认开口说话（chat 或分享成果），"
-                "把此刻想说的自然说出来；确实没有可说的才允许 silent，并在 reason 说明为何改变主意，"
-                "不要只汇报约定本身。\n"
+                + "。这是你此前自己决定的开口时刻：本轮优先开口（chat 或分享成果），"
+                "把此刻想说的自然说出来；但沉默依然正当——没话说、或此刻不适合说，"
+                "就 silent 并在 reason 写清为什么改了主意，别为守约硬凑一句，也不要只汇报约定本身。\n"
                 if speak_due
                 else ""
             )
@@ -2684,7 +2714,8 @@ class AutonomousCompanion(Star):
             )
             await self.finish_events(state, event_ids)
             if not event.quiet:
-                await self.flush_pending_message(state, event)
+                # 她说沉默就沉默：草稿留着，等她下次真正开口再补。
+                self.hold_pending_message(state)
             return decision
         if state["rounds"] >= self.number("max_rounds", 4, 1, 30):
             state.update(next_task="", window_end=0)
