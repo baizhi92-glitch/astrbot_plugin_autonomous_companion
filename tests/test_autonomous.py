@@ -3220,12 +3220,20 @@ async def test_quiet_turn_draft_is_pending_message_not_outbox():
 
 
 @pytest.mark.asyncio
-async def test_pending_message_flushes_on_next_normal_turn():
-    """The stored draft is sent first on the next non-quiet round."""
+async def test_pending_draft_waits_for_a_speaking_round():
+    """沉默不代替她开口：草稿留住，等下一轮她真的说话时再补。"""
     plugin,state,event=make_plugin()
     state["pending_message"]={"content":"之前想说的","saved_at":time.time(),"expires_at":time.time()+3600,"source_task":"旧"}
     event.action_receipts=[]
-    plugin.context.llm_generate.return_value=SimpleNamespace(completion_text='{"action":"silent","reason":"这轮沉默"}')
+    plugin.context.llm_generate.return_value=SimpleNamespace(completion_text='{"action":"silent","reason":"这轮想安静"}')
+    await plugin.turn(event.unified_msg_origin)
+    assert state["pending_message"]["content"]=="之前想说的"
+    event.send.assert_not_called()
+
+    # 下一轮她真的开口，才轮到旧草稿补发。
+    state["rounds"]=0
+    plugin.context.llm_generate.return_value=SimpleNamespace(completion_text='{"action":"chat","task":"正常说话"}')
+    plugin.context.tool_loop_agent.return_value=SimpleNamespace(completion_text='{"message":"新的一句","summary":"done"}')
     await plugin.turn(event.unified_msg_origin)
     assert "pending_message" not in state
     texts=["".join(getattr(p,"text","") for p in c.args[0].chain) for c in event.send.await_args_list]
@@ -3439,7 +3447,7 @@ def test_silence_and_continuation_semantics_are_spelled_out():
     decision = module.DECISION_PROMPT
     # 沉默是"停"：会结束整条链，不能当暂停键用。
     assert "silent 是\"停\"不是\"歇一下\"" in decision
-    assert "silent 挡不住它" in decision
+    assert "也不会在沉默时替你发出去" in decision
     # 已有待续目标时是接着做，不是另开话题。
     assert "这一轮是接着做，不是另开话题" in decision
     action = module.ACTION_PROMPT
@@ -3756,6 +3764,85 @@ def test_livingmemory_scopes_returns_none_when_helpers_incomplete(monkeypatch):
     monkeypatch.setattr(module, "importlib", SimpleNamespace(import_module=fake_import))
     # 旧版模块缺助手时降级返回 None，而不是把 AttributeError 炸穿整轮。
     assert plugin.livingmemory_scopes(meta) is None
+
+
+@pytest.mark.asyncio
+async def test_native_bridge_hands_memory_time_to_livingmemory_formatter():
+    engine = SimpleNamespace(
+        search_memories=AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    content="他说烧鸭饭的卤汁很够味",
+                    metadata={"create_time": 1762930000.0},
+                    final_score=0.9,
+                )
+            ]
+        )
+    )
+    living = SimpleNamespace(
+        initializer=SimpleNamespace(memory_engine=engine, memory_processor=None),
+        config_manager={},
+        context=object(),
+    )
+    event = SimpleNamespace(unified_msg_origin="x:FriendMessage:1", persona_id="p")
+    seen = {}
+
+    def fake_format(memories, *, max_chars=3000):
+        seen["memories"] = memories
+        return "格式化后的记忆"
+
+    scopes = SimpleNamespace(
+        adapter_access=lambda *a, **k: _ScopeGuard(),
+        resolve_event_memory_access=None,
+        is_event_memory_allowed=lambda *a, **k: True,
+        resolve_memory_scope=lambda *a, **k: "s",
+        get_persona_id=None,
+        format_memories_for_injection=fake_format,
+    )
+    bridge = module.LivingMemoryNativeBridge(living, event, scopes)
+
+    assert (
+        await bridge.compose_context(query="烧鸭饭", top_k=5, max_chars=800)
+        == "格式化后的记忆"
+    )
+    # 写入时间必须原样交给渲染器，否则模型只能自己猜"昨天"。
+    assert seen["memories"][0]["timestamp"] == 1762930000.0
+    assert seen["memories"][0]["content"] == "他说烧鸭饭的卤汁很够味"
+
+
+@pytest.mark.asyncio
+async def test_native_bridge_fallback_keeps_memory_date():
+    engine = SimpleNamespace(
+        search_memories=AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    content="今天中午吃了烧鸭饭",
+                    metadata={"create_time": 1762930000.0},
+                    final_score=0.5,
+                )
+            ]
+        )
+    )
+    living = SimpleNamespace(
+        initializer=SimpleNamespace(memory_engine=engine, memory_processor=None),
+        config_manager={},
+        context=object(),
+    )
+    event = SimpleNamespace(unified_msg_origin="x:FriendMessage:1", persona_id="p")
+    # 旧版没有渲染器可借：降级路径也必须自己带上日期。
+    scopes = SimpleNamespace(
+        adapter_access=lambda *a, **k: _ScopeGuard(),
+        resolve_event_memory_access=None,
+        is_event_memory_allowed=lambda *a, **k: True,
+        resolve_memory_scope=lambda *a, **k: "s",
+        get_persona_id=None,
+        format_memories_for_injection=None,
+    )
+    bridge = module.LivingMemoryNativeBridge(living, event, scopes)
+
+    text = await bridge.compose_context(query="烧鸭饭", top_k=5, max_chars=200)
+    assert "- [" in text
+    assert "今天中午吃了烧鸭饭" in text
 
 
 def test_schema_default_extra_prompt_encourages_tools():
