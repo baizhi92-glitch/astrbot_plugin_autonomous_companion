@@ -1,6 +1,6 @@
 name: astrbot_plugin_autonomous_companion
 display_name: 我只在乎你
 author: local
-version: 1.13.0
+version: 1.13.1
 desc: 全天周期自主选择聊天、创作、工具行动或沉默，支持无回复短时续行和记忆陪伴桥接。
 astrbot_version: ">=4.28.1"
