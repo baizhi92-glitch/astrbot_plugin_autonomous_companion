@@ -35,6 +35,58 @@ def save_checkpoint(event):
             event.state["execution_checkpoints"] = dict(list(checkpoints.items())[-20:])
 
 
+def is_pure_chat(event) -> bool:
+    """Report whether a finished round did nothing but talk.
+
+    Args:
+        event: Finished turn event.
+
+    Returns:
+        True when the round carried no execution contract, produced no tool
+        receipt and left nothing pending. Such a round is a reply, not a task
+        that anyone could resume.
+    """
+    contract = getattr(event, "execution_contract", None) or {}
+    if isinstance(contract, dict):
+        # 纯聊天轮的契约是 {"mode": "reply", "steps": []}：看着非空，其实没动作。
+        chat_only = not contract.get("steps") and str(
+            contract.get("mode", "") or ""
+        ) in {"", "reply"}
+    else:
+        chat_only = not contract
+    return (
+        chat_only
+        and not getattr(event, "action_receipts", None)
+        and not getattr(event, "checkpoint_pending", False)
+    )
+
+
+def drop_chat_checkpoint(state, identifier: str) -> bool:
+    """Remove the checkpoint record a pure-chat round left behind.
+
+    Chat rounds reuse the checkpoint pipeline, so without this every ordinary
+    reply becomes a "task" row: the history fills with identical titles and
+    real tasks get pushed out by the 20-entry cap.
+
+    Args:
+        state: Per-target state.
+        identifier: Checkpoint id of the finished round.
+
+    Returns:
+        True when a record was removed.
+    """
+    removed = False
+    history = state.get("execution_checkpoints")
+    if isinstance(history, dict) and identifier in history:
+        history.pop(identifier, None)
+        removed = True
+    legacy = state.get("execution_checkpoint")
+    if isinstance(legacy, dict) and legacy.get("task_id") == identifier:
+        state.pop("execution_checkpoint", None)
+        removed = True
+    return removed
+
+
 def resume_checkpoint(event, task):
     saved = event.state.get("execution_checkpoint", {})
     candidates = [
