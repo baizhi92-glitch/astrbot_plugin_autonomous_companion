@@ -1622,7 +1622,9 @@ def test_activity_says_nothing_before_enough_samples():
     block = plugin.activity_context(state)
     assert "看不出规律" in block
     assert "用户常在线：" not in block
-    assert "默认不要主动开口" in block
+    assert "不要主动开口" in block
+    # 自己约过时间不是熬夜打扰他的理由。
+    assert "你自己约过的时间也不算例外" in block
 
 
 def test_activity_fades_old_samples_but_keeps_the_shape():
@@ -3843,6 +3845,552 @@ async def test_native_bridge_fallback_keeps_memory_date():
     text = await bridge.compose_context(query="烧鸭饭", top_k=5, max_chars=200)
     assert "- [" in text
     assert "今天中午吃了烧鸭饭" in text
+
+
+def test_is_quiet_hour_detects_the_sleep_band():
+    from data.plugins.astrbot_plugin_autonomous_companion import activity
+
+    now = time.mktime((2026, 11, 12, 5, 30, 0, 0, 0, -1))
+    state = {"activity": activity.blank()}
+    # 样本不足时不许猜"他在睡觉"，否则会误判成整晚都不说话。
+    assert activity.is_quiet_hour(state, 3650, now) is False
+
+    entry = activity.blank()
+    entry["samples"] = 40
+    entry["weekday"] = [10.0] * 24
+    entry["weekday"][5] = 0.0
+    entry["updated_at"] = now
+    state["activity"] = entry
+    assert activity.is_quiet_hour(state, 3650, now) is True
+    daytime = time.mktime((2026, 11, 12, 14, 0, 0, 0, 0, -1))
+    assert activity.is_quiet_hour(state, 3650, daytime) is False
+
+
+def test_night_window_bounds_the_quiet_rule():
+    plugin, state, _ = make_plugin()
+    # 默认夜间窗口 23:00-08:00：只有这个窗口里的"安静小时"才算他在睡觉。
+    assert plugin.inside_night_window(4) is True
+    assert plugin.inside_night_window(7) is True
+    assert plugin.inside_night_window(23) is True
+    assert plugin.inside_night_window(12) is False
+    # 白天发言少的时段不该被当成本该沉默：安静的下午不是睡觉。
+    assert plugin.inside_night_window(20) is False
+
+
+@pytest.mark.asyncio
+async def test_night_guard_defers_speaking_commitments():
+    plugin, state, event = make_plugin()
+    plugin.quiet_hour_now = lambda state: True
+    plugin.next_active_timestamp = lambda state: time.time() + 3 * 3600
+    state["appointments"] = []
+    state["speak_schedule"] = [
+        {"at": time.time() - 10, "reason": "凌晨的约定", "set_at": time.time() - 600}
+    ]
+    await plugin.run_due(event.unified_msg_origin)
+
+    # 他睡着的时候不开主动轮，也不把到点的约定兑现成一条消息。
+    plugin.prepare.assert_not_called()
+    assert state["speak_schedule"][0]["at"] > time.time() + 3600
+    assert any(j.get("action") == "night_silent" for j in state.get("journal", []))
+
+
+@pytest.mark.asyncio
+async def test_night_guard_steps_aside_for_a_user_appointment():
+    plugin, state, event = make_plugin()
+    plugin.quiet_hour_now = lambda state: True
+    state["appointments"] = [
+        {"id": "a1", "title": "叫他起床", "due_at": time.time() + 600, "status": "pending"}
+    ]
+    # 用户自己要求的这个点，就不算打扰。
+    assert plugin.user_appointment_due(state) is True
+    state["appointments"][0]["status"] = "resolved"
+    assert plugin.user_appointment_due(state) is False
+
+
+def test_similar_commitments_merge_into_one():
+    plugin, state, _ = make_plugin()
+    texts = [
+        "他五点半下工，六点前后问一句今天怎么样，只问一次。",
+        "他五点半下工，约六点多自然问一句今天怎么样，顺带提煮面和体检、合同。",
+        "她今天头一天上工，五点半下工，六点前后问一句今天怎么样最自然。",
+    ]
+    for index, reason in enumerate(texts):
+        plugin.update_speak_commitment(
+            state, {"next_speak_minutes": 45 + index, "next_speak_reason": reason}
+        )
+    # 三句话说的是同一件事：只留一个闹钟，不是三个。
+    assert len(plugin.speak_schedule(state)) == 1
+    assert state["journal"][-1]["action"] == "speak_merged"
+
+
+def test_different_commitments_stay_separate():
+    plugin, state, _ = make_plugin()
+    plugin.update_speak_commitment(
+        state, {"next_speak_minutes": 30, "next_speak_reason": "晚上八点提醒他喝药"}
+    )
+    plugin.update_speak_commitment(
+        state, {"next_speak_minutes": 35, "next_speak_reason": "明早七点叫他起床"}
+    )
+    assert len(plugin.speak_schedule(state)) == 2
+
+
+def test_cancel_one_commitment_by_description():
+    plugin, state, _ = make_plugin()
+    plugin.update_speak_commitment(
+        state, {"next_speak_minutes": 30, "next_speak_reason": "晚上八点提醒他喝药"}
+    )
+    plugin.update_speak_commitment(
+        state, {"next_speak_minutes": 40, "next_speak_reason": "明早七点叫他起床"}
+    )
+    # 她自己撤掉其中一条，不需要经过用户同意。
+    plugin.update_speak_commitment(state, {"cancel_speak_reason": "提醒喝药"})
+    left = [item["reason"] for item in plugin.speak_schedule(state)]
+    assert left == ["明早七点叫他起床"]
+    assert state["journal"][-1]["action"] == "speak_cancelled"
+
+
+def test_cancel_miss_is_journaled_not_silent():
+    plugin, state, _ = make_plugin()
+    plugin.update_speak_commitment(
+        state, {"next_speak_minutes": 30, "next_speak_reason": "晚上八点提醒他喝药"}
+    )
+    plugin.update_speak_commitment(state, {"cancel_speak_reason": "陪他打游戏"})
+    # 找不到也要留下痕迹，且不能误删别的约定。
+    assert len(plugin.speak_schedule(state)) == 1
+    assert state["journal"][-1]["action"] == "speak_cancel_missed"
+
+
+def test_mask_digits_keeps_shape_without_the_number():
+    from data.plugins.astrbot_plugin_autonomous_companion.diagnostics import mask_digits
+
+    assert mask_digits("香夜梨:FriendMessage:3403811093") == "香夜梨:FriendMessage:34***93"
+    # 短号本来就不是账号，不该被动
+    assert mask_digits("短号 123") == "短号 123"
+
+
+def test_redact_drops_secret_fields():
+    from data.plugins.astrbot_plugin_autonomous_companion.diagnostics import redact
+
+    out = redact({"api_key": "sk-live", "nested": {"token": "abc"}, "keep": "v"})
+    assert out["api_key"] == "***"
+    assert out["nested"]["token"] == "***"
+    assert out["keep"] == "v"
+
+
+def test_export_masks_a_bare_account_number():
+    from data.plugins.astrbot_plugin_autonomous_companion.diagnostics import redact
+
+    # targets 里是裸号（没有冒号），曾经漏出去过，别再漏。
+    out = redact({"targets": ["3403811093"], "platform_id": "香夜梨"})
+    assert out["targets"] == ["34***93"]
+    assert out["platform_id"] == "香夜梨"
+
+
+def test_export_masks_secrets_and_keeps_the_useful_parts(tmp_path, monkeypatch):
+    from data.plugins.astrbot_plugin_autonomous_companion import diagnostics
+
+    plugin, state, event = make_plugin()
+    plugin.config["llm_api_key"] = "sk-abcdef1234567890"
+    plugin.config["webhook_secret"] = "topsecret"
+    monkeypatch.setattr(diagnostics.StarTools, "get_data_dir", lambda _: tmp_path)
+    plugin.journal(state, "silent", "他在忙，没打扰")
+    plugin.update_speak_commitment(
+        state, {"next_speak_minutes": 30, "next_speak_reason": "六点问他下工"}
+    )
+
+    result = diagnostics.write_export(plugin, event.unified_msg_origin)
+    markdown = Path(result["markdown"]).read_text(encoding="utf-8")
+    raw = Path(result["json"]).read_text(encoding="utf-8")
+
+    # 密钥绝不出门
+    assert "sk-abcdef1234567890" not in raw
+    assert "topsecret" not in raw
+    assert "***" in raw
+    # 但该有的都在，否则等于没导出
+    assert "插件版本" in markdown
+    assert "他在忙，没打扰" in markdown
+    assert "六点问他下工" in markdown
+    assert result["session_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_page_api_exports_a_diagnostic_bundle(tmp_path, monkeypatch):
+    from data.plugins.astrbot_plugin_autonomous_companion import diagnostics
+
+    plugin, state, event = make_plugin()
+    monkeypatch.setattr(diagnostics.StarTools, "get_data_dir", lambda _: tmp_path)
+    page = module.CompanionPageAPI(plugin)
+
+    result = await page.perform(
+        {"umo": event.unified_msg_origin, "action": "export_diagnostics"}
+    )
+    assert result["status"] == "ok"
+    assert Path(result["data"]["markdown"]).exists()
+    assert Path(result["data"]["json"]).exists()
+
+    # 不给对象也要能导（页面按钮不传 umo）：导出全部。
+    everything = await page.perform({"action": "export_diagnostics"})
+    assert everything["status"] == "ok"
+    assert everything["data"]["session_count"] >= 1
+
+
+def test_identifies_livingmemory_by_any_identity():
+    from data.plugins.astrbot_plugin_autonomous_companion.diagnostics import (
+        identifies_plugin,
+    )
+
+    assert identifies_plugin(
+        SimpleNamespace(root_dir_name="astrbot_plugin_livingmemory"), "livingmemory"
+    )
+    # 解压出来的目录名千奇百怪，靠 metadata 里的 name / display_name 也要认得出。
+    assert identifies_plugin(
+        SimpleNamespace(
+            root_dir_name="LivingMemory-main", name="astrbot_plugin_livingmemory"
+        ),
+        "livingmemory",
+    )
+    assert identifies_plugin(
+        SimpleNamespace(display_name="LivingMemory"), "livingmemory"
+    )
+    assert not identifies_plugin(
+        SimpleNamespace(name="astrbot_plugin_music"), "livingmemory"
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_bridge_finds_a_renamed_livingmemory_folder():
+    plugin, state, event = make_plugin()
+    plugin.context.get_all_stars = lambda: [
+        SimpleNamespace(
+            activated=True,
+            name="astrbot_plugin_livingmemory",
+            display_name="LivingMemory",
+            root_dir_name="LivingMemory-main",
+            star_cls=SimpleNamespace(
+                autonomous_recall=AsyncMock(), autonomous_record=AsyncMock()
+            ),
+        )
+    ]
+    # 目录名不同也要接上，否则用户会看到"装了却显示未连接"。
+    bridge = plugin.memory_bridge(event)
+    assert isinstance(bridge, module.LivingMemoryBridge)
+    assert event.state["memory_provider"] == "LivingMemory"
+
+
+def test_livingmemory_probe_reports_a_missing_plugin():
+    plugin, state, event = make_plugin()
+    plugin.context.get_all_stars = lambda: []
+    probe = module.livingmemory_probe(plugin, event.unified_msg_origin)
+    assert probe["结论"].startswith("没找到 LivingMemory")
+
+
+def test_livingmemory_probe_explains_an_incomplete_interface(monkeypatch):
+    from data.plugins.astrbot_plugin_autonomous_companion import diagnostics
+
+    plugin, state, event = make_plugin()
+    plugin.context.get_all_stars = lambda: [
+        SimpleNamespace(
+            activated=True,
+            name="astrbot_plugin_livingmemory",
+            display_name="LivingMemory",
+            version="2.10.0",
+            root_dir_name="astrbot_plugin_livingmemory",
+            star_cls=SimpleNamespace(),
+        )
+    ]
+
+    def boom(name):
+        raise ImportError(name)
+
+    monkeypatch.setattr(diagnostics.importlib, "import_module", boom)
+    probe = module.livingmemory_probe(plugin, event.unified_msg_origin)
+    assert probe["结论"].startswith("接口不完整")
+    assert probe["缺少"]
+
+
+def test_livingmemory_probe_reports_a_disabled_plugin():
+    plugin, state, event = make_plugin()
+    plugin.context.get_all_stars = lambda: [
+        SimpleNamespace(
+            activated=False,
+            name="astrbot_plugin_livingmemory",
+            root_dir_name="astrbot_plugin_livingmemory",
+            star_cls=SimpleNamespace(),
+        )
+    ]
+    probe = module.livingmemory_probe(plugin, event.unified_msg_origin)
+    assert "未启用" in probe["结论"]
+
+
+def test_trim_caps_a_runaway_field():
+    from data.plugins.astrbot_plugin_autonomous_companion.diagnostics import _trim
+
+    long_text = "啊" * 9000
+    trimmed = _trim(long_text, limit=4000)
+    assert len(trimmed) < 5000
+    assert "截断" in trimmed
+
+    trimmed_list = _trim(list(range(500)), items=200)
+    assert len(trimmed_list) == 201
+    assert "还有 300 条" in trimmed_list[-1]
+
+
+def test_log_tail_keeps_only_relevant_lines(tmp_path, monkeypatch):
+    from data.plugins.astrbot_plugin_autonomous_companion import diagnostics
+
+    folder = tmp_path / "logs"
+    folder.mkdir()
+    (folder / "astrbot.log").write_text(
+        "\n".join(
+            [
+                "[INFO] 别的插件在聊天：今天吃什么",
+                "[INFO] astrbot_plugin_autonomous_companion: 心跳开始",
+                "[ERRO] LivingMemory 读取失败",
+                "Traceback (most recent call last):",
+                "[INFO] 另一条无关的噪音",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(diagnostics, "_logs_dir", lambda: folder)
+    tail = diagnostics._log_tail()
+    body = "\n".join(tail["内容"])
+    # 只留和本插件/记忆/异常有关的行，别把别人的私聊内容带出去。
+    assert "心跳开始" in body
+    assert "LivingMemory 读取失败" in body
+    assert "Traceback" in body
+    assert "今天吃什么" not in body
+    assert "无关的噪音" not in body
+
+
+def test_export_carries_every_state_field_not_just_the_summary(tmp_path, monkeypatch):
+    from data.plugins.astrbot_plugin_autonomous_companion import diagnostics
+
+    plugin, state, event = make_plugin()
+    state["usage"] = {"day": "2026-11-14", "rounds": 9, "messages": 31}
+    state["projects"] = [{"id": "p1", "title": "车站短篇", "status": "paused"}]
+    state["stalls"] = {"k": {"signature": "abc"}}
+    monkeypatch.setattr(diagnostics.StarTools, "get_data_dir", lambda _: tmp_path)
+    monkeypatch.setattr(diagnostics, "_logs_dir", lambda: None)
+
+    result = diagnostics.write_export(plugin, event.unified_msg_origin)
+    report = json.loads(Path(result["json"]).read_text(encoding="utf-8"))
+    full = report["完整状态"][0]["状态"]
+
+    # 摘要只挑常见字段，排障要看全量：一个都不能少。
+    assert set(full) == set(state)
+    assert full["usage"]["rounds"] == 9
+    assert full["projects"][0]["title"] == "车站短篇"
+    assert "usage" not in report["会话"][0]
+    assert report["插件日志"]["说明"].startswith("没找到")
+
+
+@pytest.mark.asyncio
+async def test_page_api_export_embeds_the_self_check(tmp_path, monkeypatch):
+    from data.plugins.astrbot_plugin_autonomous_companion import diagnostics, page_api
+
+    plugin, state, event = make_plugin()
+    monkeypatch.setattr(diagnostics.StarTools, "get_data_dir", lambda _: tmp_path)
+    monkeypatch.setattr(diagnostics, "_logs_dir", lambda: None)
+
+    async def fake_checks(owner):
+        return {"targets": [{"target": "t", "checks": [{"name": "平台", "status": "ok", "detail": "运行中"}]}], "note": "只读自检"}
+
+    monkeypatch.setattr(page_api, "inspect_runtime", fake_checks)
+    page = module.CompanionPageAPI(plugin)
+    result = await page.perform({"action": "export_diagnostics"})
+    report = json.loads(Path(result["data"]["json"]).read_text(encoding="utf-8"))
+    assert report["运行自检"]["targets"][0]["checks"][0]["name"] == "平台"
+
+
+@pytest.mark.asyncio
+async def test_memory_sample_reports_when_no_plugin_is_available():
+    plugin, state, event = make_plugin()
+    plugin.context.get_all_stars = lambda: []
+    sample = await module.memory_sample(plugin, event.unified_msg_origin)
+    assert sample["结论"].startswith("没有可用的记忆插件")
+
+
+@pytest.mark.asyncio
+async def test_memory_sample_captures_what_she_actually_reads():
+    plugin, state, event = make_plugin()
+    state["memory_provider"] = "LivingMemory"
+    state["livingmemory_status"] = "原生接口直连"
+
+    class Bridge:
+        async def compose_context(self, **kwargs):
+            return "记忆 #1 · 重要性 0.60 · 2026-11-12 15:14\n白说晚上想吃软的。"
+
+    plugin.memory_bridge = lambda shim: Bridge()
+    sample = await module.memory_sample(plugin, event.unified_msg_origin)
+
+    assert sample["结论"] == "已召回"
+    assert sample["条数"] == 1
+    assert "想吃软的" in sample["内容"]
+    # 采样绝不能改到真实状态
+    assert state["memory_provider"] == "LivingMemory"
+
+
+@pytest.mark.asyncio
+async def test_memory_sample_keeps_the_failure_reason():
+    plugin, state, event = make_plugin()
+
+    class Bridge:
+        async def compose_context(self, **kwargs):
+            raise RuntimeError("索引未就绪")
+
+    plugin.memory_bridge = lambda shim: Bridge()
+    sample = await module.memory_sample(plugin, event.unified_msg_origin)
+    assert sample["结论"].startswith("召回失败")
+    assert "索引未就绪" in sample["结论"]
+
+
+def test_journal_keeps_enough_history_to_debug():
+    plugin, state, event = make_plugin()
+    for index in range(260):
+        plugin.journal(state, "dispatched", f"第 {index} 条")
+    # 以前只留 16 条，出了问题根本看不到过程。
+    assert len(state["journal"]) == 200
+    assert state["journal"][-1]["summary"] == "第 259 条"
+
+
+def test_timeline_labels_every_stage_in_plain_words():
+    from data.plugins.astrbot_plugin_autonomous_companion.diagnostics import _timeline
+
+    state = {
+        "journal": [
+            {"time": "2026-11-14T16:47:05+08:00", "action": "dispatch_attempt", "summary": "水开了。"},
+            {"time": "2026-11-14T16:47:13+08:00", "action": "dispatched", "summary": "水开了。"},
+            {"time": "2026-11-14T17:00:00+08:00", "action": "silent", "summary": "他在忙，不打扰"},
+            {"time": "2026-11-14T17:05:00+08:00", "action": "speak_scheduled", "summary": "约 60 分钟后问一句"},
+        ]
+    }
+    rows = _timeline(state)
+    # 准备发出 + 实际发出 是同一条消息的两条记录，合成一行不重复占位
+    assert [row["阶段"] for row in rows] == ["实际发出", "选择沉默", "约定开口"]
+    # 时间要能直接读，不用再去猜 ISO 串；合并后留的是真正送达那一刻
+    assert rows[0]["时间"] == "11-14 16:47:13"
+
+
+def test_export_shows_the_proactive_record_and_todays_counters(tmp_path, monkeypatch):
+    from data.plugins.astrbot_plugin_autonomous_companion import diagnostics
+
+    plugin, state, event = make_plugin()
+    plugin.journal(state, "dispatched", "水开了。今天站一天，晚上我煮面，软的。")
+    plugin.journal(state, "silent", "他在忙，不打扰")
+    state["visible_dispatches"] = [{"cid": "c", "at": time.time(), "text": "水开了。"}]
+    monkeypatch.setattr(diagnostics.StarTools, "get_data_dir", lambda _: tmp_path)
+    monkeypatch.setattr(diagnostics, "_logs_dir", lambda: None)
+
+    result = diagnostics.write_export(plugin, event.unified_msg_origin)
+    markdown = Path(result["markdown"]).read_text(encoding="utf-8")
+
+    assert "主动记录（2 条" in markdown
+    assert "【实际发出】水开了" in markdown
+    assert "【选择沉默】他在忙" in markdown
+    assert "送达明细" in markdown
+
+
+def test_journal_records_which_trigger_fired_it():
+    plugin, state, event = make_plugin()
+    plugin.journal(state, "dispatched", "水开了。", "heartbeat")
+    assert state["journal"][-1]["trigger"] == "heartbeat"
+    # 没触发来源的条目不要凭空多一个字
+    plugin.journal(state, "silent", "他在忙")
+    assert "trigger" not in state["journal"][-1]
+
+
+def test_timeline_translates_the_trigger_into_plain_words():
+    from data.plugins.astrbot_plugin_autonomous_companion.diagnostics import _timeline
+
+    rows = _timeline(
+        {
+            "journal": [
+                {
+                    "time": "2026-11-14T18:09:01+08:00",
+                    "action": "dispatched",
+                    "summary": "水开了。",
+                    "trigger": "speak",
+                }
+            ]
+        }
+    )
+    assert rows[0]["触发"] == "到点开口"
+    assert rows[0]["阶段"] == "实际发出"
+
+
+def test_timeline_flags_an_attempt_that_never_got_delivered():
+    from data.plugins.astrbot_plugin_autonomous_companion.diagnostics import _timeline
+
+    rows = _timeline(
+        {
+            "journal": [
+                {"time": "2026-11-14T16:00:00+08:00", "action": "dispatch_attempt", "summary": "发出去了吗"},
+                {"time": "2026-11-14T16:01:00+08:00", "action": "dispatched", "summary": "这条送到了"},
+            ]
+        }
+    )
+    # 有送达记录的合并；没有的第二条要显眼地标出来，这正是要查的漏发。
+    assert [row["阶段"] for row in rows] == ["准备发出（未见送达记录）", "实际发出"]
+
+
+def test_pure_chat_round_is_not_a_task_checkpoint():
+    from data.plugins.astrbot_plugin_autonomous_companion.checkpoint import (
+        drop_chat_checkpoint,
+        is_pure_chat,
+    )
+
+    # 纯聊天轮的真实形态：契约是 mode=reply、没有 steps，看着非空其实没动作
+    chat = SimpleNamespace(
+        execution_contract={"mode": "reply", "steps": []},
+        action_receipts=[],
+        checkpoint_pending=False,
+    )
+    assert is_pure_chat(chat) is True
+
+    # 做过事、有回执、或还没核验完的回合必须留下断点，别把真任务也删了。
+    assert is_pure_chat(SimpleNamespace(action_receipts=[{"tool": "x"}], checkpoint_pending=False)) is False
+    assert is_pure_chat(SimpleNamespace(execution_contract={"mode": "action", "steps": [{"goal": "画图"}]}, action_receipts=[])) is False
+    assert is_pure_chat(SimpleNamespace(execution_contract={}, action_receipts=[], checkpoint_pending=True)) is False
+
+    state = {
+        "execution_checkpoints": {"cp1": {"task": "旧任务"}, "cp2": {"task": "自然回应"}},
+        "execution_checkpoint": {"task_id": "cp2", "task": "自然回应"},
+    }
+    assert drop_chat_checkpoint(state, "cp2") is True
+    assert list(state["execution_checkpoints"]) == ["cp1"]
+    assert "execution_checkpoint" not in state
+
+
+def test_repair_prompt_asks_for_a_real_title():
+    prompt = module.AutonomousCompanion.DECISION_REPAIR_PROMPT
+    # 以前写死的占位标题就是"断点列表里全一样"的根源
+    assert "根据原文自然继续交流" not in prompt
+    assert "12 字以内" in prompt
+
+
+def test_prompts_forbid_invented_firsthand_experience():
+    action = module.ACTION_PROMPT
+    # 真正发给用户的正文在这里生成，规则必须落在这一段
+    assert "没有真实回执就别讲成做过" in action
+    assert "也别替用户编他说过的话" in action
+    # 她自己的日子不是谎话：日常质感必须留着，别被这条规则讲干
+    assert "跟你之前说的保持一致" in action
+    assert "不用上报也不用对账" in action
+    # 没人格生活设定的 bot 不能被这条放开成"现场编一套"
+    assert "别自己造一套身世和日常" in action
+    assert "别凭空长出一套身世和日常来" in module.DECISION_PROMPT
+    # 旧的"不要编造真实生活体验"和新规则打架，会把她自己的日子也一起禁掉
+    assert "不要编造看过画面或真实生活体验" not in action
+
+
+def test_honesty_rule_explicitly_spares_humor_and_exaggeration():
+    for prompt in (module.DECISION_PROMPT, module.ACTION_PROMPT):
+        # 别为了"不说谎"把玩笑也一起掐掉
+        assert "玩笑" in prompt
+        assert "夸张" in prompt
+        assert "不算编造" in prompt
+    assert "玩笑、夸张、比喻、撒娇、想象" in module.DECISION_PROMPT
 
 
 def test_schema_default_extra_prompt_encourages_tools():
