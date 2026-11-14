@@ -17,7 +17,7 @@ from .companion_library import sync_companion_library
 from .compiled_work import compile_chapters
 from .conditions import validate_conditions
 from .daily import pool_snapshot, usage_for
-from .diagnostics import inspect_runtime
+from .diagnostics import inspect_runtime, memory_sample, write_export
 from .library import (
     archive_library_images,
     backfill_library,
@@ -264,6 +264,25 @@ class CompanionPageAPI:
             raise ValueError("请求格式错误")
         umo, action = body.get("umo"), body.get("action")
         owner = self.owner
+        if action == "export_diagnostics":
+            # 一键导出脱敏诊断包，出问题直接把文件发出来；不指定对象就导出全部。
+            target = umo if umo in owner.target_origins() else None
+            extra = {}
+            try:
+                checks = await asyncio.wait_for(inspect_runtime(owner), 20)
+                extra["自检"] = {
+                    "targets": checks.get("targets", []),
+                    "note": checks.get("note", ""),
+                }
+            except Exception as exc:
+                extra["自检"] = {"targets": [], "note": "自检失败：" + type(exc).__name__}
+            if target:
+                try:
+                    extra["记忆采样"] = await memory_sample(owner, target)
+                except Exception as exc:
+                    extra["记忆采样"] = {"结论": "采样失败：" + type(exc).__name__}
+            result = await asyncio.to_thread(write_export, owner, target, extra)
+            return {"status": "ok", "data": result}
         for origin, task in list(owner.running.items()):
             if isinstance(task, asyncio.Future) and task.done():
                 owner.running.pop(origin, None)
