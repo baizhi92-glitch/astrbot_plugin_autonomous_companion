@@ -298,6 +298,33 @@ def summary(state: dict, half_life_days: float = DEFAULT_HALF_LIFE_DAYS, now: fl
     return result
 
 
+def is_quiet_hour(
+    state: dict,
+    half_life_days: float = DEFAULT_HALF_LIFE_DAYS,
+    now: float | None = None,
+) -> bool:
+    """Report whether this local hour falls in a range the user is never around.
+
+    Args:
+        state: Per-conversation state.
+        half_life_days: Days after which a sample counts half as much.
+        now: Reference timestamp, defaults to now.
+
+    Returns:
+        True only when there are enough samples and this hour is quiet. Sample
+        shortfall returns False on purpose: guessing "he is asleep" is worse
+        than saying nothing.
+    """
+    current = time.time() if now is None else float(now)
+    info = summary(state, half_life_days, current)
+    if not info["enough"] or info["total"] <= 0:
+        return False
+    hours = info["hours"]
+    average = info["total"] / HOURS
+    hour = time.localtime(current).tm_hour
+    return hours[hour] <= average * QUIET_RATIO
+
+
 def clear(state: dict) -> None:
     """Drop the histogram but keep a manual note and the sample counter reset.
 
