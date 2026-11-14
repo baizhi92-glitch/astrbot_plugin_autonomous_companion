@@ -137,6 +137,7 @@ document.addEventListener("click",async event=>{
 });
 $("refresh").onclick=refresh;
 $("diagnose").onclick=async()=>{const button=$("diagnose");button.disabled=true;try{const report=await api("GET","diagnostics");$("diagnostics-result").innerHTML=report.targets.map(row=>`<div class="preferences"><b>${escapeHTML(row.target)}</b>${row.checks.map(c=>`<p><span class="badge">${{ok:"正常",waiting:"待确认",error:"异常"}[c.status]||c.status}</span> ${escapeHTML(c.name)} · ${escapeHTML(c.detail)}</p>`).join("")}</div>`).join("")||"请先在设置添加对象。";notice(report.note);}catch(error){notice("自检失败："+error.message);}finally{button.disabled=false;}};
+$("export-diagnostics").onclick=async()=>{const button=$("export-diagnostics");button.disabled=true;try{const result=await api("POST","action",{action:"export_diagnostics"});const data=result.data||{};const box=$("diagnostics-result");box.innerHTML=`<div class="preferences"><b>诊断包已导出（${data.session_count??0} 个会话）</b><p>${escapeHTML(data.markdown||"")}</p><p>${escapeHTML(data.json||"")}</p><p>把这两个文件发出去即可定位问题；密钥和账号数字已隐去。</p></div>`+box.innerHTML;notice("已导出诊断包");}catch(error){notice("导出失败："+error.message);}finally{button.disabled=false;}};
 $("open-settings").onclick=()=>tab("settings");
 $("workspace-target").onchange=async()=>{if(planDirty&&!await pageConfirm("当前有未保存的编辑，切换会丢弃，是否继续？")){$("workspace-target").value=$("workspace-target").dataset.previous;return;}renderWorkspace();};
 $("activity-target").onchange=renderActivity;
