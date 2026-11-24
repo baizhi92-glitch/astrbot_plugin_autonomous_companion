@@ -8,12 +8,12 @@ test('same text from local and companion is one entry, different revisions remai
   const context=vm.createContext({$:()=>({})});
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../pages/我只在乎你/library.js'),'utf8'),context);
   const result=vm.runInContext(`uniqueLibrary([
-    {id:'remote',kind:'text',title:'Story',content_hash:'same',producer:'private_companion'},
-    {id:'local',kind:'text',title:'Story',content_hash:'same',path:'story.txt'},
-    {id:'revision',kind:'text',title:'Story',content_hash:'different'}
+    {id:'companion',kind:'text',title:'Story',content_hash:'same',producer:'private_companion',path:'companion/story.txt',availability:'missing'},
+    {id:'local',kind:'text',title:'Story',content_hash:'same',path:'story.txt',availability:'local'},
+    {id:'revision',kind:'text',title:'Story',content_hash:'different',availability:'inline'}
   ])`,context);
   assert.equal(result.length,2);
   assert.equal(result[0].id,'local');
   assert.equal(result[0].companion_copy,true);
-  assert.equal(result[0].aliases.includes('remote'),true);
+  assert.equal(result[0].aliases.includes('companion'),true);
 });

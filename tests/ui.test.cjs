@@ -51,12 +51,11 @@ test("every schema key belongs to a settings group", () => {
   const js = fs.readFileSync(path.join(PAGE, "app.js"), "utf8");
   const block = js.slice(js.indexOf("const groups = ["), js.indexOf("const names = {"));
   const listed = new Set([...block.matchAll(/"([a-z0-9_]+)"/g)].map(m => m[1]));
-  const injectedAtRuntime = [
-    "proactive_segmented_reply", "proactive_segment_chars",
-    "proactive_segment_interval_ms", "livingmemory_integration",
-  ];
-  const missing = Object.keys(schema).filter(key => !listed.has(key) && !injectedAtRuntime.includes(key));
+  const missing = Object.keys(schema).filter(key => !listed.has(key));
   assert.deepEqual(missing, [], "settings groups must cover every schema key");
+  assert.match(block, /"自己约定的开口",\[[^\]]*"speak_schedule_limit"/);
+  const html = fs.readFileSync(path.join(PAGE, "index.html"), "utf8");
+  assert.match(html, /href="\.\/settings-ui\.css"/);
 });
 
 // 主题约束：暖米白纸感 + 墨黑点缀。这些规则靠人眼守不住，交给测试守。
@@ -151,7 +150,7 @@ test("relative time helper drives the speak commitment wording", () => {
   assert.equal(out.short, new Date(1800000000000).toLocaleString("zh-CN", { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }));
   const app = fs.readFileSync(path.join(PAGE, "app.js"), "utf8");
   const plans = fs.readFileSync(path.join(PAGE, "plans.js"), "utf8");
-  assert.match(app, /约好开口 · \$\{soonText\(speakAt\)\}/);
+  assert.match(app, /"主动开口计划", speakList\.length, "plans", speakAt \? soonText\(speakAt\)/);
   assert.match(app, /她自己约定的开口时间 \$\{timeShort\(speakAt\)\} · \$\{soonText\(speakAt\)\}/);
   assert.match(plans, /她自己约定的开口时间 \$\{timeShort\(s\.state\.next_speak_at\)\}/);
   assert.match(plans, /soonText\(s\.state\.next_speak_at\)/);

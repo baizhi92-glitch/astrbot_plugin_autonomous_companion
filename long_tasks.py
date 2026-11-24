@@ -5,12 +5,34 @@ import hashlib
 import json
 import time
 import uuid
+from copy import deepcopy
 from pathlib import Path
 
 from astrbot.api.star import StarTools
 
+from .daily import count
+from .execution_proof import execution_verdict, required_action
 
-def create_task(state, title, goal):
+TERMINAL = {"completed", "cancelled"}
+# Execution identity is process-local and must not be included in serialized state.
+_running = {}
+
+
+def create_task(state, title, goal, *, explicit=False):
+    """Create a task without replaying an existing or removed goal by default.
+
+    Args:
+        state: State for the exact target conversation.
+        title: User-facing task name.
+        goal: Goal and completion criteria.
+        explicit: Allow a user to recreate a finished or removed goal.
+
+    Returns:
+        The new queued job.
+
+    Raises:
+        ValueError: Input is invalid, the active queue is full, or the goal is a duplicate.
+    """
     if (
         not all(isinstance(v, str) and v.strip() for v in (title, goal))
         or len(title) > 200
@@ -18,13 +40,21 @@ def create_task(state, title, goal):
     ):
         raise ValueError("任务标题1～200字，目标1～6000字")
     jobs = state.setdefault("long_tasks", [])
-    if len(jobs) >= 30:
-        raise ValueError("最多保留30个长期任务，请先删除已结束任务")
+    if sum(j["status"] not in TERMINAL for j in jobs) >= 30:
+        raise ValueError("最多同时保留30个未结束的长期任务")
+    normalized = " ".join(goal.split()).casefold()
     if any(
-        j["goal"] == goal.strip() and j["status"] not in {"completed", "cancelled"}
+        " ".join(j["goal"].split()).casefold() == normalized
+        and (not explicit or j["status"] not in TERMINAL)
         for j in jobs
+    ) or (
+        not explicit
+        and hashlib.sha256(normalized.encode()).hexdigest()
+        in state.get("long_task_removed_goals", [])
     ):
-        raise ValueError("相同目标已有任务")
+        raise ValueError(
+            "相同目标已有任务或移除记录；请先查看已有结果，确需重做请从面板添加"
+        )
     job = {
         "id": uuid.uuid4().hex,
         "title": title.strip(),
@@ -46,24 +76,65 @@ def create_task(state, title, goal):
 
 
 def control_task(state, identifier, operation):
-    job = next((j for j in state.get("long_tasks", []) if j["id"] == identifier), None)
-    if not job:
+    """Apply a user transition and invalidate only this job's active execution.
+
+    Args:
+        state: State for the exact target conversation.
+        identifier: ID of a job belonging to that conversation.
+        operation: One of delete, pause, resume or cancel.
+
+    Returns:
+        The affected job, which is detached from state on delete.
+
+    Raises:
+        ValueError: The job, operation or state transition is invalid.
+    """
+    jobs = state.get("long_tasks", [])
+    job = next((j for j in jobs if j["id"] == identifier), None)
+    if job is None:
         raise ValueError("长期任务不存在")
+    status = job["status"]
+    now = time.time()
     if operation == "delete":
-        if job["status"] not in {"completed", "cancelled"}:
-            raise ValueError("请先取消任务再删除")
-        state["long_tasks"].remove(job)
-    elif operation in {"pause", "cancel"}:
-        if job["status"] in {"completed", "cancelled"}:
+        # Keep a replay guard, not a copy of the deleted record or its output.
+        removed = state.setdefault("long_task_removed_goals", [])
+        digest = hashlib.sha256(
+            " ".join(job["goal"].split()).casefold().encode()
+        ).hexdigest()
+        if digest not in removed:
+            removed.append(digest)
+        jobs.remove(job)
+    elif operation == "pause":
+        if status not in {"queued", "running"}:
+            raise ValueError("仅排队或执行中的任务可以暂停")
+        job["status"] = "paused"
+        if status == "running":
+            job["error"] = "已暂停；正在提交的操作可能已经执行，恢复前请核对结果"
+    elif operation == "cancel":
+        if status in TERMINAL:
             raise ValueError("任务已经结束")
-        job["status"] = "paused" if operation == "pause" else "cancelled"
+        job["status"] = "cancelled"
+        if status == "running":
+            job["error"] = "已取消后续执行；正在提交的操作可能已经执行，请核对结果"
     elif operation == "resume":
-        if job["status"] not in {"paused", "waiting", "failed"}:
+        if status not in {"paused", "waiting", "failed"}:
             raise ValueError("仅暂停、等待或失败任务可以恢复")
-        job.update(status="queued", next_due=time.time(), error="", failures=0, steps=0)
+        job.update(status="queued", next_due=now, error="")
+        if status != "paused":
+            job["steps_since_review"] = 0
     else:
         raise ValueError("无效操作")
-    job["updated_at"] = time.time()
+    # Distinguish a control from a stage commit even on a coarse clock tick.
+    job["updated_at"] = max(now, job.get("updated_at", 0) + 1e-6)
+    execution = _running.get(identifier)
+    if execution is not None and execution[0] is job:
+        _running.pop(identifier)
+        # Tool wrappers mutate nested receipt dictionaries in-place. Freeze the
+        # visible evidence before a cancelled tool can yield a late result.
+        job["receipts"] = deepcopy(job.get("receipts", [])[-40:])
+        worker = execution[1]
+        if status == "running" and worker is not asyncio.current_task():
+            worker.cancel()
     return job
 
 
@@ -72,6 +143,7 @@ def recover_tasks(state):
         if job["status"] == "running":
             job.update(
                 status="waiting",
+                updated_at=time.time(),
                 error="进程中断，原操作可能已提交；请核对结果后恢复，不自动重放",
             )
 
@@ -86,25 +158,55 @@ def due_task(state):
 
 
 async def run_task(owner, umo, job):
-    state = owner.states[umo]
-    job.update(status="running", updated_at=time.time(), attempts=job["attempts"] + 1)
-    await owner.save()
-    event = None
-    try:
-        event, persona, provider, _, _ = await owner.prepare(umo)
-        event.quiet = True
-        event.action_receipts = list(job.get("receipts", []))
-        # Tool wrappers persist owner state after calls; keep their receipt list
-        # attached to the durable job before any side effect can occur.
-        job["receipts"] = event.action_receipts
-        event.checkpoint_id = job["id"]
-        event.checkpoint_task = ""
-        event.checkpoint_pending = False
-        event.project_id = ""
-        state["window_end"] = 0
-        from .daily import usage_for
+    """Run one due stage and commit its outcome only while it owns the job.
 
-        usage_for(state)["rounds"] += 1
+    Args:
+        owner: Companion instance that provides state, tools and persistence.
+        umo: Exact target conversation origin.
+        job: Live job selected by the scheduler.
+
+    Returns:
+        The committed update timestamp, or None if the stage was superseded.
+
+    Raises:
+        asyncio.CancelledError: An external interruption stopped the current stage.
+    """
+    state = owner.states[umo]
+    identifier = job["id"]
+    if (
+        job["status"] != "queued"
+        or job.get("next_due", 0) > time.time()
+        or identifier in _running
+        or not any(item is job for item in state.get("long_tasks", []))
+    ):
+        return None
+    execution = (job, asyncio.current_task())
+    _running[identifier] = execution
+    job.update(status="running", updated_at=time.time(), attempts=job["attempts"] + 1)
+
+    def is_current():
+        return (
+            _running.get(identifier) is execution
+            and job["status"] == "running"
+            and owner.states.get(umo) is state
+            and any(item is job for item in state.get("long_tasks", []))
+        )
+
+    event = None
+    committed = False
+    try:
+        await owner.save()
+        if not is_current():
+            return None
+        event, persona, provider, _, _ = await owner.prepare(umo)
+        if not is_current():
+            return None
+        event.quiet = True
+        event.long_task_is_current = is_current
+        state["window_end"] = 0
+        await owner.check_current(event)
+        if not is_current():
+            return None
         scope = hashlib.sha256(umo.encode()).hexdigest()[:16]
         workspace = (
             Path(StarTools.get_data_dir("astrbot_plugin_autonomous_companion"))
@@ -113,6 +215,17 @@ async def run_task(owner, umo, job):
             / job["id"]
         )
         await asyncio.to_thread(workspace.mkdir, parents=True, exist_ok=True)
+        if not is_current():
+            return None
+        event.action_receipts = deepcopy(job.get("receipts", []))
+        # Tool wrappers persist attempted receipts before launching side effects.
+        job["receipts"] = event.action_receipts
+        event.checkpoint_id = identifier
+        event.checkpoint_task = ""
+        event.checkpoint_pending = False
+        event.project_id = ""
+        state["tool_calls"] = 0
+        count(owner, state, "rounds")
         job["workspace"] = str(workspace.resolve())
         # Exclude communication and task-control tools. BudgetTool also enforces quiet.
         tools = owner.tools(event, persona)
@@ -124,10 +237,7 @@ async def run_task(owner, umo, job):
                 for word in ("send", "poke", "proactive", "task_control")
             )
         ]
-        # 下游插件（技能学习、记忆、好感）靠这些钩子采集本轮工具证据；不传
-        # 就退回空通知器，长期任务再丰富的工具工作也一个都学不到。开关与
-        # 主动轮共用 expose_plugin_hooks。任务文本用长期任务自己的目标，别
-        # 让学习侧只看到占位的“自主心跳”。
+        # Hooks expose the actual goal and tool evidence to downstream plugins.
         event.message_str = job["goal"][:200]
         message_obj = getattr(event, "message_obj", None)
         if message_obj is not None:
@@ -137,6 +247,7 @@ async def run_task(owner, umo, job):
             "goal": job["goal"],
             "workspace": job["workspace"],
             "previous_steps": job["log"][-8:],
+            "previous_result": job["result"],
             "actual_receipts": job["receipts"][-20:],
         }
         response = await owner.context.tool_loop_agent(
@@ -153,7 +264,11 @@ async def run_task(owner, umo, job):
             tool_call_timeout=owner.number("tool_timeout_seconds", 120, 5, 600),
             agent_hooks=owner.notification_hooks,
         )
+        if not is_current():
+            return None
         await owner.check_current(event)
+        if not is_current():
+            return None
         from .main import parse_object
 
         result = parse_object(response.completion_text or "")
@@ -162,46 +277,92 @@ async def run_task(owner, umo, job):
             for k in ("summary", "result", "reason")
         ):
             raise ValueError("后台任务返回格式错误")
-        job["steps"] += 1
-        job["log"] = (
-            job["log"]
-            + [{"at": time.time(), "summary": result.get("summary", "")[:4000]}]
-        )[-20:]
-        job["result"] = result.get("result", "")[:12000]
-        job["error"] = result.get("reason", "")[:1000]
-        job["status"] = {
+        output = result.get("result", "")[:12000]
+        stage_status = {
             "continue": "queued",
             "waiting": "waiting",
             "completed": "completed",
         }[result["status"]]
-        if job["status"] == "completed" and (
-            not job["result"].strip()
-            or any(
-                r.get("status") in {"failed", "pending", "attempted", "unverified"}
-                for r in event.action_receipts
+        reason = result.get("reason", "")[:1000]
+        if stage_status == "completed":
+            family = required_action(job["goal"], long_task=True)
+            verification, proof_reason = execution_verdict(
+                event, family, long_task=True
             )
-        ):
-            job.update(
-                status="waiting",
-                error="完成报告缺少结果，或工具存在未确认结果，请核对后恢复",
-            )
-        if job["steps"] >= 12 and job["status"] == "queued":
-            job.update(
-                status="waiting", error="已执行12个阶段，等待人工核对目标和继续必要性"
-            )
-        job["next_due"] = time.time() + 90
+            # An older failed attempt is not unresolved if the very same call
+            # subsequently succeeded; never discard the original receipt.
+            resolved_calls = set()
+            unresolved = False
+            for receipt in reversed(event.action_receipts):
+                key = receipt.get("call_key")
+                status = receipt.get("status")
+                if key and status in {"success", "verified", "completed"}:
+                    resolved_calls.add(key)
+                if key not in resolved_calls and status in {
+                    "failed",
+                    "pending",
+                    "attempted",
+                    "unverified",
+                    "interrupted",
+                }:
+                    unresolved = True
+                    break
+            if not output.strip() or unresolved:
+                stage_status = "waiting"
+                reason = "完成报告缺少结果，或工具存在未确认结果，请核对后恢复"
+            elif family and verification != "verified":
+                stage_status = "waiting"
+                reason = proof_reason
+        steps_since_review = job.get("steps_since_review", job["steps"]) + 1
+        if steps_since_review >= 12 and stage_status == "queued":
+            stage_status = "waiting"
+            reason = "已执行12个阶段，等待人工核对目标和继续必要性"
+        now = time.time()
+        job.update(
+            status=stage_status,
+            steps=job["steps"] + 1,
+            steps_since_review=steps_since_review,
+            log=(
+                job["log"] + [{"at": now, "summary": result.get("summary", "")[:4000]}]
+            )[-20:],
+            result=output if output.strip() else job["result"],
+            error=reason,
+            next_due=now + 90,
+        )
+        committed = True
     except asyncio.CancelledError:
-        if job["status"] == "running":
-            job.update(
-                status="waiting", error="用户消息或停止操作打断，待核对已有结果后恢复"
-            )
+        if not is_current():
+            return None
+        job.update(
+            status="waiting", error="用户消息或停止操作打断，待核对已有结果后恢复"
+        )
+        committed = True
         raise
     except Exception as exc:
+        if not is_current():
+            return None
         job["failures"] += 1
         job.update(status="failed", error=str(exc)[:1000])
-        owner.logger.exception("Long task failed: %s", job["id"])
+        committed = True
+        owner.logger.exception("Long task failed: %s", identifier)
     finally:
-        if event is not None:
-            job["receipts"] = event.action_receipts[-40:]
-        job["updated_at"] = time.time()
-        await owner.save()
+        if committed:
+            if event is not None and job.get("receipts") is getattr(
+                event, "action_receipts", None
+            ):
+                job["receipts"] = deepcopy(event.action_receipts[-40:])
+            job["updated_at"] = time.time()
+        stamp = None
+        try:
+            if committed:
+                await owner.save()
+        finally:
+            if _running.get(identifier) is execution:
+                _running.pop(identifier)
+                if (
+                    committed
+                    and owner.states.get(umo) is state
+                    and any(item is job for item in state.get("long_tasks", []))
+                ):
+                    stamp = job["updated_at"]
+    return stamp

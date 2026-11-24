@@ -2,27 +2,212 @@
 
 import copy
 import math
+import re
 import time
 import uuid
 from typing import Any
 
-from .cancellations import cancelled_match
+from .action_context import completed_action_match
+from .cancellations import cancelled_match, related
 from .conditions import validate_conditions
 from .lifecycle import appointment_updates
 from .notes import NOTE_KINDS
 
+PROJECT_SLOT_STATUSES = frozenset({"active", "paused"})
+_NOTE_CLAUSE = re.compile(r"[^，。！？；,!?;\n]+[！？!?]?")
+_NOTE_TRANSIENT = re.compile(
+    r"今天|今晚|今早|明天|昨天|刚才|目前|暂时|这次|这一回|这周|最近|此刻|现在|开玩笑|演戏|角色扮演|假设|比方说|举个例子|不是说我|这句|这句话|台词|转述"
+)
+_NOTE_PREFERENCE = re.compile(
+    r"^(?:我(?:希望|更喜欢|不喜欢)你|以后|今后|从今往后|往后|平时|每次|一直|"
+    r"请(?:叫我|称呼我|不要叫我|别叫我)|(?:别|不要)再叫我|from now on\b|always\b|please call me\b)",
+    re.IGNORECASE,
+)
+_NOTE_FACT = re.compile(
+    r"^(?:我(?:的)?(?:(?:一位|一个|那位)?朋友|家人|伴侣|对象|室友|家里人|父母|兄弟姐妹|同事|家)?"
+    r"(?:养了|养着|有|收养了|领养了)\s*(?:[一两二三四五六七八九十\d]+)?(?:只|条|匹|对)\S{0,70}(?:猫|狗|兔|鹦鹉|仓鼠|宠物|乌龟|金鱼|蜥蜴|刺猬)(?:[！!]|$)|"
+    r"我(?:叫(?!他|她|你|他们|它|别人|大家|朋友|同事)|的名字是)\s*[\w·-]{1,32}[！!]?$)"
+    r"|^(?:I (?:have|adopted)|my (?:friend|partner|family|roommate) (?:has|adopted)) (?:a|an|two) (?:pet|cat|dog|rabbit|bird)\b",
+    re.IGNORECASE,
+)
+_NOTE_STORY = re.compile(
+    r"开玩笑|演戏|角色扮演|人设|假设|比方说|举个例子|台词|转述|虚构|小说里|故事里|如果|要是|说过|听说"
+)
+_PROJECT_OPERATIONS = {
+    "pause": "paused",
+    "resume": "active",
+    "cancel": "cancelled",
+    "complete": "completed",
+    "delete": "deleted",
+}
+
 
 def resolve_project(state, task, identifier=""):
-    """Bind a known ID or a uniquely named project; never guess between matches."""
+    """Bind a known ID or a uniquely named project.
+
+    Args:
+        state: Per-conversation planning state.
+        task: Task text to match against project titles.
+        identifier: Exact project ID, if specified.
+
+    Returns:
+        The matching project, or None if missing or ambiguous.
+    """
     projects = state.get("projects", [])
     if identifier:
         return next((p for p in projects if p["id"] == identifier), None)
+    text = task.strip().casefold()
     matches = [
         p
         for p in projects
-        if len(p.get("title", "")) >= 2 and p["title"].casefold() in task.casefold()
+        if p["title"].casefold() == text
+        or (len(p["title"]) >= 2 and p["title"].casefold() in text)
     ]
+    if len(matches) > 1 and len({p["title"].casefold() for p in matches}) == 1:
+        # An explicit restart can legitimately share an older title.
+        working = [p for p in matches if p.get("status") in PROJECT_SLOT_STATUSES]
+        if len(working) == 1:
+            return working[0]
     return matches[0] if len(matches) == 1 else None
+
+
+def _matches_project(task, project):
+    """Check a queue entry against a project's title or goal.
+
+    Args:
+        task: Queued work description.
+        project: A live record or deletion marker.
+
+    Returns:
+        Whether the text matches, including short exact names.
+    """
+    text = task.strip().casefold()
+    return bool(text) and any(
+        value and (text == value.casefold() or related(text, value))
+        for value in (project.get("title", ""), project.get("goal", ""))
+    )
+
+
+def blocked_project_task(state, task, identifier=""):
+    """Recognize work targeting a paused, terminal, or deleted project.
+
+    Args:
+        state: Per-conversation planning state.
+        task: Candidate work description.
+        identifier: Exact project ID, if already bound.
+
+    Returns:
+        Whether the work must not proceed automatically.
+    """
+    project = resolve_project(state, task, identifier)
+    deleted = state.get("deleted_projects", [])
+    if identifier:
+        return (
+            project.get("status") != "active"
+            if project is not None
+            else any(row["id"] == identifier for row in deleted)
+        )
+    if project is not None:
+        return project.get("status") != "active"
+    return any(
+        row.get("status") != "active" and _matches_project(task, row)
+        for row in (*state.get("projects", []), *deleted)
+    )
+
+
+def _stop_project_work(state, project, status):
+    """Detach queued plans and deactivate or delete only this project's checkpoints.
+
+    Args:
+        state: Per-conversation planning state.
+        project: Project whose pending work must stop.
+        status: Its destination status (including deleted).
+    """
+    identifier = project["id"]
+    legacy = state.get("execution_checkpoint")
+    checkpoints = state.get("execution_checkpoints", {})
+    linked_tasks = set()
+    for key, checkpoint in [(None, legacy), *checkpoints.items()]:
+        if not checkpoint:
+            continue
+        bound = checkpoint.get("project_id")
+        if bound != identifier and (
+            bound or not _matches_project(checkpoint.get("task", ""), project)
+        ):
+            continue
+        if checkpoint.get("task"):
+            linked_tasks.add(checkpoint["task"])
+        if status == "deleted":
+            if key is None:
+                state.pop("execution_checkpoint", None)
+            else:
+                checkpoints.pop(key)
+        else:
+            # Paused work can still be resumed explicitly with its receipts.
+            checkpoint["project_id"] = identifier
+            if status != "paused":
+                checkpoint["pending"] = False
+    manual = state.get("manual_plan", "")
+    manual_id = state.get("manual_project_id")
+    if manual_id == identifier or (
+        not manual_id and (manual in linked_tasks or _matches_project(manual, project))
+    ):
+        state.update(manual_plan="", manual_project_id="", manual_plan_expires_at=0)
+        if manual:
+            linked_tasks.add(manual)
+    for key in ("future_task", "next_task"):
+        task = state.get(key, "")
+        if task in linked_tasks or (
+            not (manual_id and manual_id != identifier and task == manual)
+            and _matches_project(task, project)
+        ):
+            state[key] = ""
+            if key == "next_task":
+                state.update(window_end=0, window_admitted=False)
+
+
+def control_project(state, identifier, operation, *, max_projects=5):
+    """Apply an explicit user lifecycle action to a persisted project.
+
+    Args:
+        state: Per-conversation planning state to update.
+        identifier: Exact ID of the user-selected project.
+        operation: One of pause, resume, cancel, complete, or delete.
+        max_projects: Maximum number of active and paused projects.
+
+    Returns:
+        The updated project or, for deletion, the removed project.
+
+    Raises:
+        ValueError: The action or project ID is invalid, or resuming exceeds capacity.
+    """
+    if not isinstance(operation, str) or operation not in _PROJECT_OPERATIONS:
+        raise ValueError("Invalid project operation")
+    project = resolve_project(state, "", identifier) if identifier else None
+    if project is None:
+        raise ValueError("项目不存在或已删除，请刷新")
+    status = _PROJECT_OPERATIONS[operation]
+    if status != "deleted":
+        apply_plan(
+            state,
+            {"project_updates": [{"id": identifier, "status": status}]},
+            explicit_edit=True,
+            max_projects=max_projects,
+        )
+        return resolve_project(state, "", identifier)
+
+    _stop_project_work(state, project, status)
+    state["deleted_projects"] = [
+        *state.get("deleted_projects", []),
+        {
+            "id": identifier,
+            "title": project["title"],
+            "goal": project.get("goal", ""),
+            "at": time.time(),
+        },
+    ]
+    state["projects"] = [p for p in state["projects"] if p["id"] != identifier]
+    return project
 
 
 def filter_project_updates(state, payload):
@@ -69,7 +254,7 @@ project_updates: 最多 3 项，每项为
  "progress":"实际完成部分或正文草稿","next_step":"下一步","artifact":"实际作品位置或引用",
  "status":"active|paused|completed|cancelled"}。
 新建或更新项目时必须保留有用的已有进展；不能把设想记成已完成。
-paused/cancelled/completed 项目不自动继续，只有用户明确要求恢复才改回 active。
+paused/cancelled/completed 项目不自动继续，不新建同名项目替代；只有用户在网页明确恢复才改回 active。
 连续失败或长期未推进的项目先重新判断价值、修改方法或暂停，不重复同一失败动作。
 创作较长时通过实际可用的文件工具保存作品，artifact 只记录真实返回的位置；
 没有文件工具时，可将短草稿写在 progress，后续接着推进。
@@ -97,7 +282,7 @@ project_updates 只能引用“持续项目”列表中的本插件ID；陪伴�
 短篇、单幅画和一次性创作默认是有限作品，不是无限连载。先确定适量范围与收尾点，优先完成现有作品，不因还有灵感不断追加章节。只有用户明确要求连载或长期创作才保持开放式目标。
 每次保存一段只表示片段保存，不代表整篇完成；但“可以再润色、等待感想、以后还可续写”不是必须保持未完成的理由。达到原目标、有完整结尾即可 completed，next_step 置空。新的续篇另作候选，不自动续写已完成作品。
 progress 最多6000字符，只存摘要或短草稿；长正文先保存为文件再记录 artifact，不要用一句摘要替换唯一正文。
-同名项目应更新原ID，不重复新建；达到5项时不新增。参考 last_attempt_at 兼顾久未推进的项目，retry_after 到期前不重复尝试。
+同名进行中项目应更新原ID，不重复新建。进行中和暂停项目合计最多5项；已完成和已取消项目保留记录，但不占名额。参考 last_attempt_at 兼顾久未推进的项目，retry_after 到期前不重复尝试。
 """
 
 CHAT_PLANNING_PROMPT = (
@@ -108,17 +293,11 @@ CHAT_PLANNING_PROMPT = (
 还可包含 note_updates: [{"key":"这条的主题","value":"具体内容",
 "kind":"preference 或 fact 或 interest","evidence":"用户原话中的连续片段",
 "confirmed":true 或 false,"drop":可选，true 表示删掉这个主题}]，每轮最多 3 条改动。
-三个 kind 的区别：preference 是"你该怎么对待用户"（作息、语气、称呼、不喜欢的话题），会约束你开口的时间、话题与语气；
-fact 是关于用户的事实（身份、职业、居住、家人宠物、重要日程）；interest 是用户的爱好与口味。
-拿不准算偏好还是事实时，用 fact，不要用 preference 乱加限制。
-key 用稳定短标签，同一件事必须复用同一个 key，不要造近义 key。
-evidence 必须逐字复制用户本轮原话的连续片段，不能改写、拼接或用自己的总结代替，否则整条会被丢弃。
-preference 只能来自用户明确表达，不能由沉默、未回复或助手的话推断；它记的是以后要反复照做的约束，一次性的"这次想听个故事"属于临时计划。
-confirmed 只在用户本人明确说出或明确确认过时为 true；从语气猜的、从上下文推的、助手说的，一律 false。preference 视为已确认。
-只记稳定、以后还用得上的信息；不记情绪、临时状态、一次性经历、别人的隐私；身份证号、门牌号、密码、账号这类敏感信息一律不记。
-不限条数。人是会变的：用户改口、搬家、换工作、分手、戒掉某个习惯时，用同一个 key 写成新说法覆盖旧的（旧说法会自动留一份做对比）；
-发现某条已经彻底不对或当初就记错了，就在同一条里带 "drop": true 删掉它，不要留着自相矛盾的旧记录。
-和已有记录对不上、又没有用户原话支撑时，不要改也不要删。没有值得改的就省略这个字段。
+自动记事只用 preference（用户明确要求长期如何互动）与 fact（有助于陪伴的、用户明确陈述的事实）。用户是陪伴对象，不是助手。
+例如：『以后叫我白』『平时聊天别用敬语』是长期互动偏好；『我朋友养了只叫团子的猫』是关于用户身边关系的事实，必须保留“朋友”，不能改为用户本人养猫，也不能推成用户喜欢猫。
+『那个插件不再用了，也不打算继续修』是特定事项的决定，不是长期偏好或个人事实；只有明确关联现有事项时才走项目／取消逻辑。临时请求、偶遇、角色扮演、引用和问题不入库，日期约定走约定字段。
+key 用稳定短标签，同类同主题才复用；evidence 必须完整逐字复制本轮原话中的一段独立陈述，保留主语、否定和时间限定，不能只截关键词。value 使用原话，不补人物、对象、细节或推断。
+不要自动删除记录；不要替用户改写手动添加、固定或不同类别的条目。拿不准、只说了一次要做什么、没有值得记的内容时，省略 note_updates。
 """
     + PLANNING_PROMPT
 )
@@ -139,7 +318,9 @@ def apply_plan(
         state: Per-conversation state to update.
         payload: Model control object.
         user_text: Actual user text used to verify preference evidence.
-        max_projects: Maximum number of retained projects.
+        max_projects: Maximum number of active and paused projects.
+        allow_completion: Whether the current phase may report completion.
+        explicit_edit: Whether a person explicitly requested the change.
 
     Raises:
         ValueError: A supplied field violates the planning contract.
@@ -155,9 +336,6 @@ def apply_plan(
     if "future_task" in payload:
         if not isinstance(payload["future_task"], str):
             raise ValueError("Invalid future task")
-        proposed = payload["future_task"].strip()[:2000]
-        if not cancelled_match(state, proposed):
-            changes["future_task"] = proposed
     if "next_check_minutes" in payload:
         delay = payload["next_check_minutes"]
         if (
@@ -170,38 +348,46 @@ def apply_plan(
     updates = payload.get("project_updates", [])
     if not isinstance(updates, list) or len(updates) > 3:
         raise ValueError("Invalid project updates")
-    projects = copy.deepcopy(state.get("projects", []))
+    projects = copy.deepcopy(state.get("projects", [])) if updates else []
+    stopped = {}
+    cancellations = state.get("cancelled_tasks", [])
     for update in updates:
         if not isinstance(update, dict):
             raise ValueError("Invalid project")
-        if cancelled_match(
-            state, str(update.get("title", "")) + " " + str(update.get("goal", ""))
-        ):
-            continue
-        if any(
-            update.get("id") == deleted["id"]
-            or (not update.get("id") and update.get("title") == deleted["title"])
-            for deleted in state.get("deleted_projects", [])
-        ):
-            continue
         fields = {"id", "title", "goal", "progress", "next_step", "artifact", "status"}
         if any(
             key not in fields or not isinstance(value, str)
             for key, value in update.items()
         ):
             raise ValueError("Invalid project field")
-        existing = next((p for p in projects if p["id"] == update.get("id")), None)
-        if not update.get("id") and update.get("title"):
+        identifier = update.get("id", "")
+        title = update.get("title", "").strip()[:1000].casefold()
+        existing = next((p for p in projects if p["id"] == identifier), None)
+        if not identifier and title:
+            same_title = [p for p in projects if p["title"].casefold() == title]
             existing = next(
-                (
-                    p
-                    for p in projects
-                    if p["title"].casefold() == update["title"].strip().casefold()
-                ),
-                None,
+                (p for p in same_title if p.get("status") in PROJECT_SLOT_STATUSES),
+                None if explicit_edit else next(iter(same_title), None),
             )
-        if update.get("id") and existing is None:
+        if identifier and existing is None:
+            if not explicit_edit and any(
+                row["id"] == identifier for row in state.get("deleted_projects", [])
+            ):
+                continue
             raise ValueError("Unknown project ID")
+        if not explicit_edit and (
+            cancelled_match(
+                state, update.get("title", "") + " " + update.get("goal", "")
+            )
+            or (
+                existing is None
+                and any(
+                    title == row["title"].casefold()
+                    for row in state.get("deleted_projects", [])
+                )
+            )
+        ):
+            continue
         # Only an explicit dashboard action may resume a retired/paused project.
         # Old model context must not overwrite its status or progress.
         if (
@@ -215,6 +401,8 @@ def apply_plan(
                 "项目进展超过6000字符，请先保存完整正文为作品文件，再记录摘要和引用"
             )
         update = dict(update)
+        if "status" in update:
+            update["status"] = update["status"].strip()
         if update.get("status") == "completed" and not allow_completion:
             update.pop("status")
         if (
@@ -227,8 +415,11 @@ def apply_plan(
         for key, value in update.items():
             if key != "id":
                 project[key] = value.strip()[: 6000 if key == "progress" else 1000]
-        if project["status"] not in {"active", "paused", "completed", "cancelled"}:
+        status = project["status"]
+        if status not in {"active", "paused", "completed", "cancelled"}:
             raise ValueError("Invalid project status")
+        if status == "completed":
+            project["next_step"] = ""
         if not project.get("title"):
             raise ValueError("Project title is required")
         project["updated_at"] = time.time()
@@ -262,14 +453,33 @@ def apply_plan(
                     }
                 ]
             )[-8:]
+        old_status = (existing or {}).get("status")
+        if status != "active" and status != old_status:
+            stopped[project["id"]] = (existing or project, status)
+        elif status == "active":
+            stopped.pop(project["id"], None)
+            if explicit_edit and (not identifier or old_status != "active"):
+                cancellations = [
+                    row
+                    for row in cancellations
+                    if not _matches_project(row["text"], project)
+                ]
         if existing is not None:
             projects[projects.index(existing)] = project
-        elif len(projects) < max_projects:
-            projects.append(project)
         else:
-            raise ValueError("最多保留5个持续项目，请先删除旧项目；未覆盖已有项目")
+            projects.append(project)
     if updates:
+        occupied_before = sum(
+            p.get("status") in PROJECT_SLOT_STATUSES for p in state.get("projects", [])
+        )
+        occupied_after = sum(p.get("status") in PROJECT_SLOT_STATUSES for p in projects)
+        if occupied_after > max(max_projects, occupied_before):
+            raise ValueError(
+                f"最多保留{max_projects}个进行中或暂停项目，请先结束或删除旧项目"
+            )
         changes["projects"] = projects
+    if cancellations != state.get("cancelled_tasks", []):
+        changes["cancelled_tasks"] = cancellations
     updates = payload.get("note_updates", [])
     # 兼容旧字段名：偏好与印象曾经分开输出
     legacy = [
@@ -295,6 +505,16 @@ def apply_plan(
         if isinstance(note, dict)
     }
     touched = False
+    clauses = (
+        []
+        if _NOTE_STORY.search(user_text)
+        or re.search(
+            r"(?:朋友|同事|对象|家人|别人|网友).{0,12}(?:说|问|写)|(?:他|她|他们|有人)说",
+            user_text,
+        )
+        or any(mark in user_text for mark in '“”「」『』"`')
+        else [clause.strip() for clause in _NOTE_CLAUSE.findall(user_text)]
+    )
     for item in merged[:6]:
         if (
             not isinstance(item, dict)
@@ -311,6 +531,49 @@ def apply_plan(
         if not (key and evidence and evidence in user_text):
             # 没有逐字原话依据，或原话不在本轮发言里：整条丢弃
             continue
+        old = retained_notes.get(key, {})
+        kind = item.get("kind") if item.get("kind") in NOTE_KINDS else "fact"
+        if not explicit_edit:
+            if (
+                item.get("kind") not in ("preference", "fact")
+                or item.get("drop") is True
+                or (
+                    old
+                    and (
+                        key not in evidence
+                        or old.get("kind") != kind
+                        or old.get("pinned")
+                        or old.get("source") == "manual"
+                    )
+                )
+                or not 3 <= len(evidence) <= 240
+                or evidence not in clauses
+                or evidence.endswith(("?", "？"))
+                or _NOTE_TRANSIENT.search(evidence)
+                or re.search(
+                    r"测试一下|帮我|能不能|能否|可以吗|身份证|密码|验证码|门牌号",
+                    evidence,
+                )
+            ):
+                continue
+            if kind == "preference" and (
+                not _NOTE_PREFERENCE.match(evidence)
+                or not re.search(
+                    r"叫我|称呼我|发消息|发语音|回复|跟我|和我|聊天|语气|敬语|称呼|开口|说话|感叹号|打扰|提起|话题|联系我|\b(?:call me|message me|reply|address me|contact me)\b",
+                    evidence,
+                    re.IGNORECASE,
+                )
+            ):
+                continue
+            if kind == "fact" and not _NOTE_FACT.match(evidence):
+                continue
+            # Persist the literal statement rather than a model-expanded claim.
+            value = evidence
+            if not old:
+                # A model-generated title must not introduce a new person or fact.
+                key = key if key in evidence else evidence[:80]
+                if key in retained_notes:
+                    continue
         if item.get("drop") is True:
             # 人变了或当初记错了：她可以主动删掉这一条
             retained_notes.pop(key, None)
@@ -332,7 +595,9 @@ def apply_plan(
             "value": value,
             "kind": kind,
             # 偏好来自用户明确表达，天然是已确认的；其余按模型给出的确认状态
-            "confirmed": True if kind == "preference" else item.get("confirmed") is True,
+            "confirmed": True
+            if kind == "preference"
+            else item.get("confirmed") is True,
             "evidence": evidence[:300],
             "created_at": old.get("created_at", time.time()),
             "updated_at": time.time(),
@@ -352,5 +617,15 @@ def apply_plan(
         # 不设条数上限：人会变，新的说法覆盖旧的，旧的留一份做对比
         changes["notes"] = retained_notes
     state.update(changes)
+    for project, status in stopped.values():
+        _stop_project_work(state, project, status)
+    if "future_task" in payload:
+        proposed = payload["future_task"].strip()[:2000]
+        if not proposed or (
+            not cancelled_match(state, proposed)
+            and not completed_action_match(state, proposed)
+            and not blocked_project_task(state, proposed, payload.get("project_id", ""))
+        ):
+            state["future_task"] = proposed
     if state.get("manual_plan"):
         state["future_task"] = state["manual_plan"]

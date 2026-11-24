@@ -200,7 +200,7 @@
   "default": 40
  },
  "morning_report_enabled": {
-  "description": "每天早上用她自己的话汇报昨晚做了什么、卡在哪、等你什么、今晚打算",
+  "description": "到设定时间后，有实际成果、卡点或待处理事项才主动汇报；不会复述旧聊天",
   "type": "bool",
   "default": true
  },

@@ -20,6 +20,8 @@ function tab(name) {
     const on = element.dataset.tab === name;
     element.classList.toggle("active", on);
     element.setAttribute("aria-selected", String(on));
+    element.tabIndex = on ? 0 : -1;
+    if (on) $("current-view").textContent = element.querySelector(".tab-label")?.textContent || "总览";
   });
   renderView(name);
 }
@@ -97,20 +99,33 @@ function metricIcon(name) {
 }
 
 function renderMetrics(list) {
+  if (changed("welcome", [list.length, data.enabled, data.config?.targets?.length])) {
+    const configured = list.length > 0;
+    $("overview-title").textContent = configured ? "陪伴近况" : "从一次自然的陪伴开始";
+    $("welcome-description").textContent = configured
+      ? (data.enabled ? "在这里查看陪伴状态、下一次判断和已保存的作品。" : "主动陪伴目前已停用。你仍可以查看之前的计划、作品和记录。")
+      : data.config?.targets?.length ? "已有对象配置，但暂时没有可用的私聊。检查 QQ 平台是否在线、配置是否正确。" : "为一个对象开启陪伴，Bot 会在合适的时候自己判断要不要开口，也可以安静地做事。";
+    const action = $("welcome-action");
+    action.dataset.jump = configured ? "plans" : "settings";
+    action.textContent = configured ? "查看陪伴计划 ↗" : "设置陪伴对象 ↗";
+    $("first-steps").hidden = configured;
+    $("metrics").hidden = !configured;
+  }
   const projects = list.flatMap(item => item.state.projects || []);
   const pending = list.reduce((count, item) => count + (item.state.outbox || []).filter(entry => entry.status === "pending").length, 0);
   const active = list.filter(item => item.running).length;
   const speakList = list.filter(item => item.state.next_speak_at);
   const speakAt = speakList.map(item => item.state.next_speak_at).sort((a, b) => a - b)[0] || 0;
   const cards = [
-    ["people", "accent", "陪伴对象", list.length],
-    ["pulse", active ? "ok" : "", "正在行动", active],
-    ["clock", speakList.length ? "accent" : "", speakAt ? `约好开口 · ${soonText(speakAt)}` : "约好开口", speakList.length],
-    ["folder", projects.filter(item => item.status === "active").length ? "accent" : "", "持续项目", projects.filter(item => item.status === "active").length],
-    ["outbox", pending ? "warn" : "", "待分享", pending],
+    ["people", "accent", "陪伴对象", list.length, "settings"],
+    ["pulse", active ? "ok" : "", "正在行动", active, "activity"],
+    ["clock", speakList.length ? "accent" : "", "主动开口计划", speakList.length, "plans", speakAt ? soonText(speakAt) : "暂无安排"],
+    ["folder", "accent", "进行中项目", projects.filter(item => item.status === "active").length, "plans"],
+    ["outbox", pending ? "warn" : "", "待分享作品", pending, "works"],
   ];
-  $("metrics").innerHTML = cards.map(([icon, tone, label, value]) =>
-    `<div class="stat" data-tone="${tone}"><span class="stat-icon">${metricIcon(icon)}</span><div><b>${value}</b><span>${label}</span></div></div>`
+  if (!changed("metrics", cards)) return;
+  $("metrics").innerHTML = cards.map(([icon, tone, label, value, jump, help]) =>
+    `<button type="button" class="stat" data-tone="${tone}" data-jump="${jump}"><span class="stat-top"><span class="stat-icon">${metricIcon(icon)}</span><span aria-hidden="true" class="stat-arrow">↗</span></span><b>${value}</b><span class="stat-label">${label}</span>${help ? `<small>${escapeHTML(help)}</small>` : ""}</button>`
   ).join("");
 }
 
@@ -269,22 +284,22 @@ function renderActivity() {
 }
 
 const groups = [
-  ["对象与运行",["enabled","targets","platform_id"],"谁在被陪伴、总开关在哪。填好 QQ 号保存后即持续运行。"],
-  ["陪伴与人格",["companion_integration","livingmemory_integration","expose_plugin_hooks","proactive_segmented_reply","proactive_segment_chars","proactive_segment_interval_ms","general_execution_contract","task_completion_message","natural_task_closing","extra_prompt"],"和别的插件怎么配合、一句话要不要拆成几条发、做完事要不要交代一句、额外的语气要求。"],
-  ["节奏与自主性",["manual_task_ttl_minutes","adaptive_frequency","frequency_min_minutes","frequency_max_minutes","interval_minutes","jitter_minutes","continuation_window_minutes","max_rounds","tool_event_wakeup"],"多久判断一次、能不能自己调频率、一次主动能连续做多少事。"],
-  ["自己约定的开口",["self_scheduled_speak","next_speak_min_minutes","next_speak_max_minutes","speak_wish_ttl_hours"],"她自己约下次开口的时间（到点专门唤醒一次），以及心里存着的话保留多久。"],
-  ["夜间与晨间",["split_night_budget","night_window_start_hour","night_window_end_hour","night_budget_percent","morning_report_enabled","morning_report_hour","morning_report_min_gap_hours","morning_report_max_chars","morning_report_timeout_seconds"],"夜里单独算一份额度，免得半夜把白天的预算花光；早上醒来先用她自己的话讲一遍昨晚发生了什么。"],
-  ["记忆与整理",["chat_planning","preference_stale_days","activity_half_life_days","action_digest_chars","external_text_chars"],"从日常聊天整理计划与关于你的记录；读进来的外部文本最多塞多少字。"],
-  ["每日预算 · 每个对象独立",["ignore_budget_while_active","daily_check_limit","daily_round_limit","daily_tool_limit","daily_message_limit"],"保护阈值：判断、回合、工具、发送分开计数，用完就停，不跨天补。夜里的那份见「夜间与晨间」。"],
-  ["工具、超时与上下文",["max_tool_calls","max_agent_steps","turn_timeout_seconds","tool_timeout_seconds","recent_chat_grace_seconds","history_messages","history_chars","memory_timeout_seconds","allowed_tools","check_comfyui_each_round","comfyui_url","template_mcp_server"],"单轮工具上限、超时与上下文窗口。没有特殊需要不必改。",true],
-  ["文件与命令",["file_tools_enabled","file_tools_root","file_tools_extra_read_roots","file_tools_snapshot_before_write","allow_shell_commands","shell_command_timeout"],"让她读你本机的文件、必要时执行命令。改文件前先留快照；命令默认关闭，想开再开。",true],
-  ["条件查询与作品目录",["condition_query_tools","condition_file_roots","work_library_roots"],"允许她只读检查的服务与目录、补充的作品路径。"],
-  ["高级 · 发送守卫",["state_claim_guard","tool_work_message","delivery_tools","action_memory_write","pending_message_ttl_hours"],"发送前自检、工具回执与后台轮暂存策略。一般不用改。",true],
-  ["高级 · DSH 集成",["dsh_enabled","dsh_command","dsh_home","dsh_working_dir","dsh_timeout","dsh_snapshot_before_task","dsh_snapshot_keep","dsh_max_result_chars","dsh_max_concurrency","dsh_api_key","dsh_base_url"],"接入本机 DSH/DeepSeek 工具链时才需要；不接就保持关闭。",true],
+  ["对象与运行",["targets","platform_id","enabled"],"设置谁会收到陪伴消息。"],
+  ["陪伴与人格",["companion_integration","livingmemory_integration","expose_plugin_hooks","proactive_segmented_reply","proactive_segment_chars","proactive_segment_interval_ms","general_execution_contract","task_completion_message","natural_task_closing","extra_prompt"],"调整消息怎么发、任务怎么收尾，以及和其他插件怎么配合。"],
+  ["节奏与自主性",["manual_task_ttl_minutes","adaptive_frequency","frequency_min_minutes","frequency_max_minutes","interval_minutes","jitter_minutes","continuation_window_minutes","max_rounds","tool_event_wakeup"],"调整多久判断一次，以及一段时间内最多做几轮。"],
+  ["自己约定的开口",["self_scheduled_speak","next_speak_min_minutes","next_speak_max_minutes","speak_schedule_limit","speak_wish_ttl_hours"],"调整她能约多远、同时保留几个约定，以及没说出口的话保留多久。"],
+  ["夜间与晨间",["split_night_budget","night_window_start_hour","night_window_end_hour","night_budget_percent","morning_report_enabled","morning_report_hour","morning_report_min_gap_hours","morning_report_max_chars","morning_report_timeout_seconds"],"为夜间单独计算额度，或让她早上讲讲昨晚发生了什么。"],
+  ["记忆与整理",["chat_planning","preference_stale_days","activity_half_life_days","action_digest_chars","external_text_chars"],"调整怎么从聊天整理计划、多久复核偏好，以及读多少外部文字。"],
+  ["每日预算 · 每个对象独立",["ignore_budget_while_active","daily_check_limit","daily_round_limit","daily_tool_limit","daily_message_limit"],"分别限制每天判断、行动、调用工具和尝试发消息的次数。"],
+  ["工具、超时与上下文",["max_tool_calls","max_agent_steps","turn_timeout_seconds","tool_timeout_seconds","recent_chat_grace_seconds","history_messages","history_chars","memory_timeout_seconds","allowed_tools","check_comfyui_each_round","comfyui_url","template_mcp_server"],"控制每轮能用哪些工具、等多久，以及参考多少聊天内容。"],
+  ["文件与命令",["file_tools_enabled","file_tools_root","file_tools_extra_read_roots","file_tools_snapshot_before_write","allow_shell_commands","shell_command_timeout"],"设置可访问的本机目录、写入前备份，以及是否允许执行命令。"],
+  ["条件查询与作品目录",["condition_query_tools","condition_file_roots","work_library_roots"],"设置可只读检查的服务和目录，以及去哪里找已有作品。"],
+  ["高级 · 发送守卫",["state_claim_guard","tool_work_message","delivery_tools","action_memory_write","pending_message_ttl_hours"],"调整发送前怎么检查消息，以及暂时没发出的内容怎么处理。"],
+  ["高级 · DSH 集成",["dsh_enabled","dsh_command","dsh_home","dsh_working_dir","dsh_timeout","dsh_snapshot_before_task","dsh_snapshot_keep","dsh_max_result_chars","dsh_max_concurrency","dsh_api_key","dsh_base_url"],"只在需要连接本机 DSH 时配置；不使用就保持关闭。"],
 ];
 const names = {
   enabled: "持续运行", targets: "对象 QQ 号", platform_id: "QQ 平台实例",
-  companion_integration: "适配陪伴插件", livingmemory_integration: "适配 LivingMemory",
+  companion_integration: "可选适配我会永远陪着你", livingmemory_integration: "适配 LivingMemory",
   expose_plugin_hooks: "对外暴露插件钩子",
   proactive_segmented_reply: "她的消息分段发送",
   proactive_segment_chars: "每段最多 / 字",
@@ -297,7 +312,7 @@ const names = {
   frequency_max_minutes: "最长间隔 / 分钟", interval_minutes: "基础检查间隔 / 分钟",
   self_scheduled_speak: "自己约定开口时间", next_speak_min_minutes: "开口约定最短 / 分钟",
   next_speak_max_minutes: "开口约定最长 / 分钟",
-  speak_wish_ttl_hours: "想说的话保留 / 小时",
+  speak_schedule_limit: "同时保留的开口约定数", speak_wish_ttl_hours: "想说的话保留 / 小时",
   split_night_budget: "夜里单独算一份额度",
   night_window_start_hour: "夜里从几点算起",
   night_window_end_hour: "夜里到几点结束",
@@ -332,35 +347,89 @@ const names = {
   dsh_snapshot_before_task: "接任务前留快照",
   dsh_snapshot_keep: "保留几份快照",
 };
-names.companion_integration="可选适配我会永远陪着你";
-function fieldHTML(key) {
+function fieldHTML(key, options = {}) {
   const spec = data.schema[key];
+  const title = options.title || names[key] || spec.description.split(/[（(]/)[0];
+  if (key === "dsh_api_key") {
+    return `<label class="field"><span>${escapeHTML(title)}</span><input data-config="${key}" type="password" autocomplete="new-password" maxlength="10000" spellcheck="false"><span class="hint">仅填写新密钥；留空保持不变。</span></label>`;
+  }
   const value = data.config[key];
-  const title = names[key] || spec.description.split(/[（(]/)[0];
-  const hint = spec.description === title ? "" : `<span class="hint">${escapeHTML(spec.description)}</span>`;
+  const description = options.description || spec.description;
+  const hint = description === title ? "" : `<span class="hint">${escapeHTML(description)}</span>`;
   if (spec.type === "bool") {
-    return `<label class="check wide"><input type="checkbox" data-config="${key}" ${value ? "checked" : ""}><span>${escapeHTML(title)}</span>${hint}</label>`;
+    return `<label class="check"><input type="checkbox" data-config="${key}" ${value ? "checked" : ""}><span>${escapeHTML(title)}</span>${hint}</label>`;
   }
   let input;
   if (key === "platform_id") {
-    input = `<select data-config="${key}"><option value="">自动识别唯一 OneBot 平台</option>${data.platforms.map(item => `<option value="${escapeHTML(item.id)}" ${value === item.id ? "selected" : ""}>${escapeHTML(item.id)} · ${escapeHTML(item.name)}</option>`).join("")}${value && !data.platforms.some(item => item.id === value) ? `<option selected value="${escapeHTML(value)}">${escapeHTML(value)}（当前未加载）</option>` : ""}</select>`;
+    const platforms = options.platforms;
+    input = `<select data-config="${key}"><option value="">${platforms.length === 1 ? "自动使用唯一的 QQ 平台" : "自动识别（仅有一个 QQ 平台时有效）"}</option>${platforms.map(item => `<option value="${escapeHTML(item.id)}" ${value === item.id ? "selected" : ""}>${escapeHTML(item.id)}</option>`).join("")}${value && !platforms.some(item => item.id === value) ? `<option selected value="${escapeHTML(value)}">${escapeHTML(value)}（当前不可用于 QQ 号）</option>` : ""}</select>`;
   } else if (spec.type === "list" || spec.type === "text") {
-    input = `<textarea data-config="${key}" ${spec.type === "text" ? 'maxlength="10000"' : ""} placeholder="${key === "targets" ? "每行一个 QQ 号，例如：123456789" : ""}">${escapeHTML(Array.isArray(value) ? value.join("\n") : value)}</textarea>`;
+    input = `<textarea data-config="${key}" ${spec.type === "text" ? 'maxlength="10000"' : ""} ${key === "targets" ? 'rows="2" spellcheck="false" placeholder="例如：123456789"' : ""}>${escapeHTML(Array.isArray(value) ? value.join("\n") : value)}</textarea>`;
   } else {
     input = `<input data-config="${key}" type="${spec.type === "int" ? "number" : "text"}" ${spec.type === "int" ? 'min="0" max="100000"' : ""} value="${escapeHTML(value)}">`;
   }
-  return `<label class="field ${spec.type === "text" || key === "targets" ? "wide" : ""}"><span>${escapeHTML(title)}</span>${input}${hint}</label>`;
+  return `<label class="field${["list", "text"].includes(spec.type) ? " wide" : ""}"><span>${escapeHTML(title)}</span>${input}${hint}</label>`;
 }
 
 function renderSettings() {
-  $("config-fields").innerHTML = groups.map(([title, keys, lead, collapsed]) => {
-    const body = `<div class="field-grid">${keys.filter(key => data.schema[key]).map(fieldHTML).join("")}</div>`;
-    const sub = lead ? `<p class="hint">${escapeHTML(lead)}</p>` : "";
-    if (collapsed) {
-      return `<details class="panel"><summary><span>${title}</span><span class="hint">${keys.length} 项 · 默认收起</span></summary><div class="panel-body stack">${sub}${body}</div></details>`;
-    }
-    return `<section class="panel"><div class="panel-head"><div><h2>${title}</h2>${sub}</div></div>${body}</section>`;
+  const host = $("config-fields");
+  const opened = new Set([...host.querySelectorAll("details[data-settings-section][open]")].map(section => section.dataset.settingsSection));
+  const [[title, basicKeys, lead], ...advancedGroups] = groups;
+  // Match the adapter name used by the backend to resolve bare QQ numbers.
+  const platforms = data.platforms.filter(item => item.name === "aiocqhttp");
+  const platform = data.config.platform_id;
+  const unavailable = Boolean(platform && !platforms.some(item => item.id === platform));
+  const showPlatform = platforms.length > 1 || (platforms.length === 1 && unavailable);
+  const targetCount = (data.config.targets || []).length;
+  const [targets, platformId, enabled] = basicKeys;
+  const platformField = data.schema[platformId] ? fieldHTML(platformId, {
+    title: showPlatform ? "02 · 选择 QQ 平台" : "QQ 平台实例",
+    description: "选择由哪个 QQ 机器人发送陪伴消息。填完整私聊会话 ID 时，不需要选。",
+    platforms,
+  }) : "";
+  const platformNote = !platforms.length
+    ? "未检测到 QQ 平台。使用 QQ 号前，请先在 AstrBot 添加并启用 OneBot 平台。"
+    : showPlatform
+      ? unavailable ? "上次选择的 QQ 平台当前不可用，请改选。" : "检测到多个 QQ 平台。使用 QQ 号时，请选择一个。"
+      : platform ? `QQ 平台：${platform}` : `将自动使用 QQ 平台：${platforms[0].id}`;
+  const advanced = advancedGroups.map(([groupTitle, keys, description]) => {
+    const present = keys.filter(key => data.schema[key]);
+    if (!present.length) return "";
+    return `<details class="panel settings-group" data-settings-section="${keys[0]}"${opened.has(keys[0]) ? " open" : ""}>
+      <summary><span class="settings-summary"><strong>${escapeHTML(groupTitle)}</strong><span class="hint">${escapeHTML(description)}</span></span><span class="pill">${present.length} 项</span></summary>
+      <div class="field-grid">${present.map(key => fieldHTML(key)).join("")}</div>
+    </details>`;
   }).join("");
+  host.innerHTML = `
+    <section class="panel settings-setup" aria-labelledby="settings-setup-title">
+      <div class="settings-setup-head">
+        <div><h3 id="settings-setup-title">${escapeHTML(title)}</h3><p class="hint">${escapeHTML(lead)}</p></div>
+        <span class="pill">${targetCount ? `已保存 ${targetCount} 个对象` : "尚未添加对象"}</span>
+      </div>
+      <div class="settings-setup-fields">
+        ${data.schema[targets] ? fieldHTML(targets, { title: "01 · 添加对象 QQ 号", description: "每行填一个 QQ 号；也支持填写完整私聊会话 ID。" }) : ""}
+        ${showPlatform ? platformField : ""}
+        <p class="settings-platform-note hint">${escapeHTML(platformNote)}</p>
+        <details class="panel settings-runtime" data-settings-section="runtime"${opened.has("runtime") ? " open" : ""}>
+          <summary>运行开关${!showPlatform && platformField ? "与平台选项" : ""}</summary>
+          <div class="field-grid">
+            ${data.schema[enabled] ? fieldHTML(enabled, { description: "开启后会自动安排陪伴；关闭后保留对象，但暂停运行。" }) : ""}
+            ${showPlatform ? "" : platformField}
+          </div>
+        </details>
+      </div>
+      <div class="settings-save-row">
+        <p class="hint">${data.config.enabled ? "保存后自动生效，无需重启。" : "持续运行已关闭，可在「运行开关」里开启。"}</p>
+        <button class="btn-primary" id="save-settings" type="submit" data-settings-save>保存设置</button>
+      </div>
+    </section>
+    <details class="panel settings-advanced" data-settings-section="advanced"${opened.has("advanced") ? " open" : ""}>
+      <summary><span class="settings-summary"><strong>更多设置</strong><span class="hint">默认值就能用。想调整消息、时间或工具时再展开。</span></span></summary>
+      <div class="settings-advanced-body">
+        ${advanced}
+        <div class="settings-save-row"><p class="hint">保存会一起应用上方的所有改动。</p><button type="submit" data-settings-save>保存设置</button></div>
+      </div>
+    </details>`;
   loadedForm = true;
   dirty = false;
 }
@@ -442,14 +511,26 @@ document.querySelectorAll(".tab").forEach(button => {
   button.onclick = () => tab(button.dataset.tab);
 });
 document.querySelector(".tabs").addEventListener("keydown", event => {
-  if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
+  const forward = ["ArrowRight", "ArrowDown"].includes(event.key);
+  const backward = ["ArrowLeft", "ArrowUp"].includes(event.key);
+  if (!forward && !backward && !["Home", "End"].includes(event.key)) return;
   event.preventDefault();
   const tabs = [...document.querySelectorAll(".tab")];
   const index = tabs.indexOf(document.activeElement);
   if (index < 0) return;
-  const next = tabs[(index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length];
+  const next = tabs[event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (forward ? 1 : -1) + tabs.length) % tabs.length];
   next.focus();
   tab(next.dataset.tab);
+});
+$("overview").addEventListener("click", event => {
+  const jump = event.target.closest("[data-jump]");
+  if (!jump) return;
+  tab(jump.dataset.jump);
+  const heading = $(jump.dataset.jump).querySelector(".view-head h2");
+  const target = jump.id === "welcome-action" && jump.dataset.jump === "settings"
+    ? $("config-fields").querySelector('[data-config="targets"]') : null;
+  if (target) target.focus();
+  else if (heading) { heading.tabIndex = -1; heading.focus(); }
 });
 $("refresh").onclick = refresh;
 $("notice-close").onclick = () => { $("notice").hidden = true; };
@@ -485,30 +566,46 @@ document.addEventListener("click", async event => {
 });
 
 $("config-form").addEventListener("input", () => { dirty = true; });
+$("config-form").addEventListener("invalid", event => {
+  // Native validation cannot focus a field inside a closed disclosure.
+  for (let section = event.target.parentElement; section && section !== event.currentTarget; section = section.parentElement) {
+    if (section.tagName === "DETAILS") section.open = true;
+  }
+}, true);
 $("config-form").onsubmit = async event => {
   event.preventDefault();
-  if (busy) return;
+  if (busy || !data) return;
+  const form = event.currentTarget;
   const config = {};
-  document.querySelectorAll("[data-config]").forEach(element => {
+  const fields = form.querySelectorAll("[data-config]");
+  const buttons = form.querySelectorAll("[data-settings-save]");
+  fields.forEach(element => {
     const key = element.dataset.config, type = data.schema[key].type;
+    if (key === "dsh_api_key") {
+      if (element.value.trim()) config[key] = element.value;
+      element.value = "";
+      return;
+    }
     config[key] = type === "bool" ? element.checked
       : type === "int" ? Number(element.value)
       : type === "list" ? element.value.split(/[\n,，]+/).map(value => value.trim()).filter(Boolean)
       : element.value;
   });
   busy = true;
-  $("save-settings").disabled = true;
+  buttons.forEach(button => { button.disabled = true; });
+  fields.forEach(field => { field.disabled = true; });
   try {
     await api("POST", "config", config);
     dirty = false;
     loadedForm = false;
-    notice("设置已保存，调度会自动采用新配置。", "ok");
+    notice("设置已保存，无需重启。", "ok");
   } catch (error) {
     notice("保存失败：" + error.message, "bad");
   } finally {
     busy = false;
-    $("save-settings").disabled = false;
     await refresh();
+    buttons.forEach(button => { button.disabled = false; });
+    fields.forEach(field => { field.disabled = false; });
   }
 };
 

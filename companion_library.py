@@ -61,19 +61,24 @@ async def sync_companion_library(owner, umo):
             state["companion_library_status"] = "陪伴作品库暂不可用"
             return 0
         works = []
+        removed = state.get("library_removed", {})
         for work in result.get("works", []):
             if not isinstance(work, dict) or not isinstance(work.get("content"), str):
                 continue
             identifier = hashlib.sha256(
                 (umo + "\0companion\0" + str(work.get("id"))).encode()
             ).hexdigest()[:20]
+            if identifier in removed:
+                continue
             works.append(
                 {
                     "id": identifier,
                     "kind": "text",
                     "title": work.get("title", "未命名作品"),
                     "inline_content": work["content"],
-                    "content_hash": text_content_hash(work["content"], work.get("title", "")),
+                    "content_hash": text_content_hash(
+                        work["content"], work.get("title", "")
+                    ),
                     "producer": "private_companion",
                     "source_id": work.get("id"),
                     "status": work.get("status"),

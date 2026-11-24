@@ -1,15 +1,18 @@
 """Authenticated dashboard endpoints for the embedded companion page."""
 
 import asyncio
+import hashlib
 import json
+import stat
 import time
 from pathlib import Path
 
 from astrbot.api.web import request
+from astrbot.core import file_token_service
 
+from .activity import clear as clear_activity
 from .cancellations import (
     cancelled_match,
-    clear_cancelled_work,
     related,
     remember_cancellation,
 )
@@ -27,13 +30,16 @@ from .library import (
     read_library_text,
     refresh_text_fingerprints,
 )
-from .library_management import add_text_work, organize_work
+from .library_management import add_text_work, organize_work, remove_work
 from .long_tasks import control_task as control_long_task
 from .long_tasks import create_task as create_long_task
-from .outbox import enqueue_work, output_chain
 from .notes import NOTE_KINDS, migrate_user_notes
-from .activity import clear as clear_activity
-from .planning import apply_plan, resolve_project
+from .outbox import DispatchOutcome, enqueue_work, output_chain
+from .planning import apply_plan, control_project, resolve_project
+
+MEDIA_KINDS = dict.fromkeys((".mp3", ".wav", ".ogg", ".flac", ".m4a", ".opus"), "audio")
+MEDIA_KINDS.update(dict.fromkeys((".mp4", ".webm", ".m4v"), "video"))
+MEDIA_PREVIEW_MAX_BYTES = 256 * 1024 * 1024
 
 
 class CompanionPageAPI:
@@ -81,6 +87,22 @@ class CompanionPageAPI:
         for state in owner.states.values():
             usage_for(state)
             backfill_library(state)
+        # Copy indexed rows before crossing the thread boundary; never persist view metadata.
+        library_views = await asyncio.to_thread(
+            self.inspect_library_views,
+            {
+                umo: [dict(work) for work in state.get("work_library", [])]
+                for umo, state in owner.states.items()
+            },
+        )
+        public_schema = {
+            **self.schema,
+            "dsh_api_key": {
+                "type": "string",
+                "description": "DeepSeek API Key（仅填写新密钥；留空保持不变）",
+                "write_only": True,
+            },
+        }
         return {
             "status": "ok",
             "data": {
@@ -89,8 +111,9 @@ class CompanionPageAPI:
                 "config": {
                     key: owner.config.get(key, spec.get("default"))
                     for key, spec in self.schema.items()
+                    if key != "dsh_api_key"
                 },
-                "schema": self.schema,
+                "schema": public_schema,
                 "targets": targets,
                 "sessions": [
                     {
@@ -101,10 +124,7 @@ class CompanionPageAPI:
                         "pool": pool_snapshot(owner, state),
                         "state": {
                             **state,
-                            "work_library": [
-                                {k: v for k, v in work.items() if k != "inline_content"}
-                                for work in state.get("work_library", [])
-                            ],
+                            "work_library": library_views.get(umo, []),
                         },
                     }
                     for umo, state in owner.states.items()
@@ -115,6 +135,78 @@ class CompanionPageAPI:
                 ],
             },
         }
+
+    def inspect_library_views(self, catalogues):
+        """Describe indexed works without changing the catalogue or fetching URLs.
+
+        Args:
+            catalogues: Detached work rows keyed by target session.
+
+        Returns:
+            Public work rows with availability, preview eligibility and image hashes.
+        """
+        cache = getattr(self, "_image_view_hashes", {})
+        current = {}
+        for works in catalogues.values():
+            for work in works:
+                inline = isinstance(work.pop("inline_content", None), str)
+                path = work.get("path")
+                work.pop("media_preview", None)
+                work["media_kind"] = (
+                    MEDIA_KINDS.get(Path(path).suffix.lower())
+                    if isinstance(path, str)
+                    and work.get("kind") in {"file", "audio", "video"}
+                    else None
+                )
+                work["availability"] = (
+                    "inline" if inline else "missing" if path else "unavailable"
+                )
+                if (
+                    not inline
+                    and not path
+                    and work.get("kind") == "image"
+                    and work.get("url")
+                ):
+                    work["availability"] = "remote"
+                work["image_digest"] = ""
+                if not isinstance(path, str) or not path:
+                    continue
+                try:
+                    file = Path(path)
+                    if work["media_kind"] and (
+                        not file.is_absolute() or file.anchor.startswith("\\\\")
+                    ):
+                        continue
+                    info = file.stat()
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    work["availability"] = "local"
+                    work.setdefault("modified_at", info.st_mtime)
+                    if work["media_kind"]:
+                        work["media_preview"] = (
+                            "ready"
+                            if 0 < info.st_size <= MEDIA_PREVIEW_MAX_BYTES
+                            else "empty"
+                            if info.st_size == 0
+                            else "too_large"
+                        )
+                    if work.get("kind") != "image" or info.st_size > 20 * 1024 * 1024:
+                        continue
+                    key = (path, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                    if key not in current:
+                        digest = cache.get(key)
+                        if digest is None:
+                            with file.open("rb") as stream:
+                                data = stream.read(info.st_size + 1)
+                            if len(data) != info.st_size:
+                                continue
+                            digest = hashlib.sha256(data).hexdigest()
+                        current[key] = digest
+                    work["image_digest"] = current[key]
+                except (OSError, ValueError):
+                    continue
+        self._image_view_hashes = current
+        return catalogues
 
     async def diagnostics(self):
         return {"status": "ok", "data": await inspect_runtime(self.owner)}
@@ -186,6 +278,8 @@ class CompanionPageAPI:
             )
             if not valid:
                 raise ValueError("配置格式不正确：" + key)
+        if "dsh_api_key" in body and not body["dsh_api_key"].strip():
+            body = {key: value for key, value in body.items() if key != "dsh_api_key"}
         old = dict(self.owner.config)
         merged = {**old, **body}
         minimum = merged.get("frequency_min_minutes", 10)
@@ -275,7 +369,10 @@ class CompanionPageAPI:
                     "note": checks.get("note", ""),
                 }
             except Exception as exc:
-                extra["自检"] = {"targets": [], "note": "自检失败：" + type(exc).__name__}
+                extra["自检"] = {
+                    "targets": [],
+                    "note": "自检失败：" + type(exc).__name__,
+                }
             if target:
                 try:
                     extra["记忆采样"] = await memory_sample(owner, target)
@@ -288,19 +385,56 @@ class CompanionPageAPI:
                 owner.running.pop(origin, None)
         if not isinstance(umo, str) or umo not in owner.target_origins():
             raise ValueError("请先在设置中配置该对象")
+        if action == "work_media":
+            identifier = body.get("id")
+            if not isinstance(identifier, str) or not identifier:
+                raise ValueError("未找到该媒体作品")
+            work = next(
+                (
+                    row
+                    for row in owner.states.get(umo, {}).get("work_library", [])
+                    if row.get("id") == identifier
+                    and row.get("kind") in {"file", "audio", "video"}
+                ),
+                None,
+            )
+            if work is None:
+                raise ValueError("未找到该媒体作品")
+            path = work.get("path")
+            if not isinstance(path, str) or not path:
+                raise ValueError("本地媒体文件缺失")
+            file = Path(path)
+            if not file.is_absolute() or file.anchor.startswith("\\\\"):
+                raise ValueError("只能预览本地媒体文件")
+            if file.suffix.lower() not in MEDIA_KINDS:
+                raise ValueError("不支持预览此媒体格式")
+            try:
+                # Do not issue a file token for a path redirected after indexing.
+                resolved = await asyncio.to_thread(file.resolve, strict=True)
+                if resolved != file:
+                    raise ValueError("本地媒体路径已变化，请重新登记")
+                info = await asyncio.to_thread(resolved.stat)
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("本地媒体文件缺失")
+                if not 0 < info.st_size <= MEDIA_PREVIEW_MAX_BYTES:
+                    raise ValueError("媒体文件为空或超过 256 MB 预览上限")
+                # Browsers need repeat Range requests for playback and seeking.
+                token = await file_token_service.register_file(
+                    str(resolved), single_use=False
+                )
+            except (OSError, RuntimeError) as exc:
+                raise ValueError("本地媒体文件缺失或不可读取") from exc
+            return {"status": "ok", "data": {"token": token}}
         state = owner.states.setdefault(umo, owner.new_state())
         migrate_user_notes(state)
         if action == "long_task":
             operation = body.get("operation")
             if operation == "create":
-                job = create_long_task(state, body.get("title"), body.get("goal"))
+                job = create_long_task(
+                    state, body.get("title"), body.get("goal"), explicit=True
+                )
             else:
                 job = control_long_task(state, body.get("id"), operation)
-            if operation in {"pause", "cancel"}:
-                running = owner.running.get(umo)
-                if isinstance(running, asyncio.Task):
-                    running.cancel()
-                    await asyncio.gather(running, return_exceptions=True)
             if operation in {"create", "resume"}:
                 state["next_due"] = min(
                     state.get("next_due", time.time()), time.time() + 5
@@ -324,9 +458,7 @@ class CompanionPageAPI:
             count += await asyncio.wait_for(sync_companion_library(owner, umo), 20)
             await owner.save()
             return {"status": "ok", "data": {"indexed": count}}
-        if action in {"cancel_plan", "project_delete"} or (
-            action == "plan" and body.get("value") == ""
-        ):
+        if action == "cancel_plan" or (action == "plan" and body.get("value") == ""):
             owner.revisions[umo] = owner.revisions.get(umo, 0) + 1
             tasks = [
                 task
@@ -389,7 +521,9 @@ class CompanionPageAPI:
                 if not work:
                     raise ValueError("未找到该作品")
                 if work.get("producer") == "private_companion":
-                    raise ValueError("陪伴作品库条目只读，不可直接修改；请调用 companion API")
+                    raise ValueError(
+                        "陪伴作品库条目只读，不可直接修改；请调用 companion API"
+                    )
                 if not work.get("path"):
                     raise ValueError("该草稿无本地文件，无法定稿")
                 # Mark as finished
@@ -450,12 +584,9 @@ class CompanionPageAPI:
             file = await asyncio.to_thread(download_library_file, state, body.get("id"))
             return {"status": "ok", "data": file}
         elif action == "work_delete":
-            work_id = body.get("id")
-            # Find and remove the work from library
-            state["work_library"] = [
-                w for w in state.get("work_library", []) if w["id"] != work_id
-            ]
-            self.owner.logger.info(f"Deleted work: {work_id}")
+            if umo in owner.running or umo in owner.chat_tasks:
+                raise ValueError("正在执行或整理，请稍后管理作品")
+            remove_work(state, body.get("id"))
             await owner.save()
             return {"status": "ok", "data": {"deleted": True}}
         elif action == "work_image":
@@ -494,8 +625,10 @@ class CompanionPageAPI:
             old = notes.get(replace_key or key) or {}
             renaming = bool(replace_key) and replace_key != key and replace_key in notes
             # 偏好只来自用户明确表达，天然是已确认的
-            confirmed = True if kind == "preference" else body.get(
-                "confirmed", old.get("confirmed", False)
+            confirmed = (
+                True
+                if kind == "preference"
+                else body.get("confirmed", old.get("confirmed", False))
             )
             if type(confirmed) is not bool:
                 raise ValueError("确认状态必须为布尔值")
@@ -670,7 +803,8 @@ class CompanionPageAPI:
                 try:
                     await asyncio.wait_for(task, 60)
                 finally:
-                    owner.running.pop(umo, None)
+                    if owner.running.get(umo) is task:
+                        owner.running.pop(umo, None)
             else:
                 raise ValueError("成果操作不支持")
         elif action == "now":
@@ -680,10 +814,11 @@ class CompanionPageAPI:
                 raise ValueError("请先启用总开关")
             if umo in owner.running:
                 raise ValueError("本对象正在行动，请稍后再试")
-            state["last_inbound"] = 0
+            state["force_check_revision"] = owner.revisions.get(umo, 0)
             state["next_due"] = 0
         elif action == "stop":
             owner.revisions[umo] = owner.revisions.get(umo, 0) + 1
+            state.pop("force_check_revision", None)
             task = owner.running.get(umo)
             if task:
                 task.cancel()
@@ -742,118 +877,50 @@ class CompanionPageAPI:
             if not update.get("id"):
                 raise ValueError("缺少项目ID")
             apply_plan(state, {"project_updates": [update]}, explicit_edit=True)
-        elif action == "project":
-            if umo in owner.running or umo in owner.chat_tasks:
-                raise ValueError("正在整理或执行，请稍后编辑")
+        elif action in {"project", "project_delete"}:
             status = body.get("status")
-            if status not in {"active", "paused", "completed", "cancelled"}:
+            if action == "project_delete":
+                operation = "delete"
+            elif isinstance(status, str):
+                operation = {
+                    "active": "resume",
+                    "paused": "pause",
+                    "completed": "complete",
+                    "cancelled": "cancel",
+                }.get(status)
+            else:
                 raise ValueError("项目状态错误")
-            project = next(
-                (p for p in state.get("projects", []) if p["id"] == body.get("id")),
-                None,
-            )
-            if project is None:
-                raise ValueError("项目不存在")
-            project["status"] = status
-            project["updated_at"] = time.time()
-            if status != "active":
-                if state.get("manual_project_id") == project["id"]:
-                    state.update(
-                        manual_plan="", manual_project_id="", manual_plan_expires_at=0
-                    )
-                # Stop queued work too, not just the project card's status.
-                for checkpoint in [
-                    state.get("execution_checkpoint", {}),
-                    *state.get("execution_checkpoints", {}).values(),
-                ]:
-                    if checkpoint.get("project_id") == project["id"] or any(
-                        related(checkpoint.get("task", ""), text)
-                        for text in (project["title"], project.get("goal", ""))
-                    ):
-                        checkpoint["project_id"] = project["id"]
-                for key in ("future_task", "next_task", "manual_plan"):
-                    if any(
-                        related(state.get(key, ""), text)
-                        for text in (project["title"], project.get("goal", ""))
-                    ):
-                        state[key] = ""
-                        if key == "manual_plan":
-                            state["manual_plan_expires_at"] = 0
-                            state["plan_status"] = "关联项目已暂停或结束"
-                if not state.get("next_task"):
-                    state["window_end"] = 0
-        elif action in {"project_add", "project_delete"}:
+            identifier = body.get("id")
+            control_project(state, identifier, operation)
+            if operation != "resume":
+                running = owner.running.get(umo)
+                if (
+                    isinstance(running, asyncio.Task)
+                    and state.get("last_turn", {}).get("project_id") == identifier
+                    and state.get("last_turn", {}).get("status") == "running"
+                    and not state.get("progress", {}).get("long_task_id")
+                ):
+                    running.cancel()
+                    await asyncio.gather(running, return_exceptions=True)
+        elif action == "project_add":
             if umo in owner.running or umo in owner.chat_tasks:
                 raise ValueError("正在整理或执行，请稍后编辑")
-            if action == "project_delete":
-                project = next(
-                    (p for p in state.get("projects", []) if p["id"] == body.get("id")),
-                    None,
-                )
-                if project is None:
-                    raise ValueError("项目不存在或已删除，请刷新")
-                remember_cancellation(
-                    state, [project["title"], project.get("goal", "")]
-                )
-                state["deleted_projects"] = (
-                    state.get("deleted_projects", [])
-                    + [
-                        {
-                            "id": project["id"],
-                            "title": project["title"],
-                            "at": time.time(),
-                        }
+            title, goal = body.get("title"), body.get("goal", "")
+            if (
+                not isinstance(title, str)
+                or not title.strip()
+                or not isinstance(goal, str)
+            ):
+                raise ValueError("请填写项目名称和目标")
+            apply_plan(
+                state,
+                {
+                    "project_updates": [
+                        {"title": title.strip()[:1000], "goal": goal.strip()[:1000]}
                     ]
-                )[-50:]
-                state["projects"] = [
-                    p for p in state.get("projects", []) if p["id"] != body.get("id")
-                ]
-                if state.get("manual_project_id") == project["id"]:
-                    state.update(
-                        manual_plan="", manual_project_id="", manual_plan_expires_at=0
-                    )
-                state["execution_checkpoints"] = {
-                    key: checkpoint
-                    for key, checkpoint in state.get(
-                        "execution_checkpoints", {}
-                    ).items()
-                    if checkpoint.get("project_id") != project["id"]
-                }
-                if (
-                    state.get("execution_checkpoint", {}).get("project_id")
-                    == project["id"]
-                ):
-                    state.pop("execution_checkpoint", None)
-                if state.get("last_turn", {}).get("project_id") == project["id"]:
-                    state.pop("execution_checkpoint", None)
-                    state.update(next_task="", window_end=0, future_task="")
-                clear_cancelled_work(state)
-            else:
-                if len(state.get("projects", [])) >= 5:
-                    raise ValueError("最多保留 5 个项目，请先删除旧项目")
-                title, goal = body.get("title"), body.get("goal", "")
-                if (
-                    not isinstance(title, str)
-                    or not title.strip()
-                    or not isinstance(goal, str)
-                ):
-                    raise ValueError("请填写项目名称和目标")
-                # A manual add is explicit permission to recreate this project.
-                title, goal = title.strip()[:1000], goal.strip()[:1000]
-                state["deleted_projects"] = [
-                    item
-                    for item in state.get("deleted_projects", [])
-                    if item.get("title") != title
-                ]
-                state["cancelled_tasks"] = [
-                    item
-                    for item in state.get("cancelled_tasks", [])
-                    if not any(related(item["text"], text) for text in (title, goal))
-                ]
-                apply_plan(
-                    state,
-                    {"project_updates": [{"title": title[:1000], "goal": goal[:1000]}]},
-                )
+                },
+                explicit_edit=True,
+            )
         elif action == "preview":
             if umo in owner.running:
                 raise ValueError("正在执行，请稍后预览")
@@ -882,34 +949,35 @@ class CompanionPageAPI:
         from .companion_adapter import CompanionAdapter
 
         owner = self.owner
+        outcome = DispatchOutcome()
+        adapter = None
+        error = ""
         try:
             event, *_ = await owner.prepare(umo)
-        except Exception as exc:
-            item.update(status="failed", error=str(exc)[:300])
-            await owner.save()
-            raise
-        event.state["window_end"] = 0
-        adapter = CompanionAdapter(owner, event)
-        event.companion_adapter = adapter
-        try:
+            event.is_outbox_dispatch = True
+            adapter = CompanionAdapter(owner, event)
+            event.companion_adapter = adapter
             await adapter.begin()
             if adapter.blocked or adapter.quiet:
                 raise ValueError("陪伴插件当前暂缓发送")
-            try:
-                chain = await output_chain(owner, event.state, item)
-            except Exception as exc:
-                item.update(status="failed", error=str(exc)[:300])
-                await owner.save()
-                raise
+            chain = await output_chain(owner, event.state, item)
             item["status"] = "sending"
             await owner.save()
-            try:
-                await owner.deliver(event, chain)
-            except BaseException:
-                item["status"] = "uncertain"
-                await owner.save()
-                raise
-            item.update(status="sent", sent_at=time.time())
-            await owner.save()
+            await owner.deliver(event, chain, outcome=outcome)
+            if not outcome.complete:
+                raise ValueError("成果没有可发送的内容，未发送")
+        except (Exception, asyncio.CancelledError) as exc:
+            error = (str(exc) or type(exc).__name__)[:300]
+            raise
         finally:
-            await adapter.finish()
+            if outcome.complete:
+                item.update(status="sent", sent_at=time.time(), error="")
+            elif outcome.sent or outcome.uncertain:
+                item.update(status="uncertain", error=error)
+            else:
+                item.update(status="failed", error=error)
+            try:
+                await owner.save()
+            finally:
+                if adapter is not None:
+                    await adapter.finish()
