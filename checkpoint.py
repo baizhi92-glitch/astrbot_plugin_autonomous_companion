@@ -4,6 +4,9 @@ import copy
 import time
 import uuid
 
+from .action_context import completed_action_match
+from .planning import blocked_project_task
+
 # 一个待办断点被自动续跑的次数上限。断点没有时间过期机制，只要 pending 就会被
 # 下一轮选中；同一件事反复"再证明一次"能挂几个小时（2026-11-10 发歌那次就是）。
 MAX_CHECKPOINT_RESUMES = 4
@@ -11,7 +14,18 @@ MAX_CHECKPOINT_RESUMES = 4
 
 def save_checkpoint(event):
     task = getattr(event, "checkpoint_task", "")
-    if task:
+    project_id = getattr(event, "project_id", "")
+    project = (
+        next(
+            (p for p in event.state.get("projects", []) if p.get("id") == project_id),
+            None,
+        )
+        if project_id
+        else None
+    )
+    if task and (
+        not project_id or project and project.get("status") in {"active", "paused"}
+    ):
         previous = event.state.get("execution_checkpoints", {}).get(
             getattr(event, "checkpoint_id", ""), {}
         )
@@ -23,6 +37,7 @@ def save_checkpoint(event):
             "contract": copy.deepcopy(getattr(event, "execution_contract", {})),
             "receipts": copy.deepcopy(getattr(event, "action_receipts", [])[-40:]),
             "media_deliveries": getattr(event, "media_deliveries", 0),
+            "manual_review": getattr(event, "checkpoint_manual_review", False),
             "pending": getattr(event, "checkpoint_pending", True),
             "project_id": getattr(event, "project_id", ""),
             "next_attempt_at": previous.get("next_attempt_at", 0),
@@ -33,6 +48,51 @@ def save_checkpoint(event):
         if identifier:
             checkpoints[identifier] = copy.deepcopy(event.state["execution_checkpoint"])
             event.state["execution_checkpoints"] = dict(list(checkpoints.items())[-20:])
+
+
+MAX_TASK_FAILURES = 20
+
+
+def note_task_failure(state, task: str, reason: str, now=None) -> int:
+    """Record that one concrete goal ended without evidence.
+
+    The record is deliberately readable rather than a hard limit: the next
+    round shows her "you already tried this N times, here is why it failed"
+    and lets her decide whether to change approach or drop the goal.
+
+    Args:
+        state: Per-target state.
+        task: The goal text that failed.
+        reason: Why verification did not pass.
+        now: Optional clock.
+
+    Returns:
+        The updated failure count for that goal.
+    """
+    key = str(task or "")[:200]
+    if not key:
+        return 0
+    now = time.time() if now is None else now
+    records = state.get("task_failures")
+    if not isinstance(records, dict):
+        records = {}
+    entry = records.get(key) or {}
+    records[key] = {
+        "count": int(entry.get("count", 0) or 0) + 1,
+        "reason": str(reason or "")[:200],
+        "at": now,
+    }
+    state["task_failures"] = dict(
+        sorted(records.items(), key=lambda kv: kv[1].get("at", 0))[-MAX_TASK_FAILURES:]
+    )
+    return state["task_failures"][key]["count"]
+
+
+def clear_task_failure(state, task: str) -> None:
+    """Forget one goal's failure streak once it finally worked."""
+    records = state.get("task_failures")
+    if isinstance(records, dict):
+        records.pop(str(task or "")[:200], None)
 
 
 def is_pure_chat(event) -> bool:
@@ -136,6 +196,10 @@ def next_checkpoint(state, cid, now=None):
         and item.get("cid") == cid
         and int(item.get("resume_count", 0)) < MAX_CHECKPOINT_RESUMES
         and item.get("next_attempt_at", 0) <= now
+        and not blocked_project_task(
+            state, item.get("task", ""), item.get("project_id", "")
+        )
+        and not completed_action_match(state, item.get("task"))
         and (
             not item.get("project_id")
             or any(

@@ -30,6 +30,39 @@ def organize_work(state, identifiers, archived):
     state["library_archived"] = marks
 
 
+def remove_work(state, identifier):
+    """Forget a catalogue row and its grouped copies without touching sources.
+
+    Args:
+        state: Per-target persistent state.
+        identifier: Existing catalogue row ID.
+
+    Raises:
+        ValueError: The row does not exist in this target's catalogue.
+    """
+    works = state.get("work_library", [])
+    selected = next((w for w in works if w["id"] == identifier), None)
+    if selected is None:
+        raise ValueError("作品不存在，请刷新")
+    identifiers = {identifier}
+    digest = selected.get("content_hash") if selected.get("kind") == "text" else None
+    if digest:
+        # Match the dashboard's grouping; unrelated content at a new ID is not blocked.
+        identifiers.update(
+            w["id"]
+            for w in works
+            if w.get("kind") == "text" and w.get("content_hash") == digest
+        )
+    removed = state.setdefault("library_removed", {})
+    removed.update(dict.fromkeys(identifiers, True))
+    state["work_library"] = [w for w in works if w["id"] not in identifiers]
+    archived = state.get("library_archived", {})
+    for work_id in identifiers:
+        archived.pop("id:" + work_id, None)
+    if digest:
+        archived.pop("hash:" + digest, None)
+
+
 def add_text_work(state, title, content):
     if not isinstance(title, str) or not title.strip() or len(title) > 200:
         raise ValueError("标题为1～200字符")

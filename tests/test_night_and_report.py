@@ -8,7 +8,7 @@ import importlib.util
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -22,7 +22,10 @@ SPEC = importlib.util.spec_from_file_location(
 module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(module)
 
-from data.plugins.astrbot_plugin_autonomous_companion import daily, morning  # noqa: E402
+from data.plugins.astrbot_plugin_autonomous_companion import (  # noqa: E402
+    daily,
+    morning,
+)
 
 
 def make_owner(**overrides):
@@ -151,8 +154,8 @@ def test_digest_reports_real_records_and_alerts():
         "journal": [
             {
                 "time": at(2).isoformat(timespec="seconds"),
-                "action": "dispatched",
-                "summary": "发了一条早安",
+                "action": "work_saved",
+                "summary": json.dumps({"saved": True, "title": "封面"}),
             }
         ],
         "stalls": {
@@ -168,7 +171,7 @@ def test_digest_reports_real_records_and_alerts():
         "next_task": "把第二章写完",
     }
     digest = morning.build_digest(owner, state, now)
-    assert "发了一条早安" in digest["actions"][0]
+    assert "保存了《封面》" in digest["actions"][0]
     assert digest["failures"][0]["reason"] == "接口超时"
     assert digest["waiting"] == ["等你确认的封面"]
     assert digest["night"]["tools"] == 120
@@ -194,7 +197,14 @@ def make_plugin():
     }
     plugin.logger = logging.getLogger("test-night")
     plugin.states = {}
+    plugin.running = {}
     plugin.reporting = {}
+    plugin.busy = {}
+    plugin.chat_tasks = {}
+    plugin.revisions = {}
+    plugin.stopping = False
+    plugin.quiet_hour_now = lambda _: False
+    plugin.config["companion_integration"] = False
 
     def number(key, default, low, high):
         try:
@@ -204,12 +214,21 @@ def make_plugin():
 
     plugin.number = number
     plugin.save = AsyncMock()
-    plugin.deliver = AsyncMock()
+
+    async def dispatch(event, chain, *, outcome):
+        outcome.segments.append(chain)
+        outcome.sent.append(chain.get_plain_text())
+        return outcome
+
+    plugin.deliver = AsyncMock(side_effect=dispatch)
     plugin.journal = lambda state, action, summary: state.setdefault(
         "journal", []
     ).append({"action": action, "summary": summary})
     plugin.context = SimpleNamespace(
-        llm_generate=AsyncMock(return_value=SimpleNamespace(completion_text="昨晚我在改封面。")),
+        get_config=lambda _: {},
+        llm_generate=AsyncMock(
+            return_value=SimpleNamespace(completion_text="昨晚我在改封面。")
+        ),
         conversation_manager=SimpleNamespace(
             get_curr_conversation_id=AsyncMock(return_value="cid")
         ),
@@ -226,8 +245,13 @@ def make_plugin():
     state["stalls"] = {
         "draw": {"count": 3, "reason": "接口超时", "at": time.time() - 60}
     }
-    plugin.states["test:FriendMessage:123"] = state
-    plugin.target_origins = lambda: ["test:FriendMessage:123"]
+    umo = "test:FriendMessage:123"
+    plugin.states[umo] = state
+    plugin.target_origins = lambda: [umo]
+    event.unified_msg_origin = umo
+    event.revision = 0
+    event.cid = "cid"
+    event.state = state
     return plugin, state, event
 
 
@@ -253,6 +277,27 @@ async def test_morning_report_falls_back_when_model_fails():
     chain = plugin.deliver.call_args.args[1]
     assert "早上好" in "".join(part.text for part in chain.chain)
     assert state["morning_report"]["day"]
+
+
+@pytest.mark.asyncio
+async def test_morning_report_skips_old_roleplay_without_real_updates():
+    plugin, state, _ = make_plugin()
+    state["stalls"] = {}
+    state["journal"] = [
+        {
+            "time": datetime.now().astimezone().isoformat(),
+            "action": "dispatched",
+            "summary": "那我出门等哥哥一起去吃烧鸭饭啦",
+        }
+    ]
+    state["future_task"] = "问哥哥能不能加双蛋"
+    umo = "test:FriendMessage:123"
+    await plugin.morning_report(umo)
+    await plugin.morning_report(umo)
+    plugin.prepare.assert_awaited_once()
+    plugin.context.llm_generate.assert_not_awaited()
+    plugin.deliver.assert_not_awaited()
+    assert state["morning_report"]["text"] == ""
 
 
 @pytest.mark.asyncio
@@ -304,21 +349,42 @@ def test_report_keeps_only_things_that_really_happened():
     stamp = at(2).isoformat(timespec="seconds")
     state = {
         "journal": [
-            {"time": stamp, "action": "speak_scheduled", "summary": "自己约定约 1100 分钟后开口"},
-            {"time": stamp, "action": "dispatch_attempt", "summary": "🔨 调用工具: play_song_by_name"},
-            {"time": stamp, "action": "tool_notice", "summary": "🔨 调用工具: play_song_by_name"},
+            {
+                "time": stamp,
+                "action": "speak_scheduled",
+                "summary": "自己约定约 1100 分钟后开口",
+            },
+            {
+                "time": stamp,
+                "action": "dispatch_attempt",
+                "summary": "🔨 调用工具: play_song_by_name",
+            },
+            {
+                "time": stamp,
+                "action": "tool_notice",
+                "summary": "🔨 调用工具: play_song_by_name",
+            },
             {
                 "time": stamp,
                 "action": "tool_result",
                 "summary": 'play_song_by_name: {"ok": true, "song": "x"}',
             },
-            {"time": stamp, "action": "dispatched", "summary": "放了一首老歌，跟他说了句晚安"},
-            {"time": stamp, "action": "dispatched", "summary": "放了一首老歌，跟他说了句晚安"},
+            {
+                "time": stamp,
+                "action": "dispatched",
+                "summary": "放了一首老歌，跟他说了句晚安",
+            },
+            {
+                "time": stamp,
+                "action": "dispatched",
+                "summary": "放了一首老歌，跟他说了句晚安",
+            },
             {"time": stamp, "action": "silent", "summary": "他在忙，不说话"},
         ]
     }
     digest = morning.build_digest(owner, state, now=at(8))
-    assert digest["actions"] == ["02:00 放了一首老歌，跟他说了句晚安"]
+    assert digest["actions"] == []
+    assert morning.fallback_text(digest) == ""
     for text in (morning.digest_text(digest), morning.fallback_text(digest)):
         assert "🔨" not in text
         assert '"ok"' not in text

@@ -3,12 +3,15 @@ import importlib.util
 import json
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from mcp.types import CallToolResult, TextContent
+
+from data.plugins.astrbot_plugin_autonomous_companion.diagnostics import livingmemory_probe
 
 SPEC = importlib.util.spec_from_file_location(
     "data.plugins.astrbot_plugin_autonomous_companion.main", Path(__file__).parents[1] / "main.py"
@@ -207,6 +210,108 @@ async def test_next_chat_round_sees_actual_dispatch_even_without_history_or_jour
     prompt = plugin.context.tool_loop_agent.call_args.kwargs["prompt"]
     assert "不催了，明天再看也行。" in prompt
     assert "不要马上催看" in prompt
+
+
+@pytest.mark.asyncio
+async def test_morning_proactive_round_marks_last_night_as_history(monkeypatch):
+    from data.plugins.astrbot_plugin_autonomous_companion import dialogue_context
+
+    tz = timezone(timedelta(hours=8))
+    current = datetime(2026, 11, 23, 10, 53, tzinfo=tz)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current if tz is None else current.astimezone(tz)
+
+    monkeypatch.setattr(dialogue_context, "datetime", Clock)
+    plugin, state, event = make_plugin()
+    state["last_inbound"] = datetime(2026, 11, 22, 23, 57, tzinfo=tz).timestamp()
+    state["future_task"] = "问哥哥能不能加双蛋"
+    history = [
+        {"role": "assistant", "content": "哥哥快带我去吃烧鸭饭"},
+        {"role": "user", "content": "走走"},
+        {"role": "assistant", "content": "那我出门等哥哥啦"},
+    ]
+    plugin.prepare.return_value = (event, {"prompt": "小凌"}, "provider", history, "")
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text='{"action":"chat","task":"换个贴合当下的新话题"}'
+    )
+    plugin.context.tool_loop_agent.return_value = SimpleNamespace(
+        completion_text='{"message":"","summary":"没有合适的话，先不发"}'
+    )
+
+    await plugin.turn(event.unified_msg_origin)
+
+    for call in (plugin.context.llm_generate.call_args, plugin.context.tool_loop_agent.call_args):
+        assert call.kwargs["contexts"] == history
+        assert call.kwargs["prompt"].startswith("【现实时间】2026-11-23T10:53:00+08:00（星期一")
+        assert "距今 10 小时 56 分钟，不是今天的消息" in call.kwargs["prompt"]
+        assert "新的主动轮，不在旧续行窗口内" in call.kwargs["prompt"]
+        assert "不要继续假装见面、出门、一起点餐" in call.kwargs["system_prompt"]
+    event.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_verified_execution_survives_later_chat_and_is_not_repeated():
+    plugin, state, event = make_plugin()
+    goal = "保存调研报告"
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text=json.dumps({"action": "tools", "task": goal})
+    )
+
+    async def finish(**kwargs):
+        kwargs["event"].action_receipts.append({
+            "tool": "autonomous_save_work", "status": "verified",
+            "result": '{"saved":true,"title":"调研报告","path":"report.md"}',
+        })
+        return SimpleNamespace(completion_text='{"summary":"已保存","message":""}')
+
+    plugin.context.tool_loop_agent.side_effect = finish
+    await plugin.turn(event.unified_msg_origin)
+    assert state["completed_actions"][-1]["task"] == goal
+    state["last_turn"] = {"action": "chat", "status": "completed"}
+    state["execution_checkpoints"]["stale"] = {
+        "task": goal, "pending": True, "cid": event.cid,
+    }
+    event.set_extra = lambda *_: None
+    request = SimpleNamespace(system_prompt="")
+    await plugin.mark_busy(event, request)
+    assert "执行已核验：保存调研报告" in request.system_prompt
+    plugin.context.tool_loop_agent.reset_mock()
+    decision = await plugin.turn(event.unified_msg_origin)
+    assert decision["action"] == "silent"
+    plugin.context.tool_loop_agent.assert_not_awaited()
+
+
+def test_structured_success_result_is_not_a_failure_because_its_text_mentions_one():
+    result = json.dumps({"status": "completed", "result": "Old error: now repaired"})
+    assert module.receipt_status("tool", result) == "verified"
+    assert module.receipt_status("tool", result, True) == "failed"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_controls_only_interrupt_the_selected_project():
+    plugin, state, event = make_plugin()
+    page = module.CompanionPageAPI(plugin)
+    umo = event.unified_msg_origin
+    state["projects"] = [
+        {"id": "running", "title": "Running project", "status": "active"},
+        {"id": "other", "title": "Other project", "status": "active"},
+    ]
+    state["last_turn"] = {"status": "running", "project_id": "running"}
+    run = asyncio.create_task(asyncio.Event().wait())
+    plugin.running[umo] = run
+    try:
+        await page.perform({"umo": umo, "action": "project_delete", "id": "other"})
+        assert not run.done()
+        await page.perform({"umo": umo, "action": "project", "id": "running", "status": "paused"})
+        assert run.cancelled()
+        assert state["projects"][0]["status"] == "paused"
+    finally:
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
 
 
 def test_dispatch_context_is_bounded_and_current_conversation_only():
@@ -848,17 +953,17 @@ async def test_event_arriving_during_generation_is_retained():
 async def test_chat_planning_stores_real_preferences_and_project(monkeypatch):
     plugin, state, event = make_plugin()
     monkeypatch.setattr(module.asyncio, "sleep", AsyncMock())
-    event.get_message_str = lambda: "I prefer stories."
+    event.get_message_str = lambda: "以后聊天请叫我小满。"
     plugin.context.get_current_chat_provider_id = AsyncMock(return_value="provider")
     plugin.context.llm_generate.return_value = SimpleNamespace(completion_text=json.dumps({
         "future_task": "write a story", "project_updates": [{"title": "Story", "next_step": "draft"}],
-        "note_updates": [{"key": "topic", "value": "stories", "kind": "preference",
-                          "evidence": "prefer stories"}]
+        "note_updates": [{"key": "称呼", "value": "她的称呼是小满", "kind": "preference",
+                          "evidence": "以后聊天请叫我小满"}]
     }))
     await plugin.plan_from_chat(event, "I could write one.", 0)
     assert state["future_task"] == "write a story"
-    assert state["notes"]["topic"]["value"] == "stories"
-    assert state["notes"]["topic"]["kind"] == "preference"
+    assert state["notes"]["以后聊天请叫我小满"]["value"] == "以后聊天请叫我小满"
+    assert state["notes"]["以后聊天请叫我小满"]["kind"] == "preference"
 
 
 @pytest.mark.asyncio
@@ -887,7 +992,7 @@ def page_settings_groups(page: str) -> str:
 def test_companion_integration_is_in_page_settings_group():
     page = (Path(__file__).parents[1] / "pages" / "我只在乎你" / "app.js").read_text(encoding="utf-8")
     assert '"companion_integration"' in page_settings_groups(page)
-    assert 'names.companion_integration="可选适配我会永远陪着你"' in page
+    assert 'companion_integration: "可选适配我会永远陪着你"' in page
 
 
 def test_self_scheduled_speak_settings_are_exposed_in_page():
@@ -919,6 +1024,9 @@ async def test_page_config_validates_entire_patch_before_save():
     with pytest.raises(ValueError):
         await page.update_config({"enabled": False, "targets": "123"})
     assert plugin.config["enabled"] is True
+    plugin.context.platform_manager.platform_insts = [
+        SimpleNamespace(meta=lambda: SimpleNamespace(id="test", name="aiocqhttp"))
+    ]
     await page.update_config({"targets": ["123"], "platform_id": "test"})
     assert plugin.target_origins() == ["test:FriendMessage:123"]
     assert plugin.config.saved
@@ -1188,7 +1296,7 @@ async def test_daily_tool_budget_blocks_execution():
 @pytest.mark.parametrize("fails", [False, True])
 async def test_manual_outbox_dispatch_tracks_success_or_uncertainty(fails):
     plugin, state, event = make_plugin()
-    plugin.deliver = AsyncMock(side_effect=RuntimeError("transport") if fails else None)
+    plugin.context.send_message.side_effect = RuntimeError("transport") if fails else None
     state["outbox"] = [{"id": "output", "content": "finished work", "status": "pending"}]
     page = module.CompanionPageAPI(plugin)
     body = {"umo": event.unified_msg_origin, "action": "outbox", "id": "output", "operation": "send"}
@@ -1252,146 +1360,60 @@ def test_topic_cancellation_cannot_reduce_global_contact_frequency():
 
 
 def test_pinned_notes_survive_updates_and_are_kept_without_a_cap():
-    state = {"notes": {"keep": {"value": "old", "kind": "preference", "confirmed": True,
-                                "evidence": "old", "pinned": True, "updated_at": 1}}}
+    state = {"notes": {"称呼": {"value": "原来的称呼", "kind": "preference", "pinned": True}}}
     for index in range(15):
-        text = f"new preference {index}"
-        module.apply_plan(
-            state,
-            {"note_updates": [{"key": str(index), "value": text, "kind": "preference", "evidence": text}]},
-            user_text=text,
-        )
-    # 不再有条数上限，固定项也不会被挤掉
+        text = f"我朋友养了只叫团子{index}的猫"
+        module.apply_plan(state, {"note_updates": [
+            {"key": text, "value": text, "kind": "fact", "evidence": text},
+        ]}, user_text=text)
+    text = "以后聊天不要改称呼"
+    module.apply_plan(state, {"note_updates": [
+        {"key": "称呼", "value": text, "kind": "preference", "evidence": text},
+        {"key": "称呼", "drop": True, "evidence": text},
+    ]}, user_text=text)
     assert len(state["notes"]) == 16
-    assert state["notes"]["keep"]["pinned"]
-    module.apply_plan(
-        state,
-        {"note_updates": [{"key": "keep", "value": "changed", "kind": "preference", "evidence": "changed"}]},
-        user_text="changed",
-    )
-    assert state["notes"]["keep"]["value"] == "changed"
-    assert state["notes"]["keep"]["pinned"]
+    assert state["notes"]["称呼"]["value"] == "原来的称呼"
 
 
-def test_note_updates_need_user_evidence_and_keep_previous():
-    state = {
-        "notes": {
-            "语气": {"value": "别用感叹号", "kind": "preference", "confirmed": True,
-                     "evidence": "别用感叹号", "created_at": 1, "updated_at": 1}
-        }
-    }
-    module.apply_plan(
-        state,
-        {
-            "note_updates": [
-                # 原话里没有这句（是助手或推测），整条丢弃
-                {"key": "工作", "value": "在设计公司上班", "kind": "fact",
-                 "confirmed": True, "evidence": "她应该在设计公司上班"},
-                {"key": "语气", "value": "说话别那么正式", "kind": "preference",
-                 "evidence": "说话别那么正式"},
-                {"key": "宠物", "value": "养了一只叫团子的橘猫", "kind": "fact",
-                 "confirmed": True, "evidence": "我家团子"},
-            ]
-        },
-        user_text="说话别那么正式，我家团子又打翻水了",
-    )
-    assert set(state["notes"]) == {"语气", "宠物"}
-    assert state["notes"]["语气"]["previous"] == "别用感叹号"
-    assert state["notes"]["宠物"]["kind"] == "fact"
-    assert state["notes"]["宠物"]["source"] == "chat"
-    assert state["notes"]["宠物"]["confirmed"] is True
-
-
-def test_note_kind_defaults_to_fact_and_preference_is_always_confirmed():
+@pytest.mark.parametrize(("text", "evidence", "kind"), [
+    ("今晚帮我找几首歌", "今晚帮我找几首歌", "interest"),
+    ("我今天不想听歌", "我今天不想听歌", "preference"),
+    ("我朋友喜欢爵士乐", "我朋友喜欢爵士乐", "interest"),
+    ("我朋友说，我喜欢爵士乐", "我喜欢爵士乐", "interest"),
+    ("我今天整理作品库", "我今天整理作品库", "fact"),
+    ("她说：『我喜欢爵士乐』", "我喜欢爵士乐", "interest"),
+    ("我喜欢爵士乐吗？", "我喜欢爵士乐吗？", "interest"),
+    ("我不喜欢蓝调，只是在问爵士乐", "喜欢蓝调", "interest"),
+    ("以后要补录几张照片", "以后要补录几张照片", "preference"),
+    ("我有一只猫", "我有一只猫", None),
+    ("那个出问题的插件不再用了，也不打算继续修", "那个出问题的插件不再用了", "preference"),
+    ("我今天看到一只猫", "我今天看到一只猫", "fact"),
+    ("我朋友说，我养了只猫", "我养了只猫", "fact"),
+    ("我叫他来聊天", "我叫他来聊天", "fact"),
+])
+def test_unrelated_mentions_never_become_automatic_notes(text, evidence, kind):
     state = {}
-    module.apply_plan(
-        state,
-        {
-            "note_updates": [
-                {"key": "作息", "value": "十一点后别发消息", "kind": "preference",
-                 "evidence": "十一点以后别理我"},
-                {"key": "工作", "value": "可能在做设计", "evidence": "又要改稿"},
-                {"key": "音乐", "value": "喜欢 city pop", "kind": "interest",
-                 "confirmed": True, "evidence": "最近在循环"},
-            ]
-        },
-        user_text="十一点以后别理我，又要改稿，最近在循环 city pop",
-    )
-    assert state["notes"]["作息"]["kind"] == "preference"
-    # 偏好只来自用户明确表达，天然是已确认的
-    assert state["notes"]["作息"]["confirmed"] is True
-    # 没写 kind 时按事实处理，不会擅自变成约束
-    assert state["notes"]["工作"]["kind"] == "fact"
-    assert state["notes"]["工作"]["confirmed"] is False
-    assert state["notes"]["音乐"]["kind"] == "interest"
+    module.apply_plan(state, {"future_task": "保留独立计划", "note_updates": [
+        {"key": "模型标题", "value": "模型误写", "kind": kind, "evidence": evidence},
+    ]}, user_text=text)
+    assert not state.get("notes")
+    assert state["future_task"] == "保留独立计划"
 
 
-def test_note_updates_skip_duplicate_values():
-    state = {
-        "notes": {
-            "语气": {"value": "别用感叹号", "kind": "preference", "confirmed": True,
-                     "evidence": "别用感叹号", "updated_at": 1}
-        }
-    }
-    module.apply_plan(
-        state,
-        {"note_updates": [
-            {"key": "风格", "value": "别用感叹号", "kind": "fact", "evidence": "别用感叹号"}
-        ]},
-        user_text="别用感叹号",
-    )
-    assert set(state["notes"]) == {"语气"}
-
-
-def test_note_updates_apply_instead_of_silently_dropping_the_batch():
-    state = {}
-    module.apply_plan(
-        state,
-        {
-            "future_task": "保留这条计划",
-            "note_updates": [
-                {"key": "k1", "value": "v1", "evidence": "a1"},
-                {"key": "k2", "value": "v2", "evidence": "b2"},
-                {"key": "k3", "value": "v3", "evidence": "c3"},
-                {"key": "k4", "value": "v4", "evidence": "d4"},
-            ],
-        },
-        user_text="a1 b2 c3 d4",
-    )
-    assert set(state["notes"]) == {"k1", "k2", "k3", "k4"}
-    assert state["future_task"] == "保留这条计划"
-
-
-def test_notes_have_no_cap_and_the_bot_can_rewrite_or_drop():
-    state = {
-        "notes": {
-            f"k{index}": {
-                "value": f"v{index}",
-                "kind": "fact",
-                "confirmed": index % 2 == 0,
-                "updated_at": index,
-            }
-            for index in range(40)
-        }
-    }
-    module.apply_plan(
-        state,
-        {
-            "note_updates": [
-                {"key": "k39", "value": "换工作了，现在在教育行业", "kind": "fact",
-                 "confirmed": True, "evidence": "我换工作了"},
-                {"key": "k0", "value": "", "evidence": "已经没有猫了", "drop": True},
-            ]
-        },
-        user_text="我换工作了，已经没有猫了",
-    )
-    notes = state["notes"]
-    # 不设条数上限：40 条都在，删掉一条就是 39 条
-    assert len(notes) == 39
-    assert "k0" not in notes
-    assert notes["k39"]["value"] == "换工作了，现在在教育行业"
-    assert notes["k39"]["previous"] == "v39"
-    assert notes["k39"]["confirmed"] is True
+def test_automatic_notes_keep_literal_meaning_and_do_not_override_manual_rows():
+    state = {"notes": {"语气": {"value": "旧偏好", "kind": "preference", "source": "manual"},
+                       "爵士乐": {"value": "我喜欢爵士乐", "kind": "interest", "source": "chat"}}}
+    module.apply_plan(state, {"note_updates": [
+        {"key": "语气", "value": "正式", "kind": "preference", "evidence": "以后聊天语气自然一点"},
+        {"key": "团子", "value": "白养了猫", "kind": "fact", "confirmed": True, "evidence": "我朋友养了只叫团子的猫"},
+        {"key": "爵士乐", "drop": True, "evidence": "我不喜欢爵士乐"},
+        {"key": "白", "value": "Bot 叫白", "kind": "fact", "confirmed": True, "evidence": "我叫白"},
+    ]}, user_text="今天先聊作品。我叫白，我朋友养了只叫团子的猫。以后聊天语气自然一点。我不喜欢爵士乐。")
+    assert set(state["notes"]) == {"语气", "爵士乐", "团子", "白"}
+    assert state["notes"]["语气"]["value"] == "旧偏好"
+    assert state["notes"]["爵士乐"]["value"] == "我喜欢爵士乐"
+    assert state["notes"]["白"]["value"] == "我叫白"
+    assert state["notes"]["团子"]["value"] == state["notes"]["团子"]["evidence"] == "我朋友养了只叫团子的猫"
 
 
 def test_note_drop_needs_user_evidence_and_value_is_required():
@@ -1507,17 +1529,14 @@ async def test_decision_prompt_carries_notes_and_keeps_guesses_out_of_facts():
     assert "只当猜测" in call["system_prompt"]
 
 
-def test_chat_planning_prompt_defines_one_note_field_with_three_kinds():
+def test_chat_planning_prompt_limits_automatic_note_scope():
     prompt = module.CHAT_PLANNING_PROMPT
     assert "note_updates" in prompt
     assert "preference_updates" not in prompt and "impression_updates" not in prompt
-    for kind in ("preference", "fact", "interest"):
-        assert kind in prompt
-    assert "偏好是" not in prompt or "preference 是" in prompt
-    assert "不限条数" in prompt
-    assert "人是会变的" in prompt
-    assert '"drop": true' in prompt
-    assert "身份证号" in prompt
+    assert "用户是陪伴对象，不是助手" in prompt
+    assert "不是长期偏好或个人事实" in prompt
+    assert "不要自动删除记录" in prompt
+    assert "保留主语、否定和时间限定" in prompt
     assert "每轮最多 3 条改动" in prompt
 
 
@@ -2076,6 +2095,10 @@ async def test_committed_opening_releases_the_held_note():
     plugin.context.tool_loop_agent.return_value = SimpleNamespace(
         completion_text='{"message":"今天有件小事想跟你说。","summary":"说了"}'
     )
+    async def submit(chain, **kwargs):
+        return await plugin.deliver(event, chain, **kwargs)
+
+    event.send.side_effect = submit
     await plugin.run_due(event.unified_msg_origin)
     assert not state.get("speak_wish")
     assert any(item["action"] == "wish_spoken" for item in state["journal"])
@@ -2517,7 +2540,7 @@ def test_embedded_page_uses_sandbox_compatible_dialogs():
     for name in ("app.js","plans.js","library.js"):
         script=(root/name).read_text(encoding="utf-8")
         assert not re.search(r"\b(?:confirm|prompt)\s*\(",script)
-    assert 'await pageConfirm("删除此项目及其进展记录？")' in (root/"plans.js").read_text(encoding="utf-8")
+    assert 'await pageConfirm("停止此项目并删除进展记录？已保存的作品文件不会删除。")' in (root/"plans.js").read_text(encoding="utf-8")
 
 
 def test_library_backfills_real_receipts_and_text_read(tmp_path):
@@ -2743,7 +2766,7 @@ async def test_ui_operation_matrix_changes_expected_state():
     assert state["conditions"][0]["id"]=="http"
     project=state["projects"][0]
     await page.perform({"umo":umo,"action":"project","id":project["id"],"status":"paused"})
-    assert project["status"]=="paused"
+    assert state["projects"][0]["status"] == "paused"
     state["outbox"]=[{"id":"one","status":"pending","content":"work"}]
     await page.perform({"umo":umo,"action":"outbox","id":"one","operation":"discard"})
     assert state["outbox"][0]["status"]=="discarded"
@@ -2761,7 +2784,7 @@ async def test_ui_preview_returns_decision_and_releases_busy_slot():
     assert event.unified_msg_origin not in plugin.running
 
 
-def test_delivered_generated_image_not_blocked_by_optional_tag_lookup():
+def test_delivered_image_does_not_verify_an_unfinished_contract():
     from data.plugins.astrbot_plugin_autonomous_companion.execution_proof import execution_verdict
     event=SimpleNamespace(checkpoint_task="给我画张画",media_deliveries=1,
         action_receipts=[{"tool":"run_template","status":"verified"},{"tool":"search_tags","status":"attempted"}],
@@ -2769,7 +2792,7 @@ def test_delivered_generated_image_not_blocked_by_optional_tag_lookup():
             {"goal":"检索标签","tools":["search_tags"],"accept":"observed"},
             {"goal":"生成画作","tools":["run_template"],"accept":"completed"},
             {"goal":"发送图片","tools":["pc_send_current_media"],"accept":"success"}]})
-    assert execution_verdict(event,"contract")[0]=="verified"
+    assert execution_verdict(event, "contract")[0] != "verified"
 
 
 def test_generic_contract_requires_each_tool_goal_not_unrelated_success():
@@ -2822,7 +2845,9 @@ async def test_partial_task_with_media_still_sends_truthful_closing():
     await plugin.turn(event.unified_msg_origin)
     event.send.assert_awaited_once()
     assert "部分步骤" in event.send.call_args.args[0].get_plain_text()
-    assert state["manual_plan"]
+    assert not state["manual_plan"]
+    assert state["execution_checkpoint"]["manual_review"]
+    assert not state["execution_checkpoint"]["pending"]
 
 
 @pytest.mark.asyncio
@@ -3255,6 +3280,24 @@ async def test_expired_pending_message_is_dropped():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("crossed_day", [True, False])
+async def test_pending_message_is_not_replayed_after_midnight_or_new_inbound(crossed_day):
+    plugin, state, event = make_plugin()
+    now = time.time()
+    state["pending_message"] = {
+        "content": "哥哥能不能再加个双蛋",
+        "saved_at": now - (86400 if crossed_day else 30),
+        "expires_at": now + 3600,
+    }
+    state["last_inbound"] = 0 if crossed_day else now - 10
+
+    await plugin.flush_pending_message(state, event)
+
+    assert "pending_message" not in state
+    event.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_pending_message_discard_action():
     """The page can drop a stored draft explicitly."""
     from data.plugins.astrbot_plugin_autonomous_companion.page_api import CompanionPageAPI
@@ -3347,28 +3390,45 @@ async def test_timeout_note_not_added_for_quiet_or_receiptless_rounds():
 
 
 @pytest.mark.asyncio
-async def test_dispatched_local_media_is_registered_into_work_library(tmp_path):
-    """Proactive dispatch archives sent local media into the work library."""
+async def test_dispatched_local_media_is_registered_into_work_library(tmp_path, monkeypatch):
+    """Archive local media before a transport can consume the original."""
     plugin, state, event = make_plugin()
-    from astrbot.api.message_components import File, Image
+    from astrbot.api.message_components import File, Image, Record, Video
+    from data.plugins.astrbot_plugin_autonomous_companion import library
+
+    monkeypatch.setattr(library.StarTools, "get_data_dir", lambda _: tmp_path / "store")
 
     art = tmp_path / "art.png"
     art.write_bytes(b"\x89PNG\r\n\x1a\npng")
     doc = tmp_path / "notes.bin"
     doc.write_bytes(b"\x00notes")
+    audio = tmp_path / "my sound.wav"
+    audio.write_bytes(b"RIFF-test")
+    video = tmp_path / "my video.mp4"
+    video.write_bytes(b"test-video")
 
+    async def submit(*_):
+        for path in (art, audio, video):
+            path.unlink()
+        return True
+
+    plugin.context.send_message.side_effect = submit
     await plugin.deliver_segment(
         event,
-        module.MessageChain(
-            chain=[Image(file=str(art)), File(name="notes.bin", file=str(doc))]
-        ),
+        module.MessageChain(chain=[
+            Image.fromFileSystem(str(art)), Record.fromFileSystem(str(audio)),
+            Video.fromFileSystem(str(video)), File(name="notes.bin", file=str(doc)),
+        ]),
     )
 
     dispatched = [
         w for w in state["work_library"] if w["producer"] == "actual_output_dispatch"
     ]
-    names = {Path(w["path"]).name for w in dispatched}
-    assert {"art.png", "notes.bin"} <= names
+    works = {w["title"]: w for w in dispatched}
+    assert {"art.png", "my sound.wav", "my video.mp4", "notes.bin"} <= works.keys()
+    for name, data in {"art.png": b"\x89PNG\r\n\x1a\npng", "my sound.wav": b"RIFF-test", "my video.mp4": b"test-video"}.items():
+        assert works[name]["archive_status"] == "saved"
+        assert Path(works[name]["path"]).read_bytes() == data
     assert all(w["status"] == "recorded" for w in dispatched)
     assert event.media_deliveries == 1
 
@@ -3450,8 +3510,8 @@ def test_silence_and_continuation_semantics_are_spelled_out():
     # 沉默是"停"：会结束整条链，不能当暂停键用。
     assert "silent 是\"停\"不是\"歇一下\"" in decision
     assert "也不会在沉默时替你发出去" in decision
-    # 已有待续目标时是接着做，不是另开话题。
-    assert "这一轮是接着做，不是另开话题" in decision
+    # Continuation stays conditional on the scene still being relevant.
+    assert "只有仍适用于现在才接着做；过时情景就结束" in decision
     action = module.ACTION_PROMPT
     # 续行要把两个字段一起给，且每轮都要有新东西。
     assert "续行要两个字段一起给" in action
@@ -3907,6 +3967,94 @@ async def test_night_guard_steps_aside_for_a_user_appointment():
     assert plugin.user_appointment_due(state) is False
 
 
+def test_old_or_already_reminded_appointment_cannot_bypass_quiet_hours():
+    plugin, state, _ = make_plugin()
+    now = time.time()
+    state['appointments'] = [
+        {'status': 'pending', 'due_at': now - 86400 * 30},
+        {'status': 'pending', 'due_at': now + 60, 'reminded_at': now},
+    ]
+    assert not plugin.user_appointment_due(state)
+
+
+def test_expired_appointments_do_not_hold_all_slots():
+    now = time.time()
+    state = {'appointments': [
+        {'id': str(i), 'title': str(i), 'status': 'pending', 'due_at': now - 90000}
+        for i in range(20)
+    ]}
+    module.apply_plan(state, {'appointment_updates': [
+        {'title': 'Meeting', 'due_at': now + 300, 'evidence': 'Tomorrow meeting'}
+    ]}, user_text='Tomorrow meeting')
+    assert len(state['appointments']) == 20
+    assert state['appointments'][-1]['title'] == 'Meeting'
+
+
+def test_target_routes_are_canonical_and_do_not_parse_embedded_friend_markers():
+    plugin, _, _ = make_plugin()
+    plugin.config.update(platform_id='qq', targets=[
+        '000123', 'qq:FriendMessage:123', ':FriendMessage:123',
+        'qq:FriendMessage:', 'qq:GroupMessage:123:FriendMessage:456',
+        'qq:FriendMessage:not-a-number', 'telegram:FriendMessage:some:opaque:id',
+    ])
+    plugin.context.platform_manager.platform_insts = [
+        SimpleNamespace(meta=lambda: SimpleNamespace(id='qq', name='aiocqhttp')),
+        SimpleNamespace(meta=lambda: SimpleNamespace(id='telegram', name='telegram')),
+    ]
+    assert plugin.target_origins() == ['qq:FriendMessage:123', 'telegram:FriendMessage:some:opaque:id']
+    plugin.config.update(platform_id='telegram', targets=['123'])
+    assert plugin.target_origins() == []
+
+
+@pytest.mark.asyncio
+async def test_guard_uses_only_real_recent_same_conversation_evidence():
+    plugin, _, event = make_plugin()
+    plugin.context.get_current_chat_provider_id = AsyncMock(return_value='provider')
+    plugin.context.llm_generate.return_value = SimpleNamespace(completion_text=json.dumps({
+        'claims': [], 'text': '你可以晚点看。',
+    }))
+    event.get_message_str = lambda: '合成任务提示，不是用户原话'
+    assert await plugin._guard_user_state_claims('你正在吃饭。', event) == '你可以晚点看。'
+    assert json.loads(plugin.context.llm_generate.call_args.kwargs['prompt'])['latest_user_message'] == ''
+    umo = event.unified_msg_origin
+    plugin.inbound_evidence = {umo: (0, 'another-cid', time.time(), '我在家')}
+    await plugin._guard_user_state_claims('你正在吃饭。', event)
+    assert json.loads(plugin.context.llm_generate.call_args.kwargs['prompt'])['latest_user_message'] == ''
+    plugin.inbound_evidence[umo] = (0, event.cid, time.time(), '我在吃饭')
+    await plugin._guard_user_state_claims('你正在吃饭。', event)
+    assert json.loads(plugin.context.llm_generate.call_args.kwargs['prompt'])['latest_user_message'] == '我在吃饭'
+
+
+@pytest.mark.asyncio
+async def test_due_opening_beats_ready_long_task_and_preserves_job():
+    plugin, state, event = make_plugin()
+    now = time.time()
+    state['speak_schedule'] = [{'at': now - 10, 'reason': 'say hello', 'set_at': now - 600}]
+    state['long_tasks'] = [{'id': 'job', 'status': 'queued', 'next_due': now - 10, 'updated_at': now - 20}]
+    state['next_due'] = now + 3000
+    plugin.turn = AsyncMock(return_value={'action': 'silent'})
+    await plugin.run_due(event.unified_msg_origin)
+    plugin.turn.assert_awaited_once_with(event.unified_msg_origin, speak_due='say hello')
+    assert state['long_tasks'][0]['status'] == 'queued'
+    assert now < plugin.wake_at(state) <= now + 65
+
+
+@pytest.mark.asyncio
+async def test_scheduler_releases_running_slot_if_final_persistence_fails():
+    plugin, state, event = make_plugin()
+    umo = event.unified_msg_origin
+    plugin.running[umo] = asyncio.current_task()
+    plugin.turn = AsyncMock(return_value={'action': 'silent'})
+    async def phase(_, phase, __):
+        if phase == 'idle':
+            raise OSError('mocked storage failure')
+    plugin.phase = phase
+    with pytest.raises(OSError):
+        await plugin.run_due(umo)
+    assert not state['inflight']
+    assert umo not in plugin.running
+
+
 def test_similar_commitments_merge_into_one():
     plugin, state, _ = make_plugin()
     texts = [
@@ -4080,7 +4228,7 @@ async def test_memory_bridge_finds_a_renamed_livingmemory_folder():
 def test_livingmemory_probe_reports_a_missing_plugin():
     plugin, state, event = make_plugin()
     plugin.context.get_all_stars = lambda: []
-    probe = module.livingmemory_probe(plugin, event.unified_msg_origin)
+    probe = livingmemory_probe(plugin, event.unified_msg_origin)
     assert probe["结论"].startswith("没找到 LivingMemory")
 
 
@@ -4103,7 +4251,7 @@ def test_livingmemory_probe_explains_an_incomplete_interface(monkeypatch):
         raise ImportError(name)
 
     monkeypatch.setattr(diagnostics.importlib, "import_module", boom)
-    probe = module.livingmemory_probe(plugin, event.unified_msg_origin)
+    probe = livingmemory_probe(plugin, event.unified_msg_origin)
     assert probe["结论"].startswith("接口不完整")
     assert probe["缺少"]
 
@@ -4118,7 +4266,7 @@ def test_livingmemory_probe_reports_a_disabled_plugin():
             star_cls=SimpleNamespace(),
         )
     ]
-    probe = module.livingmemory_probe(plugin, event.unified_msg_origin)
+    probe = livingmemory_probe(plugin, event.unified_msg_origin)
     assert "未启用" in probe["结论"]
 
 
@@ -4374,9 +4522,9 @@ def test_prompts_forbid_invented_firsthand_experience():
     # 真正发给用户的正文在这里生成，规则必须落在这一段
     assert "没有真实回执就别讲成做过" in action
     assert "也别替用户编他说过的话" in action
-    # 她自己的日子不是谎话：日常质感必须留着，别被这条规则讲干
-    assert "跟你之前说的保持一致" in action
-    assert "不用上报也不用对账" in action
+    # Preserve the persona's voice, not the old scene as a present-day fact.
+    assert "照常用熟悉的口吻说话" in action
+    assert "旧对白里的人物动作和场景不是现在的事实" in action
     # 没人格生活设定的 bot 不能被这条放开成"现场编一套"
     assert "别自己造一套身世和日常" in action
     assert "别凭空长出一套身世和日常来" in module.DECISION_PROMPT
@@ -4391,6 +4539,77 @@ def test_honesty_rule_explicitly_spares_humor_and_exaggeration():
         assert "夸张" in prompt
         assert "不算编造" in prompt
     assert "玩笑、夸张、比喻、撒娇、想象" in module.DECISION_PROMPT
+
+
+def test_config_path_with_pasted_quotes_is_cleaned():
+    from data.plugins.astrbot_plugin_autonomous_companion.file_tools import clean_root
+
+    # 从文件对话框粘过来的路径会带引号，Path() 会当成相对路径，
+    # 白名单就永远对不上："路径不在允许读取的目录里：D:\\xyl；允许读取："D:\\xyl""。
+    assert str(clean_root('"D:\\xyl"')) == "D:\\xyl"
+    assert str(clean_root("'D:/xyl'")) == "D:\\xyl"
+    assert clean_root("   ") is None
+    assert clean_root(None) is None
+
+
+def test_quoted_root_can_actually_read_inside(tmp_path):
+    from data.plugins.astrbot_plugin_autonomous_companion.file_tools import Workspace
+
+    note = tmp_path / "线稿.txt"
+    note.write_text("草稿", encoding="utf-8")
+    workspace = Workspace(f'"{tmp_path}"', [f'"{tmp_path}"'])
+    # 以前这里一定抛 PermissionError
+    assert workspace.read_path(str(note)) == note.resolve()
+
+
+def test_read_error_names_the_real_allowed_root(tmp_path):
+    from data.plugins.astrbot_plugin_autonomous_companion.file_tools import Workspace
+
+    workspace = Workspace(tmp_path, [tmp_path])
+    with pytest.raises(PermissionError) as caught:
+        workspace.read_path(str(tmp_path.parent / "outside.txt"))
+    # 报错必须给解析后的真实目录，否则和"被拒的路径"看起来是同一个字符串
+    assert str(tmp_path.resolve()) in str(caught.value)
+
+
+def test_internal_wording_never_reaches_the_user():
+    assert (
+        module._scrub_internal_wording("这次还没完成：尚缺执行凭据：继续绘制")
+        == "这次没弄成，回头再说。"
+    )
+    # 人格自己的话不能被动
+    line = "（把笔搁下）线稿就搁那儿了，我懒得改。"
+    assert module._scrub_internal_wording(line) == line
+
+
+def test_task_failures_are_recorded_for_her_to_judge():
+    from data.plugins.astrbot_plugin_autonomous_companion.checkpoint import (
+        clear_task_failure,
+        note_task_failure,
+    )
+
+    state = {}
+    assert note_task_failure(state, "继续画线稿", "尚缺执行凭据：线稿路径不存在", now=100) == 1
+    assert note_task_failure(state, "继续画线稿", "路径不在允许读取的目录里", now=200) == 2
+    assert state["task_failures"]["继续画线稿"]["reason"] == "路径不在允许读取的目录里"
+    clear_task_failure(state, "继续画线稿")
+    assert state["task_failures"] == {}
+
+
+def test_failure_context_tells_her_the_count_and_reason():
+    plugin, state, event = make_plugin()
+    state["task_failures"] = {
+        "把画室线稿继续往下画": {
+            "count": 4,
+            "reason": "尚缺执行凭据：路径不在允许读取的目录里",
+            "at": time.time(),
+        }
+    }
+    text = plugin.failure_context(state)
+    assert "试过 4 次都没成" in text
+    assert "路径不在允许读取的目录里" in text
+    # 决定权在她：让她知道可以放下，而不是插件替她删
+    assert "把 future_task 写成空字符串" in text
 
 
 def test_schema_default_extra_prompt_encourages_tools():

@@ -1,0 +1,158 @@
+/* Scope the setup and disclosure styles to the embedded Settings tab. */
+#config-fields {
+  display: grid;
+  gap: var(--s3);
+}
+
+#settings .settings-setup {
+  border-color: var(--accent);
+}
+
+#settings .settings-setup-head,
+#settings .settings-save-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s1) var(--s2);
+}
+
+#settings .settings-setup-head {
+  padding: var(--s2) var(--s3);
+  background: var(--accent-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+#settings .settings-setup-head h3 {
+  font-size: var(--fs-title);
+  color: var(--ink);
+}
+
+#settings .settings-setup-fields {
+  display: grid;
+  align-items: start;
+  gap: var(--s2);
+  padding: var(--s3);
+}
+
+#settings .settings-setup-fields > label {
+  width: 100%;
+  max-width: 36rem;
+}
+
+#settings .settings-setup-fields textarea {
+  min-height: 64px;
+}
+
+#settings .settings-platform-note {
+  overflow-wrap: anywhere;
+}
+
+#settings .settings-save-row {
+  padding: var(--s2) var(--s3);
+  background: var(--accent-soft);
+  border-top: 1px solid var(--border);
+}
+
+#settings .settings-save-row > button {
+  min-height: 40px;
+  padding-inline: var(--s2);
+}
+
+#settings .settings-runtime {
+  max-width: 36rem;
+  background: var(--bg);
+}
+
+#settings .settings-runtime > summary {
+  font-size: var(--fs-small);
+  color: var(--text-muted);
+  background: transparent;
+}
+
+#settings .settings-runtime > summary:hover {
+  background: var(--accent-soft);
+}
+
+#settings :is(.settings-advanced, .settings-group, .settings-runtime) > summary:focus-visible {
+  outline-offset: -3px;
+}
+
+#settings :is(.settings-advanced, .settings-group) > summary > .settings-summary {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  gap: 4px;
+}
+
+#settings .settings-advanced > summary {
+  padding: var(--s2) var(--s3);
+}
+
+#settings .settings-advanced > summary strong {
+  font-size: var(--fs-title);
+}
+
+#settings .settings-summary .hint {
+  font-weight: 400;
+}
+
+#settings .settings-advanced-body {
+  display: grid;
+  gap: var(--s1);
+  padding: var(--s2);
+  background: var(--bg);
+}
+
+#settings details.panel:not([open]) > .settings-advanced-body {
+  display: none;
+}
+
+#settings .settings-advanced-body > .settings-save-row {
+  margin-top: var(--s1);
+  padding: var(--s2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+#settings .field-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr));
+  align-items: start;
+  gap: var(--s2);
+}
+
+#settings :is(.field, .check) {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+#settings :is(.field, .check) > span:first-of-type {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+#settings .check {
+  padding: var(--s1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  cursor: pointer;
+}
+
+#settings [data-config]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (max-width: 620px) {
+  #settings .settings-setup-head,
+  #settings .settings-setup-fields,
+  #settings .settings-save-row,
+  #settings .settings-advanced > summary {
+    padding: var(--s2);
+  }
+
+  #settings .settings-save-row > * {
+    width: 100%;
+  }
+}

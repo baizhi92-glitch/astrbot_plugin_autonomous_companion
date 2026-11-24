@@ -52,11 +52,8 @@ def clear_cancelled_work(state):
         for key, value in state.get("execution_checkpoints", {}).items()
         if not cancelled_match(state, value.get("task", ""))
     }
-    state["projects"] = [
-        p
-        for p in state.get("projects", [])
-        if not cancelled_match(state, p.get("title", ""))
-    ]
+    if not state.get("manual_plan"):
+        state.update(manual_project_id="", manual_plan_expires_at=0)
 
 
 def cancel_from_user_text(state, text):
@@ -95,14 +92,16 @@ def cancel_from_user_text(state, text):
         ]
     if not tasks:
         return []
-    remember_cancellation(state, tasks)
-    clear_cancelled_work(state)
-    for project in state.get("projects", []):
-        if any(
+    from .planning import control_project
+
+    for project in list(state.get("projects", [])):
+        if project.get("status") in {"active", "paused"} and any(
             related(task, project.get("title", "") + " " + project.get("goal", ""))
             for task in tasks
         ):
-            project["status"] = "cancelled"
+            control_project(state, project["id"], "cancel")
+    remember_cancellation(state, tasks)
+    clear_cancelled_work(state)
     state.update(
         window_end=0,
         next_task="",

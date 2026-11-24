@@ -21,22 +21,41 @@ def chapter_identity(title):
     )
     if not match:
         return None
+    series = match[1].rstrip("·•：: _-")
     number = match[2]
-    if number.isdigit():
+    if number.isdecimal() and len(number) <= 3:
         ordinal = int(number)
-    else:
-        digits = dict(
-            zip("零〇一二三四五六七八九两", [0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 2])
+    elif re.fullmatch(r"[零〇一二两三四五六七八九]{1,3}", number):
+        ordinal = int(
+            number.translate(str.maketrans("零〇一二两三四五六七八九", "001223456789"))
         )
-        ordinal, current = 0, 0
-        for character in number:
-            if character in digits:
-                current = digits[character]
-            else:
-                ordinal += (current or 1) * {"十": 10, "百": 100}[character]
-                current = 0
-        ordinal += current
-    return match[1].rstrip("·•：: _-"), ordinal
+    else:
+        # Match the positional units in order; reject repeated units and mixed Arabic digits.
+        digit = "[一二两三四五六七八九]"
+        units = re.fullmatch(
+            rf"(?:(?P<hundreds>{digit})百(?:(?:[零〇](?P<ones>{digit}))|(?P<tens>{digit})十(?P<tail>{digit})?)?|(?P<small>{digit})?十(?P<last>{digit})?)",
+            number,
+        )
+        if not units:
+            return None
+        digits = str.maketrans("一二两三四五六七八九", "1223456789")
+        ordinal = (
+            100 * int((units["hundreds"] or "0").translate(digits))
+            + 10
+            * int(
+                (
+                    units["tens"]
+                    or units["small"]
+                    or ("0" if units["hundreds"] else "1")
+                ).translate(digits)
+            )
+            + int(
+                (units["ones"] or units["tail"] or units["last"] or "0").translate(
+                    digits
+                )
+            )
+        )
+    return (series, ordinal) if series and 1 <= ordinal <= 999 else None
 
 
 def compile_chapters(state, umo, title, identifiers=None):
@@ -84,7 +103,7 @@ def compile_chapters(state, umo, title, identifiers=None):
     numbers = sorted(by_number)
     if len(numbers) < 2:
         raise ValueError("至少需要两章正文才能合并")
-    if numbers != list(range(1, numbers[-1] + 1)):
+    if any(number != expected for expected, number in enumerate(numbers, 1)):
         raise ValueError("章节缺号或不是从第一章开始，请补齐后合并")
     body = "\n\n".join(
         by_number[n][0]["title"] + "\n\n" + by_number[n][1] for n in numbers

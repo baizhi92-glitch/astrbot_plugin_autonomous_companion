@@ -74,6 +74,98 @@ def _receipt_line(receipt):
     return f"{tool}：{_clip(text, 150)}" if text else ""
 
 
+def record_completed_action(state, task, detail):
+    """Keep verified task results beyond the lifetime of last_turn.
+
+    Args:
+        state: Persisted state for the target conversation.
+        task: Exact execution goal whose required work was verified.
+        detail: Verification detail, including any bounded caveats.
+    """
+    task = str(task or "").strip()[:2000]
+    if not task:
+        return
+    rows = [r for r in state.get("completed_actions", []) if r.get("task") != task]
+    rows.append({"task": task, "detail": _clip(detail, 500), "at": time.time()})
+    state["completed_actions"] = rows[-50:]
+
+
+def completed_action_match(state, task):
+    """Check exact normalized goal identity, not loose title similarity.
+
+    Args:
+        state: Persisted state for the target conversation.
+        task: Candidate execution goal.
+
+    Returns:
+        True if that exact goal already has a verified completion record.
+    """
+    key = " ".join(str(task or "").casefold().split())
+    return bool(key) and any(
+        " ".join(row.get("task", "").casefold().split()) == key
+        for row in state.get("completed_actions", [])
+    )
+
+
+def completed_work_context(state):
+    """Summarize durable completion and save receipts without exposing paths.
+
+    Args:
+        state: Persisted state for the target conversation.
+
+    Returns:
+        Bounded prompt text, or an empty string if no facts are available.
+    """
+    rows = []
+    rows.extend(
+        (
+            r.get("at", 0),
+            f"执行已核验：{_clip(r['task'], 180)}；{_clip(r.get('detail'), 160)}",
+        )
+        for r in state.get("completed_actions", [])
+        if r.get("task")
+    )
+    rows.extend(
+        (
+            p.get("updated_at", 0),
+            f"项目已结项：{_clip(p.get('title'), 100)}；{_clip(p.get('progress'), 240)}",
+        )
+        for p in state.get("projects", [])
+        if p.get("status") == "completed"
+    )
+    rows.extend(
+        (
+            j.get("updated_at", 0),
+            f"后台任务已结项：{_clip(j.get('title'), 100)}；{_clip(j.get('result'), 240)}",
+        )
+        for j in state.get("long_tasks", [])
+        if j.get("status") == "completed"
+    )
+    lines = list(
+        dict.fromkeys(
+            text for _, text in sorted(rows, key=lambda row: row[0], reverse=True)
+        )
+    )[:12]
+    titles = list(
+        dict.fromkeys(
+            (_clip(r.get("title"), 80), r.get("status") == "drafting")
+            for r in reversed(state.get("saved_works", []))
+            if r.get("saved") is True and r.get("title")
+        )
+    )[:10]
+    lines.extend(
+        f"已保存{'草稿' if draft else '作品'}：《{title}》" for title, draft in titles
+    )
+    if not lines:
+        return ""
+    return (
+        "【已完成或实际保存的历史记录，不是待办】\n"
+        + "\n".join(lines)
+        + "\n用户问起时按记录回答；没有新要求不要重复执行。已保存草稿不等于整项结题；"
+        "已结项不代表每个外部步骤都有回执，也不等于成果已发送。后来一轮失败不会抹掉之前已保存的结果。\n"
+    )
+
+
 def action_memory_summary(state):
     """One-line natural-language fact line for long-term bot-action memory.
 
@@ -158,8 +250,16 @@ def action_memory_summary(state):
         if part and part not in cleaned:
             cleaned.append(part)
     # Prioritize facts over receipts: keep first 800 chars of core facts, last 400 of tools
-    core = [c for c in cleaned if not any(r in c for r in ["保存成功", "失败，", "已发送", "完成，"])]
-    receipts = [c for c in cleaned if any(r in c for r in ["保存成功", "失败，", "已发送", "完成，"])]
+    core = [
+        c
+        for c in cleaned
+        if not any(r in c for r in ["保存成功", "失败，", "已发送", "完成，"])
+    ]
+    receipts = [
+        c
+        for c in cleaned
+        if any(r in c for r in ["保存成功", "失败，", "已发送", "完成，"])
+    ]
     result = core[:6] + receipts[:2]
     return "；".join(result)[:1200]
 

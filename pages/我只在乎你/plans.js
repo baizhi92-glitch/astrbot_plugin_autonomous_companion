@@ -95,6 +95,11 @@ function renderPlans() {
   }
   const settings = data.config;
   const projects = s.state.projects || [];
+  const workingProjects = projects.filter(project => ["active", "paused"].includes(project.status));
+  const projectHistory = projects.filter(project => !workingProjects.includes(project)).reverse();
+  const jobs = s.state.long_tasks || [];
+  const finishedJobs = jobs.filter(job => ["completed", "cancelled"].includes(job.status)).reverse();
+  const jobCard = job => `<details class="work"><summary><span class="work-title">${escapeHTML(job.title)}</span><span class="pill">${escapeHTML(({queued:"排队中",running:"执行中",waiting:"等待核对",paused:"已暂停",failed:"失败",completed:"已完成",cancelled:"已取消"})[job.status] || job.status)}</span></summary><div class="work-detail stack"><p>${escapeHTML(job.goal)}</p><p class="hint">已推进 ${job.steps} 个阶段 · 尝试 ${job.attempts} 次</p>${job.error ? `<p class="hint">${escapeHTML(job.error)}</p>` : ""}<pre class="text-preview">${escapeHTML(job.result || "尚无结果")}</pre><details><summary>阶段记录</summary>${(job.log || []).map(entry => `<p>${timeText(entry.at)} · ${escapeHTML(entry.summary)}</p>`).join("")}</details><div class="actions">${([...(["queued","running"].includes(job.status) ? ["pause","cancel"] : ["paused","waiting","failed"].includes(job.status) ? ["resume","cancel"] : []), "delete"]).map(op => `<button data-long-task="${escapeHTML(job.id)}" data-operation="${op}" type="button">${({pause:"暂停",resume:"核对后恢复",cancel:"取消",delete:"删除记录"})[op]}</button>`).join("")}</div></div></details>`;
   const notes = Object.entries(s.state.notes || {}).sort((a, b) => {
     const rank = ([, note]) => (note.kind === "preference" ? 2 : note.confirmed ? 1 : 0);
     return rank(b) - rank(a);
@@ -113,12 +118,17 @@ function renderPlans() {
   const pause = s.state.pause_until > Date.now() / 1000;
 
   host.innerHTML = `
-    <div class="group-head"><h3>她在做什么</h3><p class="hint">长期任务、下次主动想做的事、以及长期目标。</p></div>
-    <section class="panel"><div class="panel-head"><div><h2>长期任务</h2><p class="hint">独立执行上下文，后台推进；中断后等待核对，不自动重放。</p></div><button id="add-long-task" type="button">添加长期任务</button></div>
-    <div class="panel-body stack">${(s.state.long_tasks || []).map(job => `<details class="work"><summary><span class="work-title">${escapeHTML(job.title)}</span><span class="pill">${escapeHTML(({queued:"排队中",running:"执行中",waiting:"等待核对",paused:"已暂停",failed:"失败",completed:"已完成",cancelled:"已取消"})[job.status] || job.status)}</span></summary><div class="work-detail stack"><p>${escapeHTML(job.goal)}</p><p class="hint">阶段 ${job.steps} · 尝试 ${job.attempts} · ${escapeHTML(job.workspace || "工作区尚未创建")}</p><pre class="text-preview">${escapeHTML(job.result || job.error || "尚无结果")}</pre><details><summary>阶段记录</summary>${(job.log || []).map(entry => `<p>${timeText(entry.at)} · ${escapeHTML(entry.summary)}</p>`).join("")}</details><div class="actions">${(["queued","running"].includes(job.status) ? ["pause","cancel"] : ["paused","waiting","failed"].includes(job.status) ? ["resume","cancel"] : ["delete"]).map(op => `<button data-long-task="${escapeHTML(job.id)}" data-operation="${op}" type="button">${({pause:"暂停",resume:"核对后恢复",cancel:"取消",delete:"移除记录"})[op]}</button>`).join("")}</div></div></details>`).join("") || '<p class="hint">尚无长期任务。可为资料整理、创作或排查任务设定明确目标和完成标准。</p>'}</div></section>
-    <section class="panel">
+    <nav class="section-guide" aria-label="了解计划类型">
+      <a href="#plan-next"><b>临时安排</b><span>下次适合行动时做一次</span></a>
+      <a href="#plan-projects"><b>持续项目</b><span>分多次主动互动推进</span></a>
+      <a href="#plan-background"><b>长期任务</b><span>在后台分阶段完成</span></a>
+    </nav>
+    <section class="panel" id="plan-background"><div class="panel-head"><div><h2>长期任务</h2><p class="hint">在后台分阶段执行；中断后等你核对，不会自动重做。</p></div><button id="add-long-task" type="button">添加长期任务</button></div>
+    <div class="panel-body stack">${jobs.filter(job => !finishedJobs.includes(job)).map(jobCard).join("") || '<p class="hint">暂无待执行任务。适合有明确完成标准的资料整理、创作或排查。</p>'}
+    ${finishedJobs.length ? `<details><summary>任务历史（${finishedJobs.length}）</summary>${finishedJobs.map(jobCard).join("")}</details>` : ""}</div></section>
+    <section class="panel" id="plan-next">
       <div class="panel-head">
-        <div><h2>下一次想做的事</h2><p class="hint">她能结合新对话重新判断，也可以由你直接安排。</p></div>
+        <div><h2>临时安排</h2><p class="hint">她能结合新对话重新判断，也可以由你直接安排。</p></div>
         <span class="pill">${s.state.future_task ? "已有计划" : "自然发生"}</span>
       </div>
       <div class="panel-body stack">
@@ -146,13 +156,13 @@ function renderPlans() {
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel" id="plan-projects">
       <div class="panel-head">
-        <div><h2>持续项目</h2><p class="hint">长期目标、进度与下一步，最多 5 个。</p></div>
+        <div><h2>持续项目</h2><p class="hint">随主动轮按进度推进 · 已占 ${workingProjects.length} / 5 个栏位（进行中与已暂停）。</p></div>
         <button id="add-project" type="button">添加项目</button>
       </div>
       <div class="panel-body stack">
-        ${projects.map(project => `
+        ${workingProjects.map(project => `
           <details class="work">
             <summary>
               <span class="work-kind">项目</span>
@@ -169,17 +179,14 @@ function renderPlans() {
               <div class="row wrap">
                 <button data-project-edit="${escapeHTML(project.id)}" type="button">编辑项目</button>
                 ${project.status === "active" ? `<button data-project-run="${escapeHTML(project.id)}" type="button">安排推进</button>` : ""}
-                <label class="inline-field">状态
-                  <select data-project="${escapeHTML(project.id)}" aria-label="${escapeHTML(project.title)}的状态">
-                    ${["active", "paused", "completed", "cancelled"].map(status => `<option value="${status}" ${project.status === status ? "selected" : ""}>${labels[status]}</option>`).join("")}
-                  </select>
-                </label>
+                ${[[project.status === "active" ? "paused" : "active", project.status === "active" ? "暂停" : "恢复"], ["completed", "标为完成"], ["cancelled", "取消"]].map(([status, text]) => `<button data-project="${escapeHTML(project.id)}" data-status="${status}" type="button">${text}</button>`).join("")}
                 <span class="grow"></span>
                 <button class="btn-danger" data-project-delete="${escapeHTML(project.id)}" type="button">删除项目</button>
               </div>
               ${(project.history || []).length ? `<details><summary>历史版本（${project.history.length}）</summary>${[...project.history].reverse().map(version => `<details><summary>${timeText(version.at)} · ${escapeHTML(version.title)}</summary><pre class="text-preview">${escapeHTML(JSON.stringify(version, null, 2))}</pre></details>`).join("")}</details>` : ""}
             </div>
-          </details>`).join("") || '<p class="empty">还没有持续项目。聊聊故事、画作或共同兴趣，她会从中产生项目。</p>'}
+          </details>`).join("") || '<p class="empty">暂无进行中或暂停的项目。</p>'}
+        ${projectHistory.length ? `<details><summary>项目历史（${projectHistory.length}，不占栏位）</summary><div class="stack">${projectHistory.map(project => `<details class="work"><summary><span class="work-title">${escapeHTML(project.title)}</span><span class="pill">${labels[project.status] || escapeHTML(project.status)}</span></summary><div class="work-detail stack"><p>${escapeHTML(project.goal || "")}</p><pre class="text-preview">${escapeHTML(project.progress || "暂无记录")}</pre>${project.artifact ? `<p>${escapeHTML(project.artifact)}</p>` : ""}<div class="actions"><button class="btn-danger" data-project-delete="${escapeHTML(project.id)}" type="button">删除记录</button></div></div></details>`).join("")}</div></details>` : ""}
       </div>
     </section>
 
@@ -208,7 +215,7 @@ function renderPlans() {
 
     <section class="panel">
       <div class="panel-head">
-        <div><h2>关于你</h2><p class="hint">她记下的关于你的事，分三类：<strong>偏好</strong>会约束她开口的时间、话题与语气，<strong>事实</strong>和<strong>爱好</strong>只用来挑话题。不限条数；标着"未确认"的只是她的猜测，她不会当成你说过的话。人会变，每条都能改。</p></div>
+        <div><h2>关于你</h2><p class="hint">只自动记录你明确说过的长期<strong>互动偏好</strong>和与陪伴有关的<strong>事实</strong>。保留对应原话，不把朋友的事记成你的事，也不把一次任务记成偏好。旧记录仍可编辑。</p></div>
         <div class="actions">
           <span class="pill">共 ${notes.length} 条${pendingCount ? ` · ${pendingCount} 条待确认` : ""}</span>
           <button id="add-note" type="button">添加一条</button>
@@ -304,7 +311,9 @@ function renderPlans() {
     perform({umo:s.umo,action:"long_task",operation:"create",title,goal});
   };
   host.querySelectorAll("[data-long-task]").forEach(button => button.onclick = async () => {
-    if (await pageConfirm("确认执行此操作？恢复前请核对已提交的外部任务，避免重复。")) perform({umo:s.umo,action:"long_task",id:button.dataset.longTask,operation:button.dataset.operation});
+    const operation = button.dataset.operation;
+    const question = {pause:"暂停这个任务？进度会保留。", resume:"确认已核对外部结果并恢复这个任务？", cancel:"取消这个任务？它不会继续执行，已有结果会保留。", delete:"停止任务并删除记录？已生成的文件不会删除。"}[operation];
+    if (await pageConfirm(question)) perform({umo:s.umo,action:"long_task",id:button.dataset.longTask,operation});
   });
   $("save-plan").onclick = () => perform({ action: "plan", umo: s.umo, value: $("plan-editor").value });
   $("cancel-plan").onclick = () => perform({ action: "cancel_plan", umo: s.umo });
@@ -321,11 +330,15 @@ function renderPlans() {
     perform({ umo: s.umo, action: "project_add", title, goal });
   };
   document.querySelectorAll("[data-project]").forEach(element => {
-    element.onchange = () => perform({ action: "project", umo: s.umo, id: element.dataset.project, status: element.value });
+    element.onclick = async () => {
+      const status = element.dataset.status;
+      const question = {completed:"标为完成并移入项目历史？", cancelled:"取消这个项目？已有进展会保留，不再自动推进。"}[status];
+      if (!question || await pageConfirm(question)) perform({ action: "project", umo: s.umo, id: element.dataset.project, status });
+    };
   });
   document.querySelectorAll("[data-project-delete]").forEach(element => {
     element.onclick = async () => {
-      if (await pageConfirm("删除此项目及其进展记录？")) perform({ umo: s.umo, action: "project_delete", id: element.dataset.projectDelete });
+      if (await pageConfirm("停止此项目并删除进展记录？已保存的作品文件不会删除。")) perform({ umo: s.umo, action: "project_delete", id: element.dataset.projectDelete });
     };
   });
   document.querySelectorAll("[data-project-edit]").forEach(element => {

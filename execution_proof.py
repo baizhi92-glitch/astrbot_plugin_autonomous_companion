@@ -79,7 +79,7 @@ def validate_contract(value, tool_names):
     return {"mode": value["mode"], "steps": clean if value["mode"] == "action" else []}
 
 
-def required_action(text):
+def required_action(text, *, long_task=False):
     # Negated mentions ("不提绘图失败") explicitly avoid a topic instead of
     # performing it; strip those clauses before classifying the task.
     cleaned = re.sub(
@@ -87,7 +87,52 @@ def required_action(text):
         "",
         str(text),
     )
-    if re.search(r"画(?:一|个|张|幅|图)|绘图|生图|补画|生成.*(?:图|视频|音频)", cleaned):
+    if long_task:
+        # Keep reply-only writing and explanations separate from explicit actions.
+        cleaned = re.sub(
+            r"\b(?:explain|describe|show me)\s+how\s+to\b[^,.;!?]*|"
+            r"\b(?:without|do not|don't|no need to)\s+(?:actually\s+)?"
+            r"(?:sav(?:e|ing)|run(?:ning)?|execut(?:e|ing)|upload(?:ing)?|download(?:ing)?)[^,.;!?]*",
+            "",
+            cleaned,
+            flags=re.I,
+        )
+        cleaned = re.sub(
+            r"(?:不用|无需|不要|不必)(?:实际)?(?:保存|写入|执行|运行|发送|上传|下载)[^，。；;！？]*",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"(?:解释|说明|描述|介绍|教我)(?:一下)?(?:如何|怎么|怎样)[^，。；;！？]*",
+            "",
+            cleaned,
+        )
+        if re.search(
+            r"\b(?:save|write\s+(?:to|into)|create\s+(?:a\s+)?(?:file|directory))\b",
+            cleaned,
+            re.I,
+        ):
+            return "save"
+        if re.search(
+            r"(?:运行|执行)(?:代码|脚本|命令|程序)|"
+            r"\b(?:run|execute)\s+(?:(?:the|a|this|some)\s+)?(?:script|command|code|program)\b",
+            cleaned,
+            re.I,
+        ):
+            return "run"
+        if re.search(
+            r"(?:打开|读取|修改|删除|重命名|列出|创建|新建).{0,12}(?:文件|目录|路径)|"
+            r"(?:查询|查看)(?:当前|实时|最新)|(?:设置|创建|添加|安排)(?:闹钟|提醒|日程)|"
+            r"\b(?:upload|download|(?:read|delete|update|rename|open)\s+(?:(?:the|a|this)\s+)?(?:file|directory)|"
+            r"(?:check|look up|fetch)\s+(?:(?:the|a)\s+)?(?:current|latest|live)|"
+            r"(?:schedule|set)\s+(?:(?:the|a)\s+)?(?:an?\s+)?(?:reminder|appointment|alarm))\b",
+            cleaned,
+            re.I,
+        ):
+            return "external"
+    if re.search(
+        r"画(?:一|个|张|幅|图)|绘图|生图|补画|生成.*(?:图|视频|音频)", cleaned
+    ):
         return "media"
     if re.search(r"保存|写入|落盘|存到|存入", cleaned):
         return "save"
@@ -97,15 +142,19 @@ def required_action(text):
 
 
 def receipt_status(name, text, is_error=False):
-    if is_error or any(
-        marker in text.lower()
-        for marker in ("error:", "fail:", "timed out", "permission denied")
-    ):
+    if is_error:
         return "failed"
     try:
         value = json.loads(text)
     except (ValueError, TypeError):
-        return "unverified"
+        return (
+            "failed"
+            if any(
+                marker in text.lower()
+                for marker in ("error:", "fail:", "timed out", "permission denied")
+            )
+            else "unverified"
+        )
     if not isinstance(value, dict):
         return "unverified"
     if isinstance(value.get("data"), dict):
@@ -116,12 +165,14 @@ def receipt_status(name, text, is_error=False):
         "status"
     ) in {"error", "failed", "disabled"}:
         return "failed"
+    if isinstance(value.get("exit_code"), int) and value["exit_code"] != 0:
+        return "failed"
     if (
         name == "autonomous_save_work"
         and value.get("saved") is True
         and value.get("path")
     ):
-        return "verified"
+        return "observed" if value.get("status") == "drafting" else "verified"
     if value.get("status") == "completed" and value.get("outputs"):
         return "verified"
     if value.get("generated") is True and (
@@ -149,59 +200,37 @@ def receipt_status(name, text, is_error=False):
     return "unverified"
 
 
-def execution_verdict(event, family):
+def execution_verdict(event, family, *, long_task=False):
     receipts = getattr(event, "action_receipts", [])
     contract = getattr(event, "execution_contract", None)
     if contract and contract["mode"] == "action":
-        task = getattr(event, "checkpoint_task", "")
-        media_goal_satisfied = (
-            required_action(task) == "media"
-            and getattr(event, "media_deliveries", 0) > 0
-            and any(
-                r["status"] == "verified"
-                and any(
-                    s in r["tool"].lower()
-                    for s in ("template", "generate", "image", "photo", "video")
-                )
-                for r in receipts
-            )
-        )
-        missing = []
-        for step in contract["steps"]:
-            if not step["tools"] and step.get("kind") == "reply":
-                # A dialogue step is fulfilled by the final message phase,
-                # not a mandatory external tool invocation.
-                continue
-            if media_goal_satisfied and step["accept"] == "observed":
-                continue
-            if getattr(event, "media_deliveries", 0) and any(
-                s in step["goal"] for s in ("发送", "投递")
-            ):
-                continue
-            accepted = (
-                {"verified"}
-                | ({"success"} if step["accept"] in {"success", "observed"} else set())
-                | (
-                    {"observed", "unverified"}
-                    if step["accept"] == "observed"
-                    else set()
-                )
-            )
-            matching = [r for r in receipts if r["tool"] in step["tools"]]
-            if not any(r["status"] in accepted for r in matching):
-                missing.append(step["goal"])
+        steps = [
+            step
+            for step in contract["steps"]
+            if step["tools"] or step.get("kind") != "reply"
+        ]
+        # At most four steps: track the subsets that distinct receipts can cover.
+        # A delivery counter cannot identify a step or stand in for a receipt.
+        accepted = {
+            "observed": {"observed", "success", "verified", "completed"},
+            "success": {"success", "verified", "completed"},
+            "completed": {"verified", "completed"},
+        }
+        covered = {0}
+        for receipt in receipts:
+            covered |= {
+                mask | (1 << index)
+                for mask in covered
+                for index, step in enumerate(steps)
+                if receipt.get("tool") in step["tools"]
+                and receipt.get("status") in accepted[step["accept"]]
+            }
+        best = max(covered, key=lambda mask: (mask.bit_count(), -mask))
+        missing = [
+            step["goal"] for index, step in enumerate(steps) if not best & (1 << index)
+        ]
         if not missing:
             return "verified", "契约各目标已有对应工具回执；语义条件仍以实际结果为准"
-        if media_goal_satisfied:
-            # The core media deliverable was generated and actually delivered.
-            # A pending media checkpoint is retried wholesale, which re-sends
-            # media the user already received, so auxiliary step failures
-            # must not keep the checkpoint pending.
-            return (
-                "verified",
-                "核心媒体已生成并实际投递；辅助步骤未全部完成，为避免重复投递不再重试。未完成项："
-                + "；".join(missing),
-            )
         return (
             "unexecuted"
             if not receipts
@@ -219,6 +248,15 @@ def execution_verdict(event, family):
         relevant = (
             (family == "save" and any(s in name for s in ("save", "write", "edit")))
             or (
+                family == "run"
+                and name
+                in {
+                    "autonomous_run_command",
+                    "autonomous_dsh_task",
+                    "autonomous_dsh_cli",
+                }
+            )
+            or (
                 family == "media"
                 and any(
                     s in name
@@ -235,7 +273,10 @@ def execution_verdict(event, family):
             )
             or family == "external"
         )
-        if relevant and item["status"] == "verified":
+        if relevant and (
+            item["status"] in {"verified", "completed"}
+            or (long_task and family != "media" and item["status"] == "success")
+        ):
             return "verified", "已获得相关工具的实际结果凭据"
     if any(item["status"] == "pending" for item in receipts):
         return "pending", "已有任务标识或运行状态，尚不能确认目标完成"

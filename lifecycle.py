@@ -84,6 +84,7 @@ def appointment_updates(state, updates, user_text):
     """
     if not isinstance(updates, list) or len(updates) > 3:
         raise ValueError("Invalid appointment updates")
+    now = time.time()
     items = [dict(item) for item in state.get("appointments", [])]
     for update in updates:
         if not isinstance(update, dict):
@@ -122,7 +123,7 @@ def appointment_updates(state, updates, user_text):
             or not title.strip()
         ):
             raise ValueError("Invalid appointment deadline or title")
-        if not time.time() - 3600 <= due <= time.time() + 90 * 86400:
+        if not now - 3600 <= due <= now + 90 * 86400:
             continue
         if any(
             item["title"] == title[:100] and abs(item["due_at"] - due) < 1800
@@ -131,7 +132,13 @@ def appointment_updates(state, updates, user_text):
             continue
         if len(items) >= 20:
             retired = next(
-                (item for item in items if item["status"] != "pending"), None
+                (
+                    item
+                    for item in items
+                    if item["status"] != "pending"
+                    or item.get("due_at", 0) < now - 86400
+                ),
+                None,
             )
             if retired is None:
                 continue

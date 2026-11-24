@@ -91,9 +91,7 @@ class DSHWorker:
         self.last_error = ""
         self.last_duration = 0.0
         self._procs: set[asyncio.subprocess.Process] = set()
-        self._semaphore = asyncio.Semaphore(
-            max(1, self._int("dsh_max_concurrency", 1))
-        )
+        self._semaphore = asyncio.Semaphore(max(1, self._int("dsh_max_concurrency", 1)))
         self._api_key_source = ""
         self.last_snapshot = ""
 
@@ -170,7 +168,9 @@ class DSHWorker:
         return self._plugin_data_dir() / "dsh_workspace"
 
     def working_dir(self, override: str = "") -> Path:
-        text = (override or "").strip() or str(self._get("dsh_working_dir", "") or "").strip()
+        text = (override or "").strip() or str(
+            self._get("dsh_working_dir", "") or ""
+        ).strip()
         path = Path(os.path.expandvars(text)) if text else self.default_working_dir()
         try:
             path.mkdir(parents=True, exist_ok=True)
@@ -209,7 +209,9 @@ class DSHWorker:
         files: list[Path] = []
         appdata = os.environ.get("APPDATA", "").strip()
         if appdata:
-            files.append(Path(appdata) / "dsh-desktop" / "harness" / ".credentials.yaml")
+            files.append(
+                Path(appdata) / "dsh-desktop" / "harness" / ".credentials.yaml"
+            )
         files.append(Path.home() / ".dsh" / ".credentials.yaml")
         return files
 
@@ -268,7 +270,9 @@ class DSHWorker:
             "off",
             "no",
         }:
-            return self._result(False, "", "本机执行通道已在插件配置里关闭（dsh_enabled）")
+            return self._result(
+                False, "", "本机执行通道已在插件配置里关闭（dsh_enabled）"
+            )
 
         try:
             command = self.resolve_command()
@@ -323,14 +327,14 @@ class DSHWorker:
                 output = _decode(out_raw).strip()
                 error = _decode(err_raw).strip()
                 self.last_duration = round(time.time() - started, 1)
-                if code != 0 and not output:
+                if code != 0:
                     self.failed += 1
                     self.last_error = error[:400] or f"dsh 退出码 {code}"
                     self.completed += 1
                     return self._result(
                         False,
                         _clamp(output, self._result_limit()),
-                        f"dsh 退出码 {code}：{error[:800] or '没有输出'}",
+                        f"dsh 退出码 {code}：{error[:800] or '没有错误输出'}",
                         cwd,
                     )
                 self.completed += 1
@@ -341,9 +345,7 @@ class DSHWorker:
                         "",
                         cwd,
                     )
-                return self._result(
-                    True, _clamp(output, self._result_limit()), "", cwd
-                )
+                return self._result(True, _clamp(output, self._result_limit()), "", cwd)
             except asyncio.TimeoutError:
                 self.failed += 1
                 self.last_error = f"超时（{limit} 秒）"
@@ -387,7 +389,9 @@ class DSHWorker:
             "off",
             "no",
         }:
-            return self._result(False, "", "本机执行通道已在插件配置里关闭（dsh_enabled）")
+            return self._result(
+                False, "", "本机执行通道已在插件配置里关闭（dsh_enabled）"
+            )
         try:
             command = self.resolve_command()
         except FileNotFoundError as exc:

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import locale
 import os
+import signal
 import time
 from pathlib import Path
 
@@ -25,12 +26,47 @@ MAX_OUTPUT_CHARS = 6000
 MAX_WRITE_BYTES = 4 * 1024 * 1024
 
 
+_QUOTE_PAIRS = {'"': '"', "'": "'", "\u201c": "\u201d", "\u2018": "\u2019"}
+
+
+def clean_root(raw) -> Path | None:
+    """Normalize a configured root path before it becomes an allow-list entry.
+
+    Args:
+        raw: Raw config value, possibly pasted straight out of a file dialog.
+
+    Returns:
+        The path with surrounding quotes, variables and stray spaces removed,
+        or None when nothing usable is left.
+
+    Pasting a path usually drags its quotes along: ``"D:/xyl"``. Path() then
+    reads it as a relative name, so the allow-list never matches the real
+    directory and every read reports "路径不在允许读取的目录里" while echoing
+    the very same path back - an unfixable-looking error with a one
+    character cause.
+    """
+    text = str(raw or "").strip()
+    changed = True
+    while changed and len(text) >= 2:
+        changed = False
+        opener, closer = text[0], text[-1]
+        if _QUOTE_PAIRS.get(opener) == closer or opener == closer and opener in "\"'":
+            text = text[1:-1].strip()
+            changed = True
+    if not text:
+        return None
+    return Path(os.path.expandvars(text)).expanduser()
+
+
 class Workspace:
     """Resolved, root-bound view of the local file system for the companion."""
 
     def __init__(self, write_root: Path, read_roots: list[Path]) -> None:
-        self.write_root = Path(write_root)
-        self.read_roots = [Path(item) for item in read_roots] or [self.write_root]
+        # 不管调用方有没有清洗过，进白名单前一律再清一遍。
+        self.write_root = clean_root(write_root) or Path(write_root)
+        self.read_roots = [clean_root(item) or Path(item) for item in read_roots] or [
+            self.write_root
+        ]
 
     def _within(self, path: Path, roots: list[Path]) -> bool:
         for root in roots:
@@ -49,10 +85,9 @@ class Workspace:
         if not path.is_absolute():
             path = self.write_root / path
         path = path.resolve()
-        if not self._within(path, [self.write_root.resolve()]):
-            raise PermissionError(
-                f"这个路径不在可写目录里：{path}；只能写 {self.write_root}"
-            )
+        root = self.write_root.resolve()
+        if not self._within(path, [root]):
+            raise PermissionError(f"这个路径不在可写目录里：{path}；只能写 {root}")
         return path
 
     def read_path(self, raw: str) -> Path:
@@ -64,12 +99,15 @@ class Workspace:
         if not path.is_absolute():
             path = self.write_root / path
         path = path.resolve()
-        if not self._within(path, [root.resolve() for root in self.read_roots]):
+        roots = [root.resolve() for root in self.read_roots]
+        if not self._within(path, roots):
+            # 报错要打印解析后的真实目录，否则白名单里那个带引号的假路径
+            # 会让日志看起来自相矛盾（拒的和允许的是同一个字符串）。
             raise PermissionError(
                 "这个路径不在允许读取的目录里："
                 + str(path)
                 + "；允许读取："
-                + "、".join(str(root) for root in self.read_roots)
+                + "、".join(str(root) for root in roots)
             )
         return path
 
@@ -131,7 +169,9 @@ def write_file(
         backup = take_snapshot(workspace.write_root, store, keep, "write")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        with open(target, "a" if append else "w", encoding="utf-8", newline="") as handle:
+        with open(
+            target, "a" if append else "w", encoding="utf-8", newline=""
+        ) as handle:
             handle.write(body)
     except OSError as exc:
         return _fail(f"写不进去：{exc}")
@@ -267,12 +307,17 @@ async def run_command(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             creationflags=creationflags,
+            start_new_session=os.name != "nt",
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=limit)
     except asyncio.TimeoutError:
         if proc is not None:
             await _kill_tree(proc)
         return _fail(f"命令超过 {limit} 秒没结束，已强制停止")
+    except asyncio.CancelledError:
+        if proc is not None:
+            await _kill_tree(proc)
+        raise
     except OSError as exc:
         return _fail(f"起不了进程：{exc}")
     output = _decode_output(out)
@@ -330,11 +375,16 @@ async def _kill_tree(proc) -> None:
                 stderr=asyncio.subprocess.DEVNULL,
                 creationflags=0x08000000,
             )
-            await killer.wait()
+            if await killer.wait() != 0 and proc.returncode is None:
+                proc.kill()
         else:
-            proc.kill()
+            os.killpg(proc.pid, signal.SIGKILL)
     except OSError:
-        pass
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
     try:
         await asyncio.wait_for(proc.wait(), timeout=10)
     except (asyncio.TimeoutError, OSError):

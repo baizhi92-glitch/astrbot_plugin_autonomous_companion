@@ -65,21 +65,64 @@ function baseState(extra) {
   }, extra);
 }
 
-test("settings page groups every option under a described heading", () => {
+test("settings starts with the target, folds every optional group and never echoes the secret", () => {
   const h = harness();
   const schema = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "_conf_schema.json"), "utf8"));
-  const config = {};
-  for (const [key, spec] of Object.entries(schema)) config[key] = spec.default;
+  const config = Object.fromEntries(Object.entries(schema).map(([key, spec]) => [key, spec.default]));
+  config.dsh_api_key = "secret-must-not-be-rendered";
   h.run(`data = { schema: ${JSON.stringify(schema)}, config: ${JSON.stringify(config)}, platforms: [] }; renderSettings();`);
   const html = h.byId("config-fields").innerHTML;
-  const blocks = html.match(/<section class="panel">|<details class="panel">/g) || [];
-  assert.equal(blocks.length, 12, "twelve settings groups");
-  const open = html.match(/<h2>[^<]+<\/h2><p class="hint">[^<]+<\/p>/g) || [];
-  const folded = html.match(/<span class="hint">\d+ 项 · 默认收起<\/span><\/summary><div class="panel-body stack"><p class="hint">[^<]+<\/p>/g) || [];
-  assert.equal(open.length + folded.length, 12, "every group explains what it is for");
-  // 每个配置项都必须能在页面上改到，否则等于藏了一个开关
-  const rendered = new Set([...html.matchAll(/data-config="([a-z0-9_]+)"/g)].map(m => m[1]));
-  assert.deepEqual(Object.keys(schema).filter(key => !rendered.has(key)), []);
+  const folded = [...html.matchAll(/<details class="panel settings-group"[^>]*>\s*<summary><span class="settings-summary"><strong>[^<]+<\/strong><span class="hint">[^<]+<\/span>/g)];
+  assert.equal(folded.length, 11, "every optional group explains what it is for");
+  assert.doesNotMatch(html, /<details[^>]+\bopen\b/);
+  assert.match(html, /尚未添加对象[\s\S]*data-config="targets"[\s\S]*未检测到 QQ 平台[\s\S]*id="save-settings"[\s\S]*更多设置/);
+  assert.match(html, /<details class="panel settings-runtime"[^>]*>[\s\S]*data-config="enabled"[\s\S]*data-config="platform_id"/);
+  const rendered = [...html.matchAll(/data-config="([a-z0-9_]+)"/g)].map(m => m[1]);
+  assert.deepEqual(rendered.sort(), Object.keys(schema).sort(), "all settings appear exactly once");
+  assert.match(html, /data-config="dsh_api_key" type="password" autocomplete="new-password"/);
+  assert.doesNotMatch(html, /secret-must-not-be-rendered/);
+
+  h.run(`data.platforms = [{id: "work", name: "aiocqhttp"}, {id: "other", name: "other"}]; renderSettings();`);
+  assert.match(h.byId("config-fields").innerHTML, /将自动使用 QQ 平台：work[\s\S]*settings-runtime[^>]*>[\s\S]*data-config="platform_id"/);
+  h.run(`data.config.targets = ["123"]; data.platforms.push({id: "home", name: "aiocqhttp"}); renderSettings();`);
+  assert.match(h.byId("config-fields").innerHTML, /已保存 1 个对象[\s\S]*data-config="targets"[\s\S]*data-config="platform_id"[\s\S]*检测到多个 QQ 平台[\s\S]*settings-runtime/);
+  h.run(`data.config.platform_id = "unavailable<&"; data.platforms.pop(); renderSettings();`);
+  assert.match(h.byId("config-fields").innerHTML, /<option selected value="unavailable&lt;&amp;">[^<]+<\/option>[\s\S]*上次选择的 QQ 平台当前不可用/);
+});
+
+test("settings saves folded fields and only sends a newly entered secret", async () => {
+  const h = harness();
+  await h.run(`(async () => {
+    const form = $("config-form");
+    const settingsFields = [
+      {dataset: {config: "targets"}, value: "123\\n456，789"},
+      {dataset: {config: "enabled"}, checked: false},
+      {dataset: {config: "speak_schedule_limit"}, value: "8"},
+      {dataset: {config: "dsh_api_key"}, value: "  "},
+    ];
+    const saveButtons = [{}, {}];
+    form.querySelectorAll = selector => selector === "[data-config]" ? settingsFields : saveButtons;
+    data = {schema: {
+      targets: {type: "list"}, enabled: {type: "bool"},
+      speak_schedule_limit: {type: "int"}, dsh_api_key: {type: "string"},
+    }};
+    window.posts = [];
+    api = async (method, endpoint, body) => window.posts.push({method, endpoint, body});
+    refresh = async () => {};
+    const event = {currentTarget: form, preventDefault() {}};
+    await form.onsubmit(event);
+    settingsFields[3].value = "new secret";
+    await form.onsubmit(event);
+    window.secretCleared = settingsFields[3].value === "";
+    window.buttonsRestored = saveButtons.every(button => !button.disabled);
+  })()`);
+  const posts = JSON.parse(h.run("JSON.stringify(window.posts)"));
+  const body = { targets: ["123", "456", "789"], enabled: false, speak_schedule_limit: 8 };
+  assert.deepEqual(posts, [
+    { method: "POST", endpoint: "config", body },
+    { method: "POST", endpoint: "config", body: { ...body, dsh_api_key: "new secret" } },
+  ]);
+  assert.equal(h.run("window.secretCleared && window.buttonsRestored"), true);
 });
 
 test("activity axis ticks sit under their own bar, not at the two ends", () => {
@@ -164,8 +207,8 @@ test("overview card shows the self-committed opening with relative time", () => 
   assert.match(sessions, /她自己约定的开口时间/);
   assert.ok(sessions.includes(expected), `card should show the relative time ${expected}`);
   assert.match(sessions, /…<\/div>/, "long reasons are clipped");
-  assert.ok(metrics.includes("约好开口 · " + expected), "metric label carries the next opening");
-  assert.match(metrics, /<b>1<\/b>\s*<span>约好开口/);
+  assert.ok(metrics.includes(`<small>${expected}</small>`), "metric carries the next opening time");
+  assert.match(metrics, /<b>1<\/b>\s*<span class="stat-label">主动开口计划/);
 });
 
 test("a due commitment reads 已到点 instead of 约 0 分钟后", () => {
@@ -177,15 +220,15 @@ test("a due commitment reads 已到点 instead of 约 0 分钟后", () => {
   assert.match(sessions, /她自己约定的开口时间[\s\S]*已到点/);
   assert.doesNotMatch(sessions, /约 0 分钟后/);
   assert.doesNotMatch(sessions, /（0 分钟后）/);
-  assert.match(metrics, /约好开口 · 已到点/);
+  assert.match(metrics, /主动开口计划<\/span><small>已到点<\/small>/);
 });
 
-test("no commitment renders no opening line, and the metric reads 约好开口 0", () => {
+test("no commitment renders no opening line, and the metric reads 主动开口计划 0", () => {
   const h = harness();
   load(h, baseState({}));
   h.run("renderMetrics(sessions()); renderSessions(sessions());");
   assert.doesNotMatch(h.byId("sessions").innerHTML, /她自己约定的开口时间/);
-  assert.match(h.byId("metrics").innerHTML, /<b>0<\/b>\s*<span>约好开口/);
+  assert.match(h.byId("metrics").innerHTML, /<b>0<\/b>\s*<span class="stat-label">主动开口计划<\/span><small>暂无安排<\/small>/);
 });
 
 test("plans page exposes the opening as a stat and explains the toggle", () => {

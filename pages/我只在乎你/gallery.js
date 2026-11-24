@@ -2,6 +2,7 @@
 const previewCache = new Map();
 const previewQueue = [];
 let previewActive = 0;
+let stopWorkMedia = null;
 
 function queuePreview(job) {
   previewQueue.push(job);
@@ -54,6 +55,77 @@ function mountGallery(details, session, item) {
   };
   details.addEventListener("toggle", () => { if (details.open) load(); });
   if (details.open) load();
+}
+
+function mountWorkMedia(details, session, item) {
+  const host = detailHost(details);
+  const status = document.createElement("p");
+  status.className = "hint";
+  status.setAttribute("role", "status");
+  host.append(status);
+  if (item.availability !== "local" || item.media_preview !== "ready") {
+    status.textContent = item.availability !== "local" ? "本地媒体文件缺失或不可用，无法预览。"
+      : item.media_preview === "too_large" ? "媒体超过 256 MB 预览上限。"
+      : item.media_preview === "empty" ? "媒体文件为空，无法预览。" : "此媒体格式不支持网页预览。";
+    return;
+  }
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "加载" + (item.media_kind === "audio" ? "音频" : "视频") + "播放器";
+  host.append(button);
+  let player = null;
+  let activation = 0;
+  const stop = () => {
+    ++activation;
+    if (stopWorkMedia === stop) stopWorkMedia = null;
+    if (player) {
+      player.pause();
+      player.removeAttribute("src");
+      player.load();
+      player.remove();
+      player = null;
+    }
+    status.textContent = "";
+    button.hidden = false;
+  };
+  button.onclick = () => {
+    if (!details.open || !details.isConnected || stopWorkMedia === stop) return;
+    if (stopWorkMedia) stopWorkMedia();
+    stopWorkMedia = stop;
+    button.hidden = true;
+    status.textContent = "正在准备播放器…";
+    const requested = ++activation;
+    queuePreview(async () => {
+      if (requested !== activation || !details.open || !details.isConnected) return;
+      try {
+        const { token } = await api("POST", "action", { umo: session.umo, action: "work_media", id: item.id });
+        if (requested !== activation || !details.open || !details.isConnected) return;
+        if (typeof token !== "string" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(token)) throw new Error("未收到有效的媒体凭据");
+        player = document.createElement(item.media_kind === "audio" ? "audio" : "video");
+        player.className = "preview";
+        player.controls = true;
+        player.preload = "none";
+        player.playsInline = true;
+        player.setAttribute("aria-label", item.title || button.textContent);
+        player.addEventListener("error", () => {
+          if (requested !== activation) return;
+          stop();
+          status.textContent = "无法播放：文件已失效或浏览器不支持该编码，可重新加载播放器。";
+        }, { once: true });
+        player.src = "/api/v1/files/tokens/" + token;
+        status.textContent = "";
+        host.append(player);
+      } catch (error) {
+        if (requested !== activation) return;
+        stop();
+        status.textContent = "无法加载媒体：" + error.message;
+      }
+    });
+  };
+  details.addEventListener("toggle", () => {
+    if (!details.open && stopWorkMedia === stop) stop();
+  });
 }
 
 function mountTextWork(details, session, item) {

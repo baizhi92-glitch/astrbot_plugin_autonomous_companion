@@ -5,12 +5,15 @@ import base64
 import hashlib
 import json
 import re
+import stat
+import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
 
 from astrbot.api.star import StarTools
+from astrbot.core.utils.media_utils import file_uri_to_path, is_file_uri
 
 TEXT_EXTENSIONS = {
     ".txt",
@@ -45,6 +48,24 @@ CODE_EXTENSIONS = {
     ".vue",
 }
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | {
+    ".mp3",
+    ".wav",
+    ".ogg",
+    ".flac",
+    ".m4a",
+    ".aac",
+    ".opus",
+    ".amr",
+    ".silk",
+    ".mp4",
+    ".webm",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".m4v",
+}
+MEDIA_ARCHIVE_LIMIT = 100 * 1024 * 1024
 
 
 def file_kind(path):
@@ -98,8 +119,18 @@ def register_local_work(state, path, producer, title="", status=None):
         return False
     source = str(target.resolve())
     identifier = hashlib.sha256(source.encode()).hexdigest()[:20]
+    if identifier in state.get("library_removed", {}):
+        return False
     works = state.setdefault("work_library", [])
-    item = next((w for w in works if w["id"] == identifier), None)
+    item = next(
+        (
+            w
+            for w in works
+            if w["id"] == identifier
+            or (w.get("archive_status") == "saved" and w.get("path") == source)
+        ),
+        None,
+    )
     metadata = {
         "id": identifier,
         "kind": file_kind(source),
@@ -120,6 +151,10 @@ def register_local_work(state, path, producer, title="", status=None):
             pass
     if item:
         preserved = item.get("status") if status is None else status
+        if item.get("archive_status") == "saved":
+            if status is not None:
+                item["status"] = status
+            return False
         item.update({k: v for k, v in metadata.items() if k != "shared"})
         if preserved:
             item["status"] = preserved
@@ -127,6 +162,132 @@ def register_local_work(state, path, producer, title="", status=None):
     works.append(metadata)
     state["work_library"] = works[-100:]
     return True
+
+
+async def archive_local_media(state, sources, producer, *, origin):
+    """Copy indexed or dispatched local media into durable plugin storage.
+
+    Args:
+        state: Exact target's work catalogue.
+        sources: Filesystem paths or local file URIs from actual output.
+        producer: Source used for a newly registered work.
+        origin: Exact conversation origin for storage separation.
+
+    Returns:
+        Number of output rows backed by a verified copy.
+    """
+    root = None
+
+    def copy(source):
+        info = source.stat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or not 0 < info.st_size <= MEDIA_ARCHIVE_LIMIT
+        ):
+            raise ValueError("媒体文件为空、不受支持或超过100MB")
+        folder = root / scope
+        folder.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        size = 0
+        temp = None
+        try:
+            with (
+                source.open("rb") as stream,
+                tempfile.NamedTemporaryFile(dir=folder, delete=False) as output,
+            ):
+                temp = Path(output.name)
+                while chunk := stream.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > info.st_size:
+                        raise OSError("媒体文件在备份期间发生变化")
+                    output.write(chunk)
+                    digest.update(chunk)
+            final_info = source.stat()
+            if size != info.st_size or final_info.st_mtime_ns != info.st_mtime_ns:
+                raise OSError("媒体文件在备份期间发生变化")
+            with temp.open("rb") as stream:
+                verified = hashlib.sha256()
+                while chunk := stream.read(1024 * 1024):
+                    verified.update(chunk)
+            if verified.digest() != digest.digest():
+                raise OSError("媒体备份校验失败")
+            target = folder / (digest.hexdigest() + source.suffix.lower())
+            temp.replace(target)
+            return target.resolve(), size, digest.hexdigest()
+        finally:
+            if temp is not None:
+                temp.unlink(missing_ok=True)
+
+    scope = hashlib.sha256(origin.encode()).hexdigest()[:16]
+    count = 0
+    for raw in dict.fromkeys(s for s in sources if isinstance(s, str) and s):
+        if is_file_uri(raw) and urlsplit(raw).netloc.lower() not in {"", "localhost"}:
+            continue
+        source = Path(file_uri_to_path(raw))
+        if (
+            source.drive.startswith("\\\\")
+            or not source.is_absolute()
+            or source.suffix.lower() not in MEDIA_EXTENSIONS
+        ):
+            continue
+        work = None
+        try:
+            source = source.resolve()
+            if not source.is_file():
+                continue
+            if root is None:
+                root = (
+                    Path(StarTools.get_data_dir("astrbot_plugin_autonomous_companion"))
+                    / "media"
+                )
+            if source.is_relative_to(root.resolve()):
+                continue
+            identifier = hashlib.sha256(str(source).encode()).hexdigest()[:20]
+            work = next(
+                (
+                    row
+                    for row in state.get("work_library", [])
+                    if row.get("id") == identifier or row.get("path") == str(source)
+                ),
+                None,
+            )
+            if work is None:
+                register_local_work(state, str(source), producer)
+                work = next(
+                    (
+                        row
+                        for row in state.get("work_library", [])
+                        if row.get("id") == identifier
+                    ),
+                    None,
+                )
+            if work is None:
+                continue
+            before = source.stat()
+            stamp = [before.st_size, before.st_mtime_ns, before.st_ctime_ns]
+            if (
+                work.get("archive_status") == "saved"
+                and work.get("source_stamp") == stamp
+                and Path(work["path"]).is_file()
+            ):
+                continue
+            target, size, digest = await asyncio.to_thread(copy, source)
+            if any(row is work for row in state.get("work_library", [])):
+                work.update(
+                    path=str(target),
+                    bytes=size,
+                    content_hash=digest,
+                    archive_status="saved",
+                    archive_error="",
+                    source_stamp=stamp,
+                )
+                count += 1
+        except (OSError, ValueError) as exc:
+            if work is not None and not (
+                work.get("archive_status") == "saved" and Path(work["path"]).is_file()
+            ):
+                work.update(archive_status="failed", archive_error=str(exc)[:300])
+    return count
 
 
 async def discover_text_works(owner, umo):
@@ -201,13 +362,15 @@ async def discover_text_works(owner, umo):
     return len(files)
 
 
-def catalogue_receipt(state, tool, text):
+def catalogue_receipt(state, tool, text, *, media_only=False, local_outputs=None):
     """Index image URLs and actual file-write acknowledgements.
 
     Args:
         state: Per-conversation persistent state.
         tool: Actual producing tool.
         text: Original unmodified result.
+        media_only: Ignore non-media paths when recording ordinary tool outputs.
+        local_outputs: Optional list to collect explicit local paths from this receipt.
 
     Returns:
         Number of newly indexed outputs.
@@ -217,8 +380,13 @@ def catalogue_receipt(state, tool, text):
     except (ValueError, TypeError):
         if tool == "execute_python_code" and isinstance(text, str):
             matches = re.findall(r"(?m)^saved:\s*(.+?)\s+\d+\s*$", text)
+            if local_outputs is not None:
+                local_outputs.extend(path.strip() for path in matches[:10])
             return sum(
-                register_local_work(state, path.strip(), tool) for path in matches[:10]
+                register_local_work(state, path.strip(), tool)
+                for path in matches[:10]
+                if not media_only
+                or Path(path.strip()).suffix.lower() in MEDIA_EXTENSIONS
             )
         return 0
     if not isinstance(value, dict):
@@ -250,7 +418,19 @@ def catalogue_receipt(state, tool, text):
             or body.get("success") is True
             or body.get("status") == "completed"
         ):
-            paths = [path, body.get("output_path"), body.get("image_path")]
+            paths = [
+                path,
+                body.get("output_path"),
+                body.get("image_path"),
+                body.get("audio_path"),
+                body.get("video_path"),
+            ]
+            if isinstance(body.get("outputs"), dict):
+                paths.extend(
+                    entry.get("path") or entry.get("file")
+                    for entry in body["outputs"].values()
+                    if isinstance(entry, dict)
+                )
             for key in ("files", "artifacts", "output_files"):
                 for entry in (
                     body.get(key, []) if isinstance(body.get(key), list) else []
@@ -263,16 +443,26 @@ def catalogue_receipt(state, tool, text):
                         else None
                     )
             for actual in paths:
-                if actual:
+                if (
+                    isinstance(actual, str)
+                    and actual
+                    and (
+                        not media_only
+                        or Path(actual).suffix.lower() in MEDIA_EXTENSIONS
+                    )
+                ):
+                    if local_outputs is not None:
+                        local_outputs.append(actual)
                     local_added += register_local_work(
                         state, actual, tool, str(body.get("title") or "")
                     )
     works = state.setdefault("work_library", [])
+    removed = state.get("library_removed", {})
     added = 0
     for item in candidates:
         source = item.get("url") or item["path"]
         identifier = hashlib.sha256(source.encode()).hexdigest()[:20]
-        if any(work["id"] == identifier for work in works):
+        if identifier in removed or any(work["id"] == identifier for work in works):
             continue
         works.append(
             {
@@ -284,7 +474,8 @@ def catalogue_receipt(state, tool, text):
             }
         )
         added += 1
-    state["work_library"] = works[-100:]
+    if added or not media_only:
+        state["work_library"] = works[-100:]
     return added + local_added
 
 
@@ -432,7 +623,9 @@ async def read_library_image(state, identifier, base_url):
         / (hashlib.sha256(url.encode()).hexdigest() + ".bin")
     )
     if cache.is_file():
-        raw = cache.read_bytes()
+        if cache.stat().st_size > 20 * 1024 * 1024:
+            raise ValueError("图片超过20MB，无法内嵌展示")
+        raw = await asyncio.to_thread(cache.read_bytes)
     else:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=20)
@@ -455,6 +648,8 @@ async def read_library_image(state, identifier, base_url):
         if raw.startswith(b"\xff\xd8\xff")
         else "image/webp"
         if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"
+        else "image/gif"
+        if raw[:6] in {b"GIF87a", b"GIF89a"}
         else ""
     )
     if not mime:

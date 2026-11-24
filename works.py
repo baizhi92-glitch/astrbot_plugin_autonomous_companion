@@ -10,7 +10,7 @@ from pathlib import Path
 from astrbot.api.star import StarTools
 from astrbot.core.agent.tool import FunctionTool
 
-from .library import catalogue_receipt, text_content_hash
+from .library import catalogue_receipt, register_local_work, text_content_hash
 from .lifecycle import record_evidence
 
 _TITLE_NOISE = " \t\r\n《》〈〉【】[]()（）\"'“”‘’·-—_：:；;，,。.!！?？、"
@@ -71,22 +71,31 @@ class SaveWorkTool(FunctionTool):
             raise ValueError("作品标题及正文不能为空，正文最多 200000 字符")
         owner = self.event.owner
         await owner.check_current(self.event)
-        root = Path(StarTools.get_data_dir("astrbot_plugin_autonomous_companion"))
+        if mode not in {"draft", "final"}:
+            raise ValueError("无效的作品保存模式")
+        root = Path(
+            StarTools.get_data_dir("astrbot_plugin_autonomous_companion")
+        ).resolve()
         scope = hashlib.sha256(self.event.unified_msg_origin.encode()).hexdigest()[:16]
+        drafts_dir = root / "works" / scope / "drafts"
 
-        def resolve_draft_path():
-            drafts_dir = root / "works" / scope / "drafts"
-            drafts_dir.mkdir(parents=True, exist_ok=True)
-            # Stable by title so re-saving a draft updates one entry.
-            digest = hashlib.sha256(
-                (scope + "\n" + title.strip()).encode()
-            ).hexdigest()[:8]
-            return drafts_dir / f"draft-{digest}.md"
+        def owns_draft(item):
+            if (
+                item.get("producer") != "autonomous_save_work"
+                or item.get("status") != "drafting"
+                or not item.get("path")
+            ):
+                return False
+            candidate = Path(item["path"])
+            return (
+                candidate.parent == drafts_dir
+                and candidate.resolve() == candidate
+                and candidate.is_file()
+            )
 
         if mode == "draft":
             # Find existing draft by work_id
             state = self.event.state
-            target = None
             inherited_from = ""
             if not work_id:
                 # Inherit the latest same-title draft instead of creating a duplicate.
@@ -94,9 +103,7 @@ class SaveWorkTool(FunctionTool):
                     w
                     for w in state.get("work_library", [])
                     if _work_title_key(w.get("title", "")) == _work_title_key(title)
-                    and w.get("producer") == "autonomous_save_work"
-                    and w.get("status") == "drafting"
-                    and w.get("path")
+                    and owns_draft(w)
                 ]
                 existing = max(
                     drafts, key=lambda w: w.get("modified_at", 0), default=None
@@ -111,9 +118,11 @@ class SaveWorkTool(FunctionTool):
                 )
                 if work_item:
                     if work_item.get("producer") == "private_companion":
-                        raise ValueError("陪伴作品库条目只读，不可直接修改；请调用 companion API")
-                    if not work_item.get("path"):
-                        raise ValueError("该草稿无本地文件，无法更新")
+                        raise ValueError(
+                            "陪伴作品库条目只读，不可直接修改；请调用 companion API"
+                        )
+                    if not owns_draft(work_item):
+                        raise ValueError("只能更新当前会话中由本工具创建的草稿")
                     target = Path(work_item["path"])
                     # Overwrite existing draft
                     text = title.strip() + "\n\n" + content
@@ -134,21 +143,31 @@ class SaveWorkTool(FunctionTool):
                         "work_id": work_id,
                         "inherited_from": inherited_from,
                     }
-                    catalogue_receipt(state, "autonomous_save_work", json.dumps(receipt))
-                    record_evidence(state, "work_saved", json.dumps(receipt, ensure_ascii=False))
-                    state["saved_works"] = (state.get("saved_works", []) + [receipt])[-30:]
-                    owner.journal(state, "work_saved", json.dumps(receipt, ensure_ascii=False))
+                    catalogue_receipt(
+                        state, "autonomous_save_work", json.dumps(receipt)
+                    )
+                    record_evidence(
+                        state, "work_saved", json.dumps(receipt, ensure_ascii=False)
+                    )
+                    state["saved_works"] = (state.get("saved_works", []) + [receipt])[
+                        -30:
+                    ]
+                    owner.journal(
+                        state, "work_saved", json.dumps(receipt, ensure_ascii=False)
+                    )
                     await owner.save()
                     return json.dumps(receipt, ensure_ascii=False)
                 else:
                     raise ValueError(f"未找到 id={work_id} 的现有草稿")
             # Create new draft
-            path = resolve_draft_path()
+            path = drafts_dir / f"draft-{uuid.uuid4().hex}.md"
             text = title.strip() + "\n\n" + content
 
             def write():
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("w", encoding="utf-8") as stream:
+                if path.parent.resolve() != drafts_dir:
+                    raise ValueError("草稿目录不属于当前会话")
+                with path.open("x", encoding="utf-8") as stream:
                     stream.write(text)
                 if path.read_text(encoding="utf-8") != text:
                     raise OSError("Work verification failed")
@@ -162,11 +181,19 @@ class SaveWorkTool(FunctionTool):
                 "status": "drafting",
                 "work_id": None,
             }
-            # Register with explicit status
-            from .library import register_local_work
-
-            register_local_work(state, str(path.resolve()), "autonomous_save_work", title, status="drafting")
-            record_evidence(state, "work_saved", json.dumps(receipt, ensure_ascii=False))
+            register_local_work(
+                state,
+                str(path.resolve()),
+                "autonomous_save_work",
+                title,
+                status="drafting",
+            )
+            receipt["work_id"] = hashlib.sha256(receipt["path"].encode()).hexdigest()[
+                :20
+            ]
+            record_evidence(
+                state, "work_saved", json.dumps(receipt, ensure_ascii=False)
+            )
             state["saved_works"] = (state.get("saved_works", []) + [receipt])[-30:]
             owner.journal(state, "work_saved", json.dumps(receipt, ensure_ascii=False))
             await owner.save()
@@ -182,7 +209,7 @@ class SaveWorkTool(FunctionTool):
             "status": "finished",
             "work_id": None,
         }
-        
+
         async def sync_companion_if_needed(title, content, scope):
             """Async companion sync helper."""
             receipt["companion"] = {"saved": False, "reason": "standalone"}
@@ -232,9 +259,10 @@ class SaveWorkTool(FunctionTool):
                     owner.logger.warning(
                         "Local work saved but Companion import failed: %s", exc
                     )
-        
+
+        same = None
         if not work_id:
-            # Inherit a same-title draft, or an identical finished body, instead of duplicating.
+            # Inherit a same-title draft, or reuse an identical finished body without writing.
             candidates = [
                 w
                 for w in state.get("work_library", [])
@@ -243,7 +271,7 @@ class SaveWorkTool(FunctionTool):
                 and w.get("path")
             ]
             draft = max(
-                (w for w in candidates if w.get("status") == "drafting"),
+                (w for w in candidates if owns_draft(w)),
                 key=lambda w: w.get("modified_at", 0),
                 default=None,
             )
@@ -252,12 +280,35 @@ class SaveWorkTool(FunctionTool):
             else:
                 new_hash = text_content_hash(content, title)
                 same = next(
-                    (w for w in candidates if w.get("content_hash") == new_hash),
+                    (
+                        w
+                        for w in candidates
+                        if w.get("status") == "finished"
+                        and w.get("content_hash") == new_hash
+                    ),
                     None,
                 )
                 if same:
-                    work_id = same["id"]
-        if work_id:
+                    existing_path = Path(same["path"])
+                    if (
+                        existing_path.parent not in {drafts_dir, drafts_dir.parent}
+                        or existing_path.resolve() != existing_path
+                    ):
+                        same = None
+                    else:
+                        try:
+                            actual = await asyncio.to_thread(
+                                existing_path.read_text, encoding="utf-8-sig"
+                            )
+                        except (OSError, UnicodeError):
+                            same = None
+                        else:
+                            if text_content_hash(actual, same["title"]) != new_hash:
+                                same = None
+        if same is not None:
+            receipt.update(path=same["path"], work_id=same["id"])
+            await sync_companion_if_needed(title, content, scope)
+        elif work_id:
             # Finalize an existing draft
             work_item = next(
                 (w for w in state.get("work_library", []) if w["id"] == work_id),
@@ -266,9 +317,11 @@ class SaveWorkTool(FunctionTool):
             if not work_item:
                 raise ValueError(f"未找到 id={work_id} 的现有草稿")
             if work_item.get("producer") == "private_companion":
-                raise ValueError("陪伴作品库条目只读，不可直接修改；请调用 companion API")
-            if not work_item.get("path"):
-                raise ValueError("该草稿无本地文件，无法定稿")
+                raise ValueError(
+                    "陪伴作品库条目只读，不可直接修改；请调用 companion API"
+                )
+            if not owns_draft(work_item):
+                raise ValueError("只能定稿当前会话中由本工具创建的草稿")
             target = Path(work_item["path"])
             # Overwrite with final content
             text = title.strip() + "\n\n" + content
@@ -280,16 +333,14 @@ class SaveWorkTool(FunctionTool):
                     raise OSError("Work verification failed")
 
             await asyncio.to_thread(write)
-            # Re-register with updated metadata
-            from .library import register_local_work
-
-            register_local_work(state, str(target.resolve()), "autonomous_save_work", title, status="finished")
-            receipt["path"] = str(target.resolve())
-            # Mark as finished
-            state["work_library"] = [
-                w if w["id"] != work_item["id"] else {**w, "status": "finished"}
-                for w in state["work_library"]
-            ]
+            register_local_work(
+                state,
+                str(target.resolve()),
+                "autonomous_save_work",
+                title,
+                status="finished",
+            )
+            receipt.update(path=str(target.resolve()), work_id=work_id)
             await sync_companion_if_needed(title, content, scope)
         else:
             # New final work (timestamped like before)
@@ -314,10 +365,16 @@ class SaveWorkTool(FunctionTool):
 
             await asyncio.to_thread(write)
             receipt["path"] = str(path.resolve())
-            # Register with explicit status
-            from .library import register_local_work
-
-            register_local_work(state, str(path.resolve()), "autonomous_save_work", title, status="finished")
+            register_local_work(
+                state,
+                str(path.resolve()),
+                "autonomous_save_work",
+                title,
+                status="finished",
+            )
+            receipt["work_id"] = hashlib.sha256(receipt["path"].encode()).hexdigest()[
+                :20
+            ]
             await sync_companion_if_needed(title, content, scope)
 
         record_evidence(state, "work_saved", json.dumps(receipt, ensure_ascii=False))
