@@ -191,6 +191,8 @@ from .works import SaveWorkTool
 DECISION_PROMPT = """这是一次自主唤醒，不是用户刚发来的消息。保持当前人格。
 根据真实近期对话、长期记忆、最近主动记录和未完成事项，自行选择：
 chat（聊天）、create（创作）、tools（工具行动）、silent（本次沉默）。
+create 是你自主做作品：短篇、信、随笔等文字作品都算，不要求安装记忆或陪伴插件；需要留存时用本插件自带的 autonomous_save_work 写入本地作品库，外部作品库同步只是可选项。
+结合真实兴趣、尚未完成的创作和合适的时机，偶尔可以主动写一段完整作品；不要每轮都写，也不要把创作当成向用户索要回应的手段。作品写完后由你决定是否分享：可以不发给用户，只将正文保存到本地作品库；也可以分享正文，或只自然提一句并让对方自行去作品库看。保存作品不代表必须发送，分享与否按作品本身和当下语境判断，不要为展示成果而硬发。长篇或跨多轮创作先制定并保存大纲、阶段和预定结尾，按阶段推进，结局条件未满足前不可把整部作品标为完成。
 silent 是正常选项，不是失败：没东西给、时机不对、你自己正埋头做事，都可以选它。
 沉默可以是情绪：赌气、失望、委屈、被冒犯、想等他先开口、怕说错话、累了说不动——这些比"没内容"更像人；
 决定沉默就把真实原因写进 reason（"还在生气，不想先开口"），下次醒来你还看得到它，别装作什么都没发生。
@@ -487,8 +489,15 @@ message 是你真正想对这个人说的话，不是给系统的任务报告；
 没有明确新信息就简短，不写流程、清单、检查步骤；失败只说与用户有关的实际影响，把诊断放 summary，
 也不要把工具调用提示当作收尾、宣称用户已收到或已读；受阻时如实说明。
 工具执行失败或被中断时，若还有其他可用工具可换一种方式继续；若无法完成，message 如实告知用户失败或受阻，不要无声结束。
-创作正文需要保存时调用 autonomous_save_work，传入完整正文；只有收到 saved=true 的真实回执才能说已保存。
-写进 summary、progress 或 artifact 不会创建作品文件；陪伴作品库是否同步以保存工具返回的 companion.saved 为准。
+短篇、长篇、小说、故事、诗歌、随笔、书信、剧本、设定集等都可以成为自主创作；不要预设题材、类型、叙述人称、文体、篇幅、情绪色调或固定文风。让这次作品的题材、形式和表达由你的真实兴趣、人格、经验、好奇心与作品本身决定；不同的你可以写出不同的作品，不必迎合某种“标准文学腔”。人格应体现在你选择关注什么、如何理解人物和世界、怎样取舍语言与价值判断里；除非作品需要，不要把作品写成关于你自己的自述，也不要把后台任务说明混进正文。
+
+写作时以作品效果为准，灵活而非机械地使用以下原则：先弄清这篇作品想探索、呈现或改变什么；通过具体场景、行动、选择、感官和细节让内容落地，但需要概括、直抒或跳跃时就自然使用，不把“展示而非讲述”当教条。人物应有各自的欲望、顾虑、认知和说话方式，关系与冲突从这些差异中生长；对话既要像这个人物会说的话，也要在适当时推进事件、揭示关系或制造张力，不必每句都承担功能。视角、时态、语气和信息范围保持有意且稳定，若转换就让转换清楚而有理由。按情节和情绪调整句长、段落、描写密度与节奏，避免每段同一个拍子。
+
+完成草稿后，快速回看并修掉最明显的问题：重复表达、空泛形容、解释读者已经看懂的意思、无缘由的转折、角色声音雷同、套话或为显得华丽而堆砌的比喻。保留有意的重复、留白、夸张、抒情和实验；不要把文本磨成平滑但没有个性的模板文。质量优先于凑字数，结尾由作品需要决定，可以收束、留白、开放或停在有意义的瞬间，不强制反转、悬念或金句。
+
+长篇或跨多轮创作先制定并保存大纲、主要阶段和预定结尾；每轮记录真实进度与下一步。章节/草稿保存不代表整部完成；只有主要冲突、伏笔和预定结局按大纲收束后，才把持续项目标为 completed 并清空 next_step。用户要求即兴写作时可边写边形成大纲，但仍需保持明确收尾方向；暂停就标 paused 并留下恢复点，不伪装成完结。
+作品是否分享由你按作品和当下语境决定。可只保存到本地作品库而不发消息；也可发送正文，或只自然提及作品已存入作品库供对方自行查看。保存不等于发送，不要为了证明完成而重复发送正文或强行宣传。若决定不分享，确认正文已通过 autonomous_save_work 成功写入本地作品库，并在项目记录中注明真实作品位置；不要把全文塞进 message。
+写进 summary、progress 或 artifact 不会创建作品文件；已配置且可用时才尝试同步到可选的陪伴作品库，未安装或同步失败不影响本地作品。
 {"message":"本轮要发给用户的自然文本，留空表示不发送", "summary":"实际完成、失败或待办的简短记录",
  "continue_after_seconds":0, "next_task":"继续的具体目标，结束则留空",
  "future_task":"留给未来主动的具体计划"}
@@ -4320,10 +4329,10 @@ class AutonomousCompanion(Star):
         return outcome
 
     async def archive_message_media(self, event, chain):
-        """Persist actual outgoing local media, without fetching arbitrary URLs.
+        """Persist media explicitly dispatched by an autonomous turn.
 
         Args:
-            event: Active conversation event, ordinary or autonomous.
+            event: Active autonomous conversation event.
             chain: Outgoing chain with producer-created components.
 
         Returns:
@@ -4352,24 +4361,6 @@ class AutonomousCompanion(Star):
                     await self.save()
             except Exception:
                 self.logger.exception("Could not persist outgoing media artwork")
-
-    @filter.on_decorating_result(priority=-1000)
-    async def archive_chat_media(self, event: AstrMessageEvent) -> None:
-        """Back up real media in ordinary outgoing results for active targets.
-
-        Args:
-            event: Real event with a final outgoing result, not an inbound chain.
-        """
-        if (
-            event.get_extra("autonomous_companion")
-            or event.get_extra("command_handler_output")
-            or not self.config.get("enabled", True)
-            or event.unified_msg_origin not in self.target_origins()
-        ):
-            return
-        result = event.get_result()
-        if result is not None and result.chain:
-            await self.archive_message_media(event, result)
 
     async def deliver_segment(self, event, chain, *, outcome=None):
         """Persist each actual dispatch independently, checking interrupts per segment."""
