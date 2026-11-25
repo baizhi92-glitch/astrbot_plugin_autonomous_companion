@@ -4362,6 +4362,7 @@ class AutonomousCompanion(Star):
         """
         if (
             event.get_extra("autonomous_companion")
+            or event.get_extra("command_handler_output")
             or not self.config.get("enabled", True)
             or event.unified_msg_origin not in self.target_origins()
         ):

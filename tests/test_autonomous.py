@@ -3434,6 +3434,27 @@ async def test_dispatched_local_media_is_registered_into_work_library(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_ordinary_chat_media_is_archived_but_command_media_is_not(tmp_path, monkeypatch):
+    from astrbot.api.message_components import Image
+    from data.plugins.astrbot_plugin_autonomous_companion import library
+
+    plugin, state, event = make_plugin()
+    monkeypatch.setattr(library.StarTools, "get_data_dir", lambda _: tmp_path / "store")
+    art = tmp_path / "chart.png"
+    art.write_bytes(b"\\x89PNG\\r\\n\\x1a\\nchart")
+    image_chain = module.MessageChain(chain=[Image.fromFileSystem(str(art))])
+    event.get_result = lambda: image_chain
+
+    await plugin.archive_chat_media(event)
+    assert any(item["title"] == "chart.png" for item in state["work_library"])
+
+    state["work_library"].clear()
+    event.get_extra = lambda key, default=None: True if key == "command_handler_output" else default
+    await plugin.archive_chat_media(event)
+    assert state["work_library"] == []
+
+
+@pytest.mark.asyncio
 async def test_dispatched_remote_media_is_not_registered(tmp_path):
     """URL-only image references have no local file and must stay out of the library."""
     plugin, state, event = make_plugin()
