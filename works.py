@@ -26,7 +26,7 @@ class SaveWorkTool(FunctionTool):
     def __init__(self, event):
         super().__init__(
             name="autonomous_save_work",
-            description="保存完整正文为真实文本文件；分轮创作时可用 mode=draft 创建/更新同一草稿（作品库显示“创作中”），完成后用 mode=final 定稿。drafting 状态的作品不算完成，不得当作成品汇报或投递。以返回的本地及陪伴作品库回执为准，不得虚构同步成功。",
+            description="将完整正文保存到本地作品库；分轮创作可用 mode=draft 创建/更新草稿（显示‘创作中’），完成后用 mode=final 定稿。草稿不算完成，不得当作成品汇报或投递。外部陪伴作品库同步是可选的，以真实回执为准；未安装不影响本地保存。",
             parameters={
                 "type": "object",
                 "properties": {
@@ -39,7 +39,7 @@ class SaveWorkTool(FunctionTool):
                         "type": "string",
                         "enum": ["draft", "final"],
                         "default": "final",
-                        "description": "mode=draft 创建或更新草稿（多轮继续写）；mode=final 定稿并可选同步到我会永远陪着你",
+                        "description": "mode=draft 创建/更新本地草稿（多轮继续写）；mode=final 定稿本地作品，并可选同步到外部陪伴作品库",
                     },
                     "work_id": {
                         "type": "string",
