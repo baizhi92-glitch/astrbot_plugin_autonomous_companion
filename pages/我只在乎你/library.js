@@ -296,6 +296,7 @@ function renderWorks(openWorkId) {
               <span class="works-entry-info">
                 <span class="works-source">${escapeHTML(source)}${item.records.length > 1 ? ` · ${item.records.length} 条来源记录` : ""}</span>
                 ${status ? `<span class="pill">${status}</span>` : ""}
+                ${Number.isFinite(item.media_duration) && item.media_duration > 0 ? `<span class="pill">${item.media_duration.toFixed(1)} 秒</span>` : ""}
                 ${series.get(item.id)?.sections?.length ? `<span class="pill">含编号 ${escapeHTML(series.get(item.id).sections.join("、"))}</span>` : ""}
                 ${item.archive_status === "saved" && item.availability === "local" ? '<span class="pill ok">已备份</span>' : ""}
                 ${!["local", "inline"].includes(item.availability) ? `<span class="pill warn">${availabilityLabels[item.availability] || "来源不可用"}</span>` : ""}

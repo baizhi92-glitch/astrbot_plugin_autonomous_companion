@@ -25,6 +25,7 @@ function harness(request = async () => ({ token: TOKEN })) {
     load() { this.reset = true; }
   }
   const calls = [];
+  const revoked = [];
   const nodes = new Map();
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, new Element(id));
@@ -35,6 +36,7 @@ function harness(request = async () => ({ token: TOKEN })) {
     escapeHTML: value => String(value),
     document: { createElement: tag => new Element(tag), querySelectorAll: () => [] },
     api: (...args) => { calls.push(args); return request(...args); },
+    atob, Blob, URL: { createObjectURL: blob => `blob:${blob.type}`, revokeObjectURL: url => revoked.push(url) },
   });
   for (const file of ["gallery.js", "library.js"]) {
     vm.runInContext(fs.readFileSync(path.join(PAGE, file), "utf8"), context);
@@ -43,10 +45,10 @@ function harness(request = async () => ({ token: TOKEN })) {
     const details = new Element("details");
     const detail = new Element("div");
     details.querySelector = () => detail;
-    context.mountWorkMedia(details, { umo }, { id, availability, media_kind, media_preview: "ready", title: id });
+    context.mountWorkMedia(details, { umo }, { id, availability, media_kind, media_preview: "ready", title: id, bytes: 100 });
     return { details, detail, status: detail.children[0], button: detail.children[1] };
   };
-  return { calls, context, mount, node };
+  return { calls, context, mount, node, revoked };
 }
 
 test("old generic media types render as audio/video, with separate absent and backup states", () => {
@@ -82,7 +84,7 @@ test("media waits for explicit action, streams with native controls, and stops o
   const player = audio.detail.children[2];
   assert.equal(player.tag, "audio");
   assert.equal(player.controls, true);
-  assert.equal(player.preload, "none");
+  assert.equal(player.preload, "metadata");
   assert.equal(Boolean(player.autoplay), false);
   assert.equal(player.src, "/api/v1/files/tokens/" + TOKEN);
 
@@ -98,6 +100,24 @@ test("media waits for explicit action, streams with native controls, and stops o
   video.details.open = false;
   video.details.listeners.toggle();
   assert.equal(video.detail.children.length, 2);
+});
+
+test("small wav uses local bytes after stream failure and releases its URL", async () => {
+  const { calls, mount, revoked } = harness(async (_method, _route, body) =>
+    body.action === "work_media" ? { token: TOKEN } : { base64: "UklGRg==" });
+  const audio = mount("voice.wav", "local", "audio");
+  audio.details.open = true;
+  audio.button.onclick();
+  await flush();
+  const player = audio.detail.children[2];
+  await player.listeners.error();
+  assert.equal(calls[1][2].action, "work_download");
+  assert.equal(player.src, "blob:audio/wav");
+  player.listeners.loadedmetadata();
+  assert.equal(audio.status.textContent, "");
+  audio.details.open = false;
+  audio.details.listeners.toggle();
+  assert.deepEqual(revoked, ["blob:audio/wav"]);
 });
 
 test("a collapsed activation is discarded before mounting; arbitrary source URLs are rejected", async () => {

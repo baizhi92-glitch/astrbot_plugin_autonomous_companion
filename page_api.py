@@ -6,6 +6,7 @@ import json
 import re
 import stat
 import time
+import wave
 from pathlib import Path
 
 from astrbot.api.star import StarTools
@@ -158,14 +159,17 @@ class CompanionPageAPI:
         """
         cache = getattr(self, "_image_view_hashes", {})
         manuscript_cache = getattr(self, "_manuscript_sections", {})
+        duration_cache = getattr(self, "_wav_durations", {})
         current = {}
         manuscripts = {}
+        durations = {}
         for origin, works in catalogues.items():
             for work in works:
                 inline = isinstance(work.pop("inline_content", None), str)
                 work.pop("manuscript_sections", None)
                 path = work.get("path")
                 work.pop("media_preview", None)
+                work.pop("media_duration", None)
                 work["media_kind"] = (
                     MEDIA_KINDS.get(Path(path).suffix.lower())
                     if isinstance(path, str)
@@ -233,6 +237,7 @@ class CompanionPageAPI:
                         if manuscripts[key]:
                             work["manuscript_sections"] = manuscripts[key]
                     if work["media_kind"]:
+                        work["bytes"] = info.st_size
                         work["media_preview"] = (
                             "ready"
                             if 0 < info.st_size <= MEDIA_PREVIEW_MAX_BYTES
@@ -240,6 +245,24 @@ class CompanionPageAPI:
                             if info.st_size == 0
                             else "too_large"
                         )
+                    if (
+                        file.suffix.lower() == ".wav"
+                        and work.get("media_preview") == "ready"
+                    ):
+                        key = (path, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                        if key not in durations:
+                            if key in duration_cache:
+                                durations[key] = duration_cache[key]
+                            else:
+                                try:
+                                    with wave.open(str(file), "rb") as reader:
+                                        durations[key] = (
+                                            reader.getnframes() / reader.getframerate()
+                                        )
+                                except (wave.Error, OSError, EOFError, ValueError):
+                                    durations[key] = None
+                        if durations[key]:
+                            work["media_duration"] = durations[key]
                     if work.get("kind") != "image" or info.st_size > 20 * 1024 * 1024:
                         continue
                     key = (path, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
@@ -257,6 +280,7 @@ class CompanionPageAPI:
                     continue
         self._image_view_hashes = current
         self._manuscript_sections = manuscripts
+        self._wav_durations = durations
         return catalogues
 
     async def diagnostics(self):

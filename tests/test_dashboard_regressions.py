@@ -3,6 +3,7 @@
 import hashlib
 import json
 import time
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -79,6 +80,24 @@ def test_library_view_detects_manuscript_versions_without_changing_source(
     Path(rows[1]["path"]).write_text("故事\n\n无章节的新稿", encoding="utf-8")
     views = page.inspect_library_views({ORIGIN: [dict(row) for row in rows]})[ORIGIN]
     assert "manuscript_sections" not in views[1]
+
+
+def test_library_views_report_pcm_wav_duration_without_playback(dashboard, tmp_path):
+    page, _ = dashboard
+    path = tmp_path / "voice.wav"
+    with wave.open(str(path), "wb") as stream:
+        stream.setparams((1, 2, 48000, 0, "NONE", "not compressed"))
+        stream.writeframes(b"\x00\x00" * 84000)
+    row = {"kind": "file", "path": str(path)}
+    for _ in range(2):
+        view = page.inspect_library_views({ORIGIN: [dict(row)]})[ORIGIN][0]
+        assert view["media_duration"] == 1.75
+        assert view["bytes"] == path.stat().st_size
+    path.write_bytes(b"not a WAV")
+    assert (
+        "media_duration"
+        not in page.inspect_library_views({ORIGIN: [dict(row)]})[ORIGIN][0]
+    )
 
 
 def test_library_preserves_more_than_one_hundred_sources(tmp_path):

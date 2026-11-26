@@ -75,6 +75,7 @@ function mountWorkMedia(details, session, item) {
   button.textContent = "加载" + (item.media_kind === "audio" ? "音频" : "视频") + "播放器";
   host.append(button);
   let player = null;
+  let objectURL = null;
   let activation = 0;
   const stop = () => {
     ++activation;
@@ -86,6 +87,7 @@ function mountWorkMedia(details, session, item) {
       player.remove();
       player = null;
     }
+    if (objectURL) { URL.revokeObjectURL(objectURL); objectURL = null; }
     status.textContent = "";
     button.hidden = false;
   };
@@ -105,14 +107,39 @@ function mountWorkMedia(details, session, item) {
         player = document.createElement(item.media_kind === "audio" ? "audio" : "video");
         player.className = "preview";
         player.controls = true;
-        player.preload = "none";
+        player.preload = "metadata";
         player.playsInline = true;
         player.setAttribute("aria-label", item.title || button.textContent);
-        player.addEventListener("error", () => {
+        let fallbackUsed = false;
+        const cannotPlay = () => {
           if (requested !== activation) return;
           stop();
-          status.textContent = "无法播放：文件已失效或浏览器不支持该编码，可重新加载播放器。";
-        }, { once: true });
+          status.textContent = "预览播放失败。若原文件仍可下载，可以用本地播放器打开。";
+        };
+        player.addEventListener("error", async () => {
+          if (requested !== activation) return;
+          const mime = /\.wav$/i.test(item.path || item.title || "") ? "audio/wav"
+            : /\.mp3$/i.test(item.path || item.title || "") ? "audio/mpeg" : "";
+          if (fallbackUsed || item.media_kind !== "audio" || !mime || !(item.bytes > 0 && item.bytes <= 10 * 1024 * 1024)) {
+            cannotPlay();
+            return;
+          }
+          fallbackUsed = true;
+          status.textContent = "串流失败，正在尝试读取本地音频…";
+          try {
+            const result = await api("POST", "action", { umo: session.umo, action: "work_download", id: item.id });
+            if (requested !== activation || !details.open || !details.isConnected) return;
+            if (typeof result.base64 !== "string" || result.base64.length > Math.ceil(10 * 1024 * 1024 / 3) * 4) throw new Error("音频超过备用预览限制");
+            const bytes = Uint8Array.from(atob(result.base64), char => char.charCodeAt(0));
+            objectURL = URL.createObjectURL(new Blob([bytes], { type: mime }));
+            player.src = objectURL;
+          } catch {
+            cannotPlay();
+          }
+        });
+        player.addEventListener("loadedmetadata", () => {
+          if (requested === activation) status.textContent = "";
+        });
         player.src = "/api/v1/files/tokens/" + token;
         status.textContent = "";
         host.append(player);
