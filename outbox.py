@@ -10,6 +10,11 @@ from astrbot.api.star import StarTools
 from astrbot.core.message.components import File, Image
 from astrbot.core.message.message_event_result import MessageChain
 
+from .creative_artifacts import (
+    CREATIVE_ARTIFACT_MAX_BYTES,
+    CREATIVE_ARTIFACT_TOOL,
+    resolve_creative_artifact_path,
+)
 from .library import read_library_image, read_library_text
 
 
@@ -26,7 +31,7 @@ class DispatchOutcome:
         return bool(self.segments) and len(self.sent) == len(self.segments)
 
 
-def enqueue_work(state, identifier):
+def enqueue_work(state, identifier, *, origin=None):
     work = next(
         (w for w in state.get("work_library", []) if w["id"] == identifier), None
     )
@@ -45,6 +50,10 @@ def enqueue_work(state, identifier):
         if retired is None:
             raise ValueError("成果箱已满，请先处理现有条目")
     snapshot = {"kind": work["kind"], "title": work["title"]}
+    if work.get("producer") == CREATIVE_ARTIFACT_TOOL:
+        path = resolve_creative_artifact_path(work.get("path"), origin)
+        if not path.is_file() or path.stat().st_size > CREATIVE_ARTIFACT_MAX_BYTES:
+            raise ValueError("创作产物缺失或超过分享限制")
     if isinstance(work.get("inline_content"), str):
         snapshot["content"] = work["inline_content"]
     elif work.get("path"):

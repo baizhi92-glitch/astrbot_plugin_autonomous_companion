@@ -45,6 +45,7 @@ from .cancellations import (
     clear_cancelled_work,
 )
 from .checkpoint import (
+    chapter_save_target,
     checkpoint_context,
     clear_task_failure,
     count_checkpoint_resume,
@@ -52,13 +53,19 @@ from .checkpoint import (
     is_pure_chat,
     next_checkpoint,
     note_task_failure,
+    reconcile_saved_chapters,
     resume_checkpoint,
     save_checkpoint,
 )
 from .commitments import best_match, find_same
 from .companion_adapter import CompanionAdapter
-from .compiled_work import compile_chapters
+from .compiled_work import (
+    chapter_identity,
+    compile_chapters,
+    refresh_finished_collection,
+)
 from .conditions import refresh_conditions
+from .creative_artifacts import CREATIVE_ARTIFACT_TOOL, SaveCreativeArtifactTool
 from .daily import (
     active_budget_override,
     count,
@@ -191,7 +198,7 @@ from .works import SaveWorkTool
 DECISION_PROMPT = """这是一次自主唤醒，不是用户刚发来的消息。保持当前人格。
 根据真实近期对话、长期记忆、最近主动记录和未完成事项，自行选择：
 chat（聊天）、create（创作）、tools（工具行动）、silent（本次沉默）。
-create 是你自主做作品：短篇、信、随笔等文字作品都算，不要求安装记忆或陪伴插件；需要留存时用本插件自带的 autonomous_save_work 写入本地作品库，外部作品库同步只是可选项。
+create 是你自主做作品：不限于文章和图片。需要留存普通文章或连载章节时用 autonomous_save_work；也可用 autonomous_save_creative_artifact 创作 Markdown 剧本／诗集、JSON／CSV 设定资料、或作为纯文本保存的创意源码。两者都写入本地作品库，不要求安装记忆或陪伴插件；普通文章的外部作品库同步只是可选项。
 结合真实兴趣、尚未完成的创作和合适的时机，偶尔可以主动写一段完整作品；不要每轮都写，也不要把创作当成向用户索要回应的手段。作品写完后由你决定是否分享：可以不发给用户，只将正文保存到本地作品库；也可以分享正文，或只自然提一句并让对方自行去作品库看。保存作品不代表必须发送，分享与否按作品本身和当下语境判断，不要为展示成果而硬发。长篇或跨多轮创作先制定并保存大纲、阶段和预定结尾，按阶段推进，结局条件未满足前不可把整部作品标为完成。
 silent 是正常选项，不是失败：没东西给、时机不对、你自己正埋头做事，都可以选它。
 沉默可以是情绪：赌气、失望、委屈、被冒犯、想等他先开口、怕说错话、累了说不动——这些比"没内容"更像人；
@@ -496,7 +503,7 @@ message 是你真正想对这个人说的话，不是给系统的任务报告；
 完成草稿后，快速回看并修掉最明显的问题：重复表达、空泛形容、解释读者已经看懂的意思、无缘由的转折、角色声音雷同、套话或为显得华丽而堆砌的比喻。保留有意的重复、留白、夸张、抒情和实验；不要把文本磨成平滑但没有个性的模板文。质量优先于凑字数，结尾由作品需要决定，可以收束、留白、开放或停在有意义的瞬间，不强制反转、悬念或金句。
 
 长篇或跨多轮创作先制定并保存大纲、主要阶段和预定结尾；每轮记录真实进度与下一步。章节/草稿保存不代表整部完成；只有主要冲突、伏笔和预定结局按大纲收束后，才把持续项目标为 completed 并清空 next_step。用户要求即兴写作时可边写边形成大纲，但仍需保持明确收尾方向；暂停就标 paused 并留下恢复点，不伪装成完结。
-作品是否分享由你按作品和当下语境决定。可只保存到本地作品库而不发消息；也可发送正文，或只自然提及作品已存入作品库供对方自行查看。保存不等于发送，不要为了证明完成而重复发送正文或强行宣传。若决定不分享，确认正文已通过 autonomous_save_work 成功写入本地作品库，并在项目记录中注明真实作品位置；不要把全文塞进 message。
+作品是否分享由你按作品和当下语境决定。可只保存到本地作品库而不发消息；也可自然提及作品已存入作品库供对方自行查看。普通文章可分享正文。保存不等于发送，不要为了证明完成而重复发送正文或强行宣传。用 autonomous_save_work 保存文章或章节；如本轮明确创作 Markdown、JSON、CSV 或源码纯文本，用 autonomous_save_creative_artifact 传自产的完整内容（不传路径、不执行或渲染源码），以真实回执的 work_id 或 output_path 记录项目产物。不要用它归档普通对话或搜集文件，不要把全文塞进 message。
 写进 summary、progress 或 artifact 不会创建作品文件；已配置且可用时才尝试同步到可选的陪伴作品库，未安装或同步失败不影响本地作品。
 {"message":"本轮要发给用户的自然文本，留空表示不发送", "summary":"实际完成、失败或待办的简短记录",
  "continue_after_seconds":0, "next_task":"继续的具体目标，结束则留空",
@@ -623,6 +630,28 @@ class BudgetTool(FunctionTool):
     async def call(self, context, **kwargs):
         await self.event.owner.check_current(self.event)
         state = self.event.state
+        if self.name == "autonomous_save_work" and (
+            target := chapter_save_target(getattr(self.event, "checkpoint_task", ""))
+        ):
+            title = str(kwargs.get("title", "")).strip()
+            chapter = chapter_identity(title)
+            series, ordinal = target
+            if not (
+                kwargs.get("mode") == "draft"
+                and (
+                    chapter
+                    and chapter[1] == ordinal
+                    and (not series or chapter[0] == series)
+                )
+            ):
+                yield json.dumps(
+                    {
+                        "saved": False,
+                        "error": "本轮只保存指定章节草稿，不得改写其他章节或直接定稿。",
+                    },
+                    ensure_ascii=False,
+                )
+                return
         if self.name in {
             "pc_manage_memo",
             "pc_manage_schedule",
@@ -838,7 +867,7 @@ class BudgetTool(FunctionTool):
                     )
 
 
-@register("AutonomousCompanion", "local", "我只在乎你：自主心跳与无回复续行", "1.13.10")
+@register("AutonomousCompanion", "local", "我只在乎你：自主心跳与无回复续行", "1.13.11")
 class AutonomousCompanion(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -1826,6 +1855,20 @@ class AutonomousCompanion(Star):
             recover_tasks(state)
             backfill_library(state)
             if self.config.get("enabled", True) and umo in self.target_origins():
+                series_titles = {
+                    chapter[0]
+                    if (chapter := chapter_identity(row["title"]))
+                    else row["title"]
+                    for row in state.get("work_library", [])
+                    if row.get("producer") == "autonomous_save_work"
+                    and row.get("status") == "finished"
+                    and row.get("kind") == "text"
+                    and row.get("title")
+                }
+                for series in sorted(series_titles):
+                    await asyncio.to_thread(
+                        refresh_finished_collection, state, umo, series, self.logger
+                    )
                 legacy_media = [
                     row["path"]
                     for row in state.get("work_library", [])
@@ -3019,6 +3062,16 @@ class AutonomousCompanion(Star):
             await self.phase(state, "checking", "重新检查待办条件")
             dependencies = await refresh_conditions(self, event, persona)
         await self.check_current(event)
+        if not preview:
+            closed = reconcile_saved_chapters(state, event.cid)
+            if closed:
+                for task in closed:
+                    self.journal(
+                        state,
+                        "checkpoint_reconciled",
+                        f"已有匹配章节保存回执，关闭旧断点：{task}",
+                    )
+                await self.save()
         self.expire_speak_wish(state)
         pool = pool_snapshot(self, state)
         pool_label = "夜间" if pool.get("pool") == "night" else "白天"
@@ -3281,8 +3334,7 @@ class AutonomousCompanion(Star):
         count(self, state, "rounds")
         await self.phase(state, "executing", "执行本轮目标")
         await self.save()
-        available_tools = self.tools(event, persona)
-        state["available_tool_names"] = [tool.name for tool in available_tools.tools]
+        event.manual_task = bool(decision.get("manual"))
         action_family = required_action(str(decision.get("task", "")))
         resumed = resume_checkpoint(event, str(decision.get("task", "")))
         plain_conversation = is_plain_conversation(decision.get("task", ""))
@@ -3296,6 +3348,27 @@ class AutonomousCompanion(Star):
             decision["action"] = "chat"
             state["last_turn"]["action"] = "chat"
             state["last_turn"]["execution_contract"] = event.execution_contract
+        available_tools = self.tools(event, persona)
+        allowed_tools = self.config.get("allowed_tools", [])
+        persona_tools = persona.get("tools")
+        if (
+            (not allowed_tools or CREATIVE_ARTIFACT_TOOL in allowed_tools)
+            and (persona_tools is None or CREATIVE_ARTIFACT_TOOL in persona_tools)
+            and decision["action"] != "chat"
+            and not chapter_save_target(event.checkpoint_task)
+            and (
+                decision["action"] == "create"
+                or (
+                    resumed
+                    and any(
+                        CREATIVE_ARTIFACT_TOOL in step.get("tools", [])
+                        for step in event.execution_contract.get("steps", [])
+                    )
+                )
+            )
+        ):
+            available_tools.add_tool(BudgetTool(SaveCreativeArtifactTool(event), event))
+        state["available_tool_names"] = [tool.name for tool in available_tools.tools]
         if (
             resumed
             and getattr(event, "media_deliveries", 0)
@@ -3396,7 +3469,7 @@ class AutonomousCompanion(Star):
             context_text += (
                 "\n恢复原任务执行断点："
                 + json.dumps(checkpoint_context(event), ensure_ascii=False)
-                + "\n只推进未完成步骤。已有任务ID先查原任务，不重新提交；不确定动作先验证，不重复写入或发送。"
+                + "\n只推进未完成步骤。已有任务ID先查原任务，不重新提交；不确定动作先验证，不重复写入或发送。保存指定章节时不要改写或保存相邻章节；找不到原稿就如实记录卡点。"
             )
             no_replay = {
                 r["tool"]
@@ -3605,9 +3678,15 @@ class AutonomousCompanion(Star):
         message = result.get("message", "")
         synthesized_closing = False
         tool_work_closing = False
-        # A round that set out to do tool work still owes the user words when
-        # it ends without any. Chat rounds are excluded: a context query there
-        # is not a promise to speak, and silence stays her choice.
+        # A private save is not a promise to report back, even when the round
+        # also used lookup tools or an execution contract required verification.
+        autonomous_work_save = not event.manual_task and (
+            chapter_save_target(str(decision.get("task", ""))) is not None
+            or any(
+                r.get("tool") in {"autonomous_save_work", CREATIVE_ARTIFACT_TOOL}
+                for r in event.action_receipts
+            )
+        )
         tool_work = (
             self.config.get("tool_work_message", True)
             and decision.get("action") in {"tools", "create"}
@@ -3616,7 +3695,8 @@ class AutonomousCompanion(Star):
             )
         )
         if (
-            (action_family or tool_work)
+            not autonomous_work_save
+            and (action_family or tool_work)
             and self.config.get("task_completion_message", True)
             and not event.quiet
             and (not message.strip() or message.strip() == "NO_REPLY")
@@ -3887,7 +3967,11 @@ class AutonomousCompanion(Star):
                     compile_chapters, state, umo, project["title"]
                 )
                 project["artifact"] = edition["path"]
-                project["compilation_status"] = "已合并章节并保存合订终稿"
+                project["compilation_status"] = (
+                    "已合并章节并保存合订草稿"
+                    if edition["status"] == "drafting"
+                    else "已合并章节并保存合订终稿"
+                )
             except (ValueError, OSError) as exc:
                 project["compilation_status"] = "未自动合订：" + str(exc)[:250]
             # The project transition already retired its linked queue and checkpoints.
@@ -4248,6 +4332,11 @@ class AutonomousCompanion(Star):
             status: Short execution status, not an inferred success claim.
             result: Tool result text, truncated by the native formatter when enabled.
         """
+        if not getattr(event, "manual_task", False) and (
+            name in {"autonomous_save_work", CREATIVE_ARTIFACT_TOOL}
+            or chapter_save_target(getattr(event, "checkpoint_task", "")) is not None
+        ):
+            return
         settings = self.context.get_config(event.unified_msg_origin).get(
             "provider_settings", {}
         )

@@ -60,6 +60,16 @@
 }
 
 #works .works-filter-box h3 { margin-bottom: var(--s1); font-size: var(--fs-body); }
+#works .works-search { display: grid; gap: 4px; margin-bottom: var(--s1); }
+#works #work-search { width: 100%; min-width: 0; }
+#works .works-pagination { justify-content: center; margin-top: var(--s2); }
+#works #works-catalogue-title { scroll-margin-top: 72px; }
+#works .works-series-items { gap: var(--s1); }
+#works .works-series-items > .works-entry { margin: 0; }
+#works .works-series-items > .works-entry > summary { padding: var(--s1); }
+#works .works-series-items .works-mark { width: 32px; }
+#works .works-history { margin-top: var(--s2); }
+#works .works-history[open] > .works-history-body { display: grid; gap: var(--s1); padding: var(--s1); }
 #works .works-filter-row {
   display: grid;
   grid-template-columns: 2em minmax(0, 1fr);

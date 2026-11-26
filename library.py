@@ -15,6 +15,12 @@ import aiohttp
 from astrbot.api.star import StarTools
 from astrbot.core.utils.media_utils import file_uri_to_path, is_file_uri
 
+from .creative_artifacts import (
+    CREATIVE_ARTIFACT_MAX_BYTES,
+    CREATIVE_ARTIFACT_TOOL,
+    resolve_creative_artifact_path,
+)
+
 TEXT_EXTENSIONS = {
     ".txt",
     ".md",
@@ -117,7 +123,14 @@ def register_local_work(state, path, producer, title="", status=None):
     target = Path(path)
     if not target.is_file():
         return False
-    source = str(target.resolve())
+    resolved = target.resolve()
+    if producer != CREATIVE_ARTIFACT_TOOL and any(
+        candidate.parent.name == "creative"
+        and candidate.parent.parent.parent.name == "works"
+        for candidate in (target, resolved)
+    ):
+        return False
+    source = str(resolved)
     identifier = hashlib.sha256(source.encode()).hexdigest()[:20]
     if identifier in state.get("library_removed", {}):
         return False
@@ -160,7 +173,6 @@ def register_local_work(state, path, producer, title="", status=None):
             item["status"] = preserved
         return False
     works.append(metadata)
-    state["work_library"] = works[-100:]
     return True
 
 
@@ -308,10 +320,12 @@ async def discover_text_works(owner, umo):
     platform = owner.context.get_platform_inst(umo.split(":", 1)[0])
     scope = hashlib.sha256(umo.encode()).hexdigest()[:16]
     roots = [
-        Path(StarTools.get_data_dir("astrbot_plugin_autonomous_companion"))
+        Path(StarTools.get_data_dir("astrbot_plugin_autonomous_companion")).resolve()
         / "works"
         / scope
     ]
+    if roots[0].resolve() != roots[0]:
+        raise ValueError("作品目录被重定向，无法补录")
     roots.extend(
         Path(value)
         for value in owner.config.get("work_library_roots", [])
@@ -351,15 +365,53 @@ async def discover_text_works(owner, umo):
                     for p in root.iterdir()
                     if p.is_file() and p.resolve().is_relative_to(root.resolve())
                 )
-        return sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)[:100]
+        drafts = roots[0] / "drafts"
+        if drafts.is_dir() and drafts.resolve() == roots[0].resolve() / "drafts":
+            found.extend(
+                p
+                for p in drafts.iterdir()
+                if re.fullmatch(r"draft-[0-9a-f]{32}\.md", p.name)
+                and p.is_file()
+                and not p.is_symlink()
+            )
+        files = {}
+        for path in found:
+            if file_kind(path) not in {"text", "code"} or path.name.startswith(
+                "compiled-"
+            ):
+                continue
+            try:
+                files[path.resolve()] = path.stat().st_mtime
+            except OSError:
+                continue
+        return sorted(files, key=files.get, reverse=True)
 
     files = await asyncio.to_thread(scan)
     state = owner.states.setdefault(umo, owner.new_state())
+    count = backfill_library(state)
+    indexed = {row.get("path") for row in state.get("work_library", [])}
+    owned_drafts = roots[0].resolve() / "drafts"
     for path in files:
-        catalogue_receipt(
-            state, "safe_write", json.dumps({"ok": True, "file": str(path.resolve())})
-        )
-    return len(files)
+        if str(path) in indexed:
+            continue
+        if hashlib.sha256(str(path).encode()).hexdigest()[:20] in state.get(
+            "library_removed", {}
+        ):
+            continue
+        if path.parent == owned_drafts:
+            try:
+                with path.open(encoding="utf-8-sig") as stream:
+                    title = stream.readline(201).strip()
+            except (OSError, UnicodeError):
+                continue
+            # A draft file can also hold a final revision. Without a receipt,
+            # recover its title and content, but do not invent its lifecycle status.
+            count += register_local_work(
+                state, str(path), "autonomous_save_work", title
+            )
+        else:
+            count += register_local_work(state, str(path), "safe_write")
+    return count
 
 
 def catalogue_receipt(state, tool, text, *, media_only=False, local_outputs=None):
@@ -375,6 +427,9 @@ def catalogue_receipt(state, tool, text, *, media_only=False, local_outputs=None
     Returns:
         Number of newly indexed outputs.
     """
+    if tool == CREATIVE_ARTIFACT_TOOL:
+        # This tool registers only after its own scope and write verification.
+        return 0
     try:
         value = json.loads(text)
     except (ValueError, TypeError):
@@ -474,8 +529,6 @@ def catalogue_receipt(state, tool, text, *, media_only=False, local_outputs=None
             }
         )
         added += 1
-    if added or not media_only:
-        state["work_library"] = works[-100:]
     return added + local_added
 
 
@@ -489,8 +542,20 @@ def backfill_library(state):
         Number of recovered catalogue entries.
     """
     count = 0
-    for work in state.get("saved_works", []):
-        count += catalogue_receipt(state, "autonomous_save_work", json.dumps(work))
+    indexed = {row.get("path") for row in state.get("work_library", [])}
+    for work in reversed(state.get("saved_works", [])):
+        path = work.get("path")
+        if not path or path in indexed or work.get("saved") is not True:
+            continue
+        status = work.get("status")
+        count += register_local_work(
+            state,
+            path,
+            "autonomous_save_work",
+            str(work.get("title") or ""),
+            status=status if status in {"drafting", "finished"} else None,
+        )
+        indexed.add(path)
     for artifact in state.get("task_artifacts", []):
         count += catalogue_receipt(
             state,
@@ -507,22 +572,25 @@ def backfill_library(state):
                 work["shared"] = artifact.get("status", "unknown")
     for record in [state.get("execution_checkpoint", {}), state.get("last_turn", {})]:
         for receipt in record.get("receipts", record.get("tool_receipts", [])):
-            count += catalogue_receipt(
-                state, receipt.get("tool", ""), receipt.get("result", "")
-            )
+            if receipt.get("tool") != "autonomous_save_work":
+                count += catalogue_receipt(
+                    state, receipt.get("tool", ""), receipt.get("result", "")
+                )
     for entry in state.get("journal", []):
         if entry.get("action") == "tool_result" and ": " in entry.get("summary", ""):
             tool, result = entry["summary"].split(": ", 1)
-            count += catalogue_receipt(state, tool, result)
+            if tool != "autonomous_save_work":
+                count += catalogue_receipt(state, tool, result)
     return count
 
 
-def read_library_text(state, identifier):
+def read_library_text(state, identifier, *, origin=None):
     """Read only an indexed text output with a strict size limit.
 
     Args:
         state: Target catalogue.
         identifier: Existing catalogue entry ID, never a client-supplied path.
+        origin: Target origin required for explicitly scoped creative artifacts.
 
     Returns:
         Verified file text.
@@ -540,18 +608,23 @@ def read_library_text(state, identifier):
     )
     if item is None:
         raise ValueError("文本作品不存在")
-    if isinstance(item.get("inline_content"), str):
+    if item.get("producer") == CREATIVE_ARTIFACT_TOOL:
+        path = resolve_creative_artifact_path(item.get("path"), origin)
+        if not path.is_file() or path.stat().st_size > CREATIVE_ARTIFACT_MAX_BYTES:
+            raise ValueError("创作产物缺失或超过读取限制")
+    elif isinstance(item.get("inline_content"), str):
         return item["inline_content"]
-    path = Path(item["path"])
-    if not path.is_file() or path.stat().st_size > 1024 * 1024:
-        raise ValueError("正文文件缺失或超过1MB，无法在页面读取")
+    else:
+        path = Path(item["path"])
+        if not path.is_file() or path.stat().st_size > 1024 * 1024:
+            raise ValueError("正文文件缺失或超过1MB，无法在页面读取")
     return path.read_text(encoding="utf-8-sig")
 
 
 def refresh_text_fingerprints(state):
     """Backfill existing entries too, rather than requiring re-registration."""
     for item in list(state.get("work_library", [])):
-        if item.get("kind") != "text":
+        if item.get("kind") != "text" or item.get("producer") == CREATIVE_ARTIFACT_TOOL:
             continue
         try:
             item["content_hash"] = text_content_hash(
@@ -716,7 +789,7 @@ async def archive_library_images(state, base_url, identifiers=None):
             item.update(archive_status="failed", archive_error=str(exc)[:300])
 
 
-def download_library_file(state, identifier):
+def download_library_file(state, identifier, *, origin=None):
     item = next(
         (
             w
@@ -727,9 +800,14 @@ def download_library_file(state, identifier):
     )
     if item is None:
         raise ValueError("文件作品未登记")
-    path = Path(item["path"])
-    if not path.is_file() or path.stat().st_size > 20 * 1024 * 1024:
-        raise ValueError("文件缺失或超过20MB")
+    if item.get("producer") == CREATIVE_ARTIFACT_TOOL:
+        path = resolve_creative_artifact_path(item["path"], origin)
+        if not path.is_file() or path.stat().st_size > CREATIVE_ARTIFACT_MAX_BYTES:
+            raise ValueError("创作产物缺失或超过下载限制")
+    else:
+        path = Path(item["path"])
+        if not path.is_file() or path.stat().st_size > 20 * 1024 * 1024:
+            raise ValueError("文件缺失或超过20MB")
     return {
         "filename": path.name,
         "base64": base64.b64encode(path.read_bytes()).decode(),

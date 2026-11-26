@@ -3,6 +3,12 @@ let workFilter = "all";
 let companionOnly = false;
 let showArchivedWorks = false;
 let showWorkReferences = false;
+let workSearch = "";
+let workSearchComposing = false;
+let workPage = 0;
+let workTarget;
+const workPageSize = 20;
+const compileSelection = new Set();
 const referenceProducers = new Set(["safe_read", "file_hash", "autonomous_read_file", "read_file", "autonomous_list_files", "autonomous_search_files"]);
 const workSourceLabels = {
   private_companion: "陪伴作品库", autonomous_save_work: "自主创作", manual: "手动添加",
@@ -64,6 +70,72 @@ function uniqueLibrary(works, marks = {}) {
   return [...groups.values()];
 }
 
+function workSeriesIndex(library) {
+  const index = new Map();
+  const manuscripts = new Map();
+  const editionSources = new Map();
+  const verified = new Set();
+  const digits = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  for (const item of library) {
+    if (item.kind !== "text" || item.reference_only) continue;
+    const explicit = new Set();
+    const numbered = new Map();
+    const editions = new Map();
+    for (const row of item.records) {
+      const name = (row.title || "").trim();
+      const series = (row.series_title || "").trim();
+      if (series) explicit.add(series);
+      const editionTitle = row.compilation && name.match(/^(.+?)\s*[·•・]\s*(?:已定稿章节合订|合订草稿|合订终稿)$/)?.[1].trim();
+      if (row.compilation && (series || editionTitle)) {
+        const title = series || editionTitle;
+        const sources = editions.get(title) || [];
+        sources.push(...(row.chapter_ids || []));
+        editions.set(title, sources);
+      }
+      const chapter = !row.compilation && name.match(/^(.+?)[·•・：:\s_—-]*第([零〇一二两三四五六七八九十百\d０-９]+)[章节段回](?:$|[\s·•・：:—_-].*|《[^》]+》)$/);
+      if (!chapter) continue;
+      const number = chapter[2].normalize("NFKC");
+      const positional = number.match(/^(?:([一二两三四五六七八九])百(?:[零〇]([一二两三四五六七八九])|([一二两三四五六七八九])十([一二两三四五六七八九])?)?|([一二两三四五六七八九])?十([一二两三四五六七八九])?)$/);
+      const ordinal = /^\d{1,3}$/.test(number) ? Number(number)
+        : positional ? 100 * (digits[positional[1]] || 0) + 10 * (positional[1] ? digits[positional[3]] || 0 : digits[positional[5]] || 1)
+          + (digits[positional[2] || positional[4] || positional[6]] || 0)
+        : /^[零〇一二两三四五六七八九]{1,3}$/.test(number) ? Number([...number].map(digit => digits[digit]).join("")) : 0;
+      if (ordinal >= 1 && ordinal <= 999) numbered.set(chapter[1].trim(), ordinal);
+    }
+    const candidates = explicit.size ? explicit : new Set([...editions.keys(), ...numbered.keys()]);
+    if (candidates.size === 1) {
+      const [title] = candidates;
+      const edition = editions.has(title);
+      const ordinal = numbered.get(title);
+      index.set(item.id, { title, order: edition ? -1 : ordinal || 0 });
+      if (edition || ordinal) verified.add(title);
+      for (const id of editions.get(title) || []) {
+        if (!editionSources.has(id)) editionSources.set(id, new Set());
+        editionSources.get(id).add(title);
+      }
+    } else if (!candidates.size) {
+      const title = (item.title || "").trim();
+      const list = manuscripts.get(title) || [];
+      list.push(item);
+      manuscripts.set(title, list);
+    }
+  }
+  // Edition links and numbered manuscript headings are evidence; a shared title alone is not.
+  for (const [title, items] of manuscripts) {
+    if (!verified.has(title)) continue;
+    for (const item of items) {
+      const links = new Set(item.aliases.flatMap(id => [...(editionSources.get(id) || [])]));
+      const sections = [...new Set(item.records.flatMap(row =>
+        row.producer === "autonomous_save_work" && row.title?.trim() === title && Array.isArray(row.manuscript_sections)
+          ? row.manuscript_sections : []))].sort((a, b) => a - b);
+      if (links.size ? links.size === 1 && links.has(title) : sections.length > 0) {
+        index.set(item.id, { title, order: 0, ...(sections.length ? { sections } : {}) });
+      }
+    }
+  }
+  return index;
+}
+
 function previewText(content) {
   const text = String(content ?? "");
   return text.length > 800 ? text.slice(0, 800) : text;
@@ -82,12 +154,16 @@ async function downloadWork(session, item) {
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
-function renderWorks() {
+function renderWorks(openWorkId) {
   const s = worksSession();
+  if (workSearchComposing && s?.umo === workTarget) return;
+  workSearchComposing = false;
   const host = $("works-content");
   const filters = $("work-filters");
   if (typeof stopWorkMedia === "function") stopWorkMedia();
   if (!s) {
+    workTarget = undefined;
+    compileSelection.clear();
     filters.innerHTML = "";
     host.innerHTML = `<section class="works-empty" aria-labelledby="works-start-title">
       <span class="works-kicker">开始使用</span>
@@ -96,22 +172,46 @@ function renderWorks() {
     </section>`;
     return;
   }
+  if (workTarget !== s.umo) {
+    workTarget = s.umo;
+    workPage = 0;
+    compileSelection.clear();
+  }
   const archiveMarks = s.state.library_archived || {};
   const library = uniqueLibrary(s.state.work_library || [], archiveMarks);
+  const selectable = new Set(library.filter(item => item.kind === "text" && !item.compilation).map(item => item.id));
+  for (const id of compileSelection) if (!selectable.has(id)) compileSelection.delete(id);
+  const series = workSeriesIndex(library);
   const archivedCount = library.filter(item => isWorkArchived(item, archiveMarks)).length;
   const section = library.filter(item => Boolean(isWorkArchived(item, archiveMarks)) === showArchivedWorks);
+  const query = workSearch.trim().toLocaleLowerCase();
   const view = section.filter(item => item.reference_only === showWorkReferences && (!companionOnly || item.companion_copy))
-    .map(item => ({ ...item, display_kind: item.media_kind || item.kind }));
-  const visible = view.filter(item => workFilter === "all" || item.display_kind === workFilter)
+    .map(item => ({ ...item, display_kind: item.media_kind || item.kind }))
+    .filter(item => !query || [series.get(item.id)?.title, ...item.records.flatMap(row => [row.title, row.path, row.url])]
+      .some(value => value?.toLocaleLowerCase().includes(query)))
     .sort((a, b) => (b.modified_at || 0) - (a.modified_at || 0));
+  const shelves = new Map();
+  for (const item of view) {
+    const group = series.get(item.id);
+    const key = group ? `series:${group.title}` : `work:${item.id}`;
+    if (!shelves.has(key)) shelves.set(key, { title: group?.title, items: [] });
+    shelves.get(key).items.push(item);
+  }
+  const catalogue = [...shelves.values()];
+  const entries = catalogue.filter(entry => workFilter === "all" || entry.items[0].display_kind === workFilter);
+  const pageCount = Math.max(1, Math.ceil(entries.length / workPageSize));
+  workPage = Math.max(0, Math.min(workPage, pageCount - 1));
+  const pageEntries = entries.slice(workPage * workPageSize, (workPage + 1) * workPageSize);
   const outbox = s.state.outbox || [];
   const saved = s.state.saved_works || [];
   const pendingCount = outbox.filter(item => item.status === "pending").length;
   const referenceCount = section.filter(item => item.reference_only).length;
   const shelfTitle = `${showArchivedWorks ? "已移出的" : ""}${showWorkReferences ? "引用资料" : "创作成果"}`;
   const firstRun = !library.length;
-  const focusedFilter = document.activeElement?.closest("#work-filters button, #works-management > summary");
+  const focusedFilter = document.activeElement?.closest("#work-filters button, #work-search, #works-management > summary");
+  const searchSelection = focusedFilter?.id === "work-search" ? [focusedFilter.selectionStart, focusedFilter.selectionEnd] : null;
   const managementOpen = $("works-management")?.open;
+  const openSeries = new Set([...host.querySelectorAll("[data-work-series][open]")].map(card => card.dataset.workSeries));
 
   filters.innerHTML = `
     <section class="works-start" aria-labelledby="works-guide-title">
@@ -129,6 +229,7 @@ function renderWorks() {
     <div class="works-tools">
       <section class="works-filter-box" aria-labelledby="works-filter-title">
         <h3 id="works-filter-title">浏览筛选</h3>
+        <label class="works-search" for="work-search">搜索目录<input id="work-search" type="text" inputmode="search" value="${escapeHTML(workSearch)}" placeholder="系列名、作品标题或路径"></label>
         <div class="works-filter-row" role="group" aria-labelledby="works-shelf-label">
           <span id="works-shelf-label" class="hint">范围</span>
           <div class="actions">
@@ -141,7 +242,7 @@ function renderWorks() {
           <span id="works-kind-label" class="hint">类型</span>
           <div class="actions">
             ${[["all", "全部"], ...Object.entries(workKinds)].map(([kind, label]) =>
-              `<button class="chip ${workFilter === kind ? "active" : ""}" data-filter="${kind}" type="button" aria-pressed="${workFilter === kind}">${label} ${view.filter(item => kind === "all" || item.display_kind === kind).length}</button>`).join("")}
+              `<button class="chip ${workFilter === kind ? "active" : ""}" data-filter="${kind}" type="button" aria-pressed="${workFilter === kind}">${label} ${catalogue.filter(entry => kind === "all" || entry.items[0].display_kind === kind).length}</button>`).join("")}
           </div>
         </div>
       </section>
@@ -153,6 +254,10 @@ function renderWorks() {
             <button id="compile-works" type="button">合并已完结章节</button>
           </div>
           <p class="hint">合订前可在正文条目中选章；原章保留，不会自动发送。</p>
+          <div class="actions">
+            <span class="hint" id="works-selection-count" aria-live="polite">已选 ${compileSelection.size} 项（跨页保留）</span>
+            <button id="clear-works-selection" class="btn-ghost" type="button" ${compileSelection.size ? "" : "disabled"}>清除选择</button>
+          </div>
         </div>
       </details>
     </div>
@@ -164,19 +269,22 @@ function renderWorks() {
   host.innerHTML = `
     <section class="works-catalogue" aria-labelledby="works-catalogue-title">
       <header class="works-section-head">
-        <div><span class="works-kicker">01 / 目录</span><h3 id="works-catalogue-title">${shelfTitle}</h3></div>
-        <span class="works-count">${visible.length} 项 · 按最近更新</span>
+        <div><span class="works-kicker">01 / 目录</span><h3 id="works-catalogue-title" tabindex="-1">${shelfTitle}</h3></div>
+        <span class="works-count">${entries.length} 项 · 按最近更新</span>
       </header>
       <div id="work-list">
-      ${visible.map(item => {
-        const kind = workKinds[item.display_kind] || "作品";
-        const source = workSourceLabels[item.producer] || item.producer || "来源未记录";
-        const status = item.status === "finished" ? "完稿" : item.status === "drafting" ? "草稿" : "";
-        const date = item.modified_at ? new Date(item.modified_at * 1000) : null;
-        const usable = ["local", "inline", "remote"].includes(item.availability);
-        const isDraft = item.status === "drafting" && item.producer !== "private_companion";
-        const id = escapeHTML(item.id);
-        return `<details class="work works-entry" data-work-id="${id}">
+      ${pageEntries.map(entry => {
+        const { title, items } = entry;
+        if (title) items.sort((a, b) => series.get(a.id).order - series.get(b.id).order);
+        const contents = items.map(item => {
+          const kind = workKinds[item.display_kind] || "作品";
+          const source = workSourceLabels[item.producer] || item.producer || "来源未记录";
+          const status = item.status === "finished" ? "完稿" : item.status === "drafting" ? "草稿" : "";
+          const date = item.modified_at ? new Date(item.modified_at * 1000) : null;
+          const usable = ["local", "inline", "remote"].includes(item.availability);
+          const isDraft = item.status === "drafting" && item.producer === "autonomous_save_work";
+          const id = escapeHTML(item.id);
+          return `<details class="work works-entry" data-work-id="${id}">
           <summary>
             <span class="works-mark" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24">${workKindMarks[item.display_kind] || workKindMarks.file}</svg></span>
             <span class="works-entry-copy">
@@ -188,6 +296,7 @@ function renderWorks() {
               <span class="works-entry-info">
                 <span class="works-source">${escapeHTML(source)}${item.records.length > 1 ? ` · ${item.records.length} 条来源记录` : ""}</span>
                 ${status ? `<span class="pill">${status}</span>` : ""}
+                ${series.get(item.id)?.sections?.length ? `<span class="pill">含编号 ${escapeHTML(series.get(item.id).sections.join("、"))}</span>` : ""}
                 ${item.archive_status === "saved" && item.availability === "local" ? '<span class="pill ok">已备份</span>' : ""}
                 ${!["local", "inline"].includes(item.availability) ? `<span class="pill warn">${availabilityLabels[item.availability] || "来源不可用"}</span>` : ""}
               </span>
@@ -198,7 +307,7 @@ function renderWorks() {
             <div class="work-detail"></div>
             <div>
               <div class="actions" role="group" aria-label="作品操作">
-                ${item.kind === "text" ? `<label class="check works-compile-check"><input type="checkbox" data-compile-id="${id}"><span>选择此章合订</span></label>` : ""}
+                ${selectable.has(item.id) ? `<label class="check works-compile-check"><input type="checkbox" data-compile-id="${id}" ${compileSelection.has(item.id) ? "checked" : ""}><span>选择此项合订</span></label>` : ""}
                 ${isDraft ? `<button data-finalize-draft="${id}" type="button" class="btn-primary">定稿</button>` : ""}
                 ${usable ? `<button data-share="${id}" type="button">加入成果箱</button>` : ""}
                 ${item.kind === "image" && item.availability === "remote" ? `<button data-save-image="${id}" type="button">补存本地图片</button>` : ""}
@@ -207,6 +316,7 @@ function renderWorks() {
                 ${showArchivedWorks && !(item.kind === "image" && item.aliases.length > 1) ? `<button data-delete-work="${id}" type="button" class="btn-danger">彻底删除</button>` : ""}
                 ${item.chapter_ids?.length && !showArchivedWorks ? `<button data-archive-chapters="${id}" type="button">收起已合订章节</button>` : ""}
               </div>
+              ${isDraft ? `<details class="work works-history"><summary>草稿版本记录</summary><div class="works-history-body" aria-live="polite"></div></details>` : ""}
               <div class="works-provenance">
                 <p class="works-kicker">来源记录</p>
                 <ul>
@@ -221,11 +331,25 @@ function renderWorks() {
             </div>
           </div>
         </details>`;
+        }).join("");
+        return title ? `<details class="work works-entry works-series" data-work-series="${escapeHTML(title)}" ${openSeries.has(title) ? "open" : ""}>
+          <summary>
+            <span class="works-mark" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24">${workKindMarks.text}</svg></span>
+            <span class="works-entry-copy"><span class="work-kind">系列 · ${items.length} 项</span><span class="work-title">${escapeHTML(title)}</span></span>
+            <span class="works-chevron" aria-hidden="true"></span>
+          </summary>
+          <div class="works-entry-body works-series-items">${contents}</div>
+        </details>` : contents;
       }).join("") || `<div class="works-empty">
         <strong>${firstRun ? "目录还是空的" : "当前筛选下没有作品"}</strong>
-        <p class="hint">${firstRun ? "从上方同步陪伴作品或添加文本，已有本地文本也可在「整理目录」中补录。" : "试试切换范围，或将类型切换到「全部」。"}</p>
+        <p class="hint">${firstRun ? "从上方同步陪伴作品或添加文本，已有本地文本也可在「整理目录」中补录。" : "试试调整搜索词、切换范围，或将类型切换到「全部」。"}</p>
       </div>`}
       </div>
+      ${pageCount > 1 ? `<nav class="actions works-pagination" aria-label="作品目录分页">
+        <button id="works-prev-page" type="button" ${workPage === 0 ? "disabled" : ""}>上一页</button>
+        <span class="works-count" role="status">第 ${workPage + 1} / ${pageCount} 页</span>
+        <button id="works-next-page" type="button" ${workPage === pageCount - 1 ? "disabled" : ""}>下一页</button>
+      </nav>` : ""}
     </section>
 
     <section class="works-outbox" aria-labelledby="works-outbox-title">
@@ -266,17 +390,39 @@ function renderWorks() {
 
   const kindButtons = [...document.querySelectorAll("#work-filters [data-filter]")];
   kindButtons.forEach(button => {
-    button.onclick = () => { workFilter = button.dataset.filter; renderWorks(); };
+    button.onclick = () => { workFilter = button.dataset.filter; workPage = 0; renderWorks(); };
   });
+  const search = $("work-search");
+  search.oncompositionstart = () => { workSearchComposing = true; };
+  search.oninput = search.oncompositionend = event => {
+    if (event.type === "compositionend") workSearchComposing = false;
+    if (workSearchComposing || event.isComposing || (event.type !== "compositionend" && search.value === workSearch)) return;
+    if (search.value !== workSearch) {
+      workSearch = search.value;
+      workPage = 0;
+    }
+    renderWorks();
+  };
   if (focusedFilter?.id) $(focusedFilter.id)?.focus();
   else if (focusedFilter?.dataset.filter) kindButtons.find(button => button.dataset.filter === focusedFilter.dataset.filter)?.focus();
   else if (focusedFilter?.tagName === "SUMMARY") $("works-management")?.querySelector("summary")?.focus();
+  if (searchSelection) search.setSelectionRange(...searchSelection);
+  if (pageCount > 1) {
+    for (const [id, step] of [["works-prev-page", -1], ["works-next-page", 1]]) {
+      $(id).onclick = () => {
+        workPage += step;
+        renderWorks();
+        $("works-catalogue-title").focus({ preventScroll: true });
+        $("works-catalogue-title").scrollIntoView({ block: "start" });
+      };
+    }
+  }
   $("jump-works-outbox").onclick = () => $("works-outbox-title").focus();
-  $("filter-work-references").onclick = () => { showWorkReferences = !showWorkReferences; companionOnly = false; workFilter = "all"; renderWorks(); };
-  $("filter-companion").onclick = () => { companionOnly = !companionOnly; renderWorks(); };
+  $("filter-work-references").onclick = () => { showWorkReferences = !showWorkReferences; companionOnly = false; workFilter = "all"; workPage = 0; renderWorks(); };
+  $("filter-companion").onclick = () => { companionOnly = !companionOnly; workPage = 0; renderWorks(); };
   $("sync-companion").onclick = () => perform({ umo: s.umo, action: "companion_sync" });
   $("rescan-works").onclick = () => perform({ umo: s.umo, action: "work_rescan" });
-  $("toggle-archived").onclick = () => { showArchivedWorks = !showArchivedWorks; renderWorks(); };
+  $("toggle-archived").onclick = () => { showArchivedWorks = !showArchivedWorks; workPage = 0; renderWorks(); };
   $("add-text-work").onclick = async () => {
     const title = await pagePrompt("作品标题");
     if (!title?.trim()) return;
@@ -284,18 +430,29 @@ function renderWorks() {
     if (!content?.trim()) return;
     perform({ umo: s.umo, action: "work_add_text", title, content });
   };
+  const clearSelection = $("clear-works-selection");
+  const selectionCount = $("works-selection-count");
+  host.onchange = event => {
+    const input = event.target;
+    if (!input.matches("[data-compile-id]")) return;
+    if (input.checked) compileSelection.add(input.dataset.compileId);
+    else compileSelection.delete(input.dataset.compileId);
+    selectionCount.textContent = `已选 ${compileSelection.size} 项（跨页保留）`;
+    clearSelection.disabled = !compileSelection.size;
+  };
+  clearSelection.onclick = () => { compileSelection.clear(); renderWorks(); $("compile-works").focus(); };
   $("compile-works").onclick = async () => {
-    const ids = [...host.querySelectorAll("[data-compile-id]:checked")].map(input => input.dataset.compileId);
-    const title = await pagePrompt("整篇作品标题（未勾选章节时，自动查找同标题的第X章/段；合订不代表程序判定故事已经完结）");
+    const ids = [...compileSelection];
+    const title = await pagePrompt("整篇作品标题（可勾选同名合稿及独立章节；若有不同版本，请只勾选要采用的版本。合订不代表完结）");
     if (!title?.trim()) return;
-    if (await pageConfirm("确认这些章节已经完结并整理合订？原章保留，不自动发送；同章有不同版本时请先勾选。")) {
+    if (await pageConfirm("按章节顺序整理合订？有草稿时生成合订草稿，不标记完结。原文件保留，不自动发送。")) {
       perform({ umo: s.umo, action: "work_compile", title: title.trim(), ...(ids.length ? { ids } : {}) });
     }
   };
 
-  const cards = [...host.querySelectorAll("[data-work-id]")];
-  visible.forEach((item, index) => {
-    const details = cards[index];
+  const cards = new Map([...host.querySelectorAll("[data-work-id]")].map(details => [details.dataset.workId, details]));
+  pageEntries.flatMap(entry => entry.items).forEach(item => {
+    const details = cards.get(item.id);
     if (!details) return;
     if (item.kind === "image") mountGallery(details, s, item);
     else if (item.kind === "text" || item.kind === "code") mountTextWork(details, s, item);
@@ -325,17 +482,39 @@ function renderWorks() {
       perform({ umo: s.umo, action: "work_delete", id: item.id });
     };
     const finalizeBtn = details.querySelector("[data-finalize-draft]");
-    if (finalizeBtn) finalizeBtn.onclick = async () => {
-      finalizeBtn.disabled = true;
+    if (finalizeBtn) finalizeBtn.onclick = () => perform({ umo: s.umo, action: "work_finalize_draft", id: item.id });
+    const history = details.querySelector(".works-history");
+    if (history) history.addEventListener("toggle", async () => {
+      if (!history.open || history.dataset.loaded) return;
+      history.dataset.loaded = "true";
+      const body = history.querySelector(".works-history-body");
+      body.textContent = "正在读取版本记录…";
       try {
-        perform({ umo: s.umo, action: "work_finalize_draft", id: item.id });
-        notice("已定稿，状态更新为已完成");
+        const { versions } = await api("POST", "action", { umo: s.umo, action: "work_versions", id: item.id });
+        body.textContent = versions.length ? "" : "暂无历史版本。";
+        for (const version of versions) {
+          const row = document.createElement("div");
+          row.className = "actions";
+          const date = new Date(version.saved_at * 1000);
+          const label = document.createElement("span");
+          label.className = "hint";
+          label.textContent = version.saved_at && Number.isFinite(date.getTime()) ? date.toLocaleString() : "保存时间未知";
+          const restore = document.createElement("button");
+          restore.type = "button";
+          restore.textContent = "恢复此版本";
+          restore.onclick = async () => {
+            if (await pageConfirm("恢复此历史版本作为当前草稿？不会自动定稿或发送。")) {
+              await perform({ umo: s.umo, action: "work_restore_version", id: item.id, version_id: version.id });
+            }
+          };
+          row.append(label, restore);
+          body.append(row);
+        }
       } catch (error) {
-        notice("定稿失败：" + error.message);
-      } finally {
-        finalizeBtn.disabled = false;
+        delete history.dataset.loaded;
+        body.textContent = "版本记录读取失败：" + error.message + "；可重新展开重试。";
       }
-    };
+    });
   });
 
   document.querySelectorAll("[data-outbox-send]").forEach(button => {
@@ -353,12 +532,24 @@ function renderWorks() {
   });
   document.querySelectorAll("[data-open-work]").forEach(button => {
     button.onclick = () => {
-      const work = visible.find(item => item.aliases.includes(button.dataset.openWork));
-      const details = cards.find(card => card.dataset.workId === work?.id);
-      if (!details) { notice("原作品不在当前筛选或目录中。"); return; }
-      details.open = true;
-      details.scrollIntoView({ behavior: "smooth", block: "center" });
+      const id = button.dataset.openWork;
+      const index = entries.findIndex(entry => entry.items.some(item => item.aliases.includes(id)));
+      if (index < 0) { notice("原作品不在当前筛选或目录中。"); return; }
+      const destination = Math.floor(index / workPageSize);
+      if (destination !== workPage) {
+        workPage = destination;
+        renderWorks(id);
+      } else {
+        const work = entries[index].items.find(item => item.aliases.includes(id));
+        const details = cards.get(work.id);
+        const parent = details.closest("[data-work-series]");
+        if (parent) parent.open = true;
+        details.open = true;
+        details.querySelector("summary").focus({ preventScroll: true });
+        details.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
     };
+    if (button.dataset.openWork === openWorkId) button.onclick();
   });
 }
 
