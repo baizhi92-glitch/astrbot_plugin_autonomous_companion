@@ -477,9 +477,13 @@ function render() {
 async function perform(body) {
   if (busy) return;
   busy = true;
-  document.querySelectorAll("button").forEach(button => { button.disabled = true; });
+  const buttons = [...document.querySelectorAll("button:not(:disabled)")];
+  buttons.forEach(button => { button.disabled = true; });
   try {
     const result = await api("POST", "action", body);
+    if (["work_finalize_draft", "work_restore_version"].includes(body.action) && result?.saved !== true) {
+      throw new Error("未收到保存确认，请刷新核对作品状态");
+    }
     if (body.action === "companion_sync") previewCache.clear();
     if (["plan", "conditions"].includes(body.action)) planDrafts.delete(body.action);
     if (body.action === "cancel_plan") { planDrafts.delete("plan"); if ($("plan-editor")) $("plan-editor").value = ""; }
@@ -489,20 +493,31 @@ async function perform(body) {
     rendered.works = "";
     rendered.sessions = "";
     rendered.usage = "";
-    notice(
+    if (body.action === "work_finalize_draft") {
+      const compilation = result.compilation;
+      const prefix = result.chapter === true ? "章节已定稿" : "草稿已定稿";
+      const detail = compilation?.status === "updated" ? `；合订已更新${compilation.chapters ? `（${compilation.chapters} 章）` : ""}`
+        : compilation?.status === "not_ready" ? "；尚未生成合订"
+        : compilation?.status === "unchanged" ? "；现有合订无需更新"
+        : compilation?.status === "blocked" ? `；合订未更新${compilation.reason ? "：" + compilation.reason : ""}` : "";
+      notice(prefix + detail + "。", compilation?.status === "blocked" ? "warn" : "ok");
+    } else notice(
       result.decision ? "预览：" + JSON.stringify(result.decision)
         : body.action === "companion_sync" ? result.message
         : body.action === "work_rescan" ? "已检查并补录 " + result.indexed + " 份文本文件。"
         : body.action === "now" ? "已安排自主判断，她可以选择行动或沉默。"
         : body.action === "cancel_plan" ? "临时任务已取消，不再恢复。"
+        : body.action === "work_restore_version" ? "已恢复为当前草稿。"
         : "已保存",
       "ok"
     );
   } catch (error) {
-    notice("操作失败：" + error.message, "bad");
+    const prefix = body.action === "work_finalize_draft" ? "定稿失败："
+      : body.action === "work_restore_version" ? "恢复草稿失败：" : "操作失败：";
+    notice(prefix + error.message, "bad");
   } finally {
     busy = false;
-    document.querySelectorAll("button").forEach(button => { button.disabled = false; });
+    buttons.forEach(button => { button.disabled = false; });
     await refresh();
   }
 }

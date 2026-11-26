@@ -3,10 +3,12 @@
 import asyncio
 import hashlib
 import json
+import re
 import stat
 import time
 from pathlib import Path
 
+from astrbot.api.star import StarTools
 from astrbot.api.web import request
 from astrbot.core import file_token_service
 
@@ -17,8 +19,14 @@ from .cancellations import (
     remember_cancellation,
 )
 from .companion_library import sync_companion_library
-from .compiled_work import compile_chapters
+from .compiled_work import (
+    chapter_identity,
+    compile_chapters,
+    draft_sections,
+    refresh_finished_collection,
+)
 from .conditions import validate_conditions
+from .creative_artifacts import CREATIVE_ARTIFACT_TOOL, resolve_creative_artifact_path
 from .daily import pool_snapshot, usage_for
 from .diagnostics import inspect_runtime, memory_sample, write_export
 from .library import (
@@ -26,9 +34,11 @@ from .library import (
     backfill_library,
     discover_text_works,
     download_library_file,
+    normalized_work_body,
     read_library_image,
     read_library_text,
     refresh_text_fingerprints,
+    register_local_work,
 )
 from .library_management import add_text_work, organize_work, remove_work
 from .long_tasks import control_task as control_long_task
@@ -36,6 +46,7 @@ from .long_tasks import create_task as create_long_task
 from .notes import NOTE_KINDS, migrate_user_notes
 from .outbox import DispatchOutcome, enqueue_work, output_chain
 from .planning import apply_plan, control_project, resolve_project
+from .work_versions import VERSION_ID, list_work_versions, replace_work_text
 
 MEDIA_KINDS = dict.fromkeys((".mp3", ".wav", ".ogg", ".flac", ".m4a", ".opus"), "audio")
 MEDIA_KINDS.update(dict.fromkeys((".mp4", ".webm", ".m4v"), "video"))
@@ -146,10 +157,13 @@ class CompanionPageAPI:
             Public work rows with availability, preview eligibility and image hashes.
         """
         cache = getattr(self, "_image_view_hashes", {})
+        manuscript_cache = getattr(self, "_manuscript_sections", {})
         current = {}
-        for works in catalogues.values():
+        manuscripts = {}
+        for origin, works in catalogues.items():
             for work in works:
                 inline = isinstance(work.pop("inline_content", None), str)
+                work.pop("manuscript_sections", None)
                 path = work.get("path")
                 work.pop("media_preview", None)
                 work["media_kind"] = (
@@ -172,7 +186,11 @@ class CompanionPageAPI:
                 if not isinstance(path, str) or not path:
                     continue
                 try:
-                    file = Path(path)
+                    file = (
+                        resolve_creative_artifact_path(path, origin)
+                        if work.get("producer") == CREATIVE_ARTIFACT_TOOL
+                        else Path(path)
+                    )
                     if work["media_kind"] and (
                         not file.is_absolute() or file.anchor.startswith("\\\\")
                     ):
@@ -182,6 +200,38 @@ class CompanionPageAPI:
                         continue
                     work["availability"] = "local"
                     work.setdefault("modified_at", info.st_mtime)
+                    title = work.get("title", "")
+                    if (
+                        title
+                        and not chapter_identity(title)
+                        and work.get("kind") == "text"
+                        and work.get("producer") == "autonomous_save_work"
+                        and not work.get("compilation")
+                        and 0 < info.st_size <= 1024 * 1024
+                    ):
+                        key = (
+                            path,
+                            title,
+                            info.st_size,
+                            info.st_mtime_ns,
+                            info.st_ctime_ns,
+                        )
+                        if key not in manuscripts:
+                            sections = manuscript_cache.get(key)
+                            if sections is None:
+                                with file.open("rb") as stream:
+                                    raw = stream.read(1024 * 1024 + 1)
+                                sections = []
+                                if len(raw) <= 1024 * 1024:
+                                    body = normalized_work_body(
+                                        raw.decode("utf-8-sig"), title
+                                    )
+                                    sections = sorted(
+                                        {n for n, _, _ in draft_sections(title, body)}
+                                    )
+                            manuscripts[key] = sections
+                        if manuscripts[key]:
+                            work["manuscript_sections"] = manuscripts[key]
                     if work["media_kind"]:
                         work["media_preview"] = (
                             "ready"
@@ -206,6 +256,7 @@ class CompanionPageAPI:
                 except (OSError, ValueError):
                     continue
         self._image_view_hashes = current
+        self._manuscript_sections = manuscripts
         return catalogues
 
     async def diagnostics(self):
@@ -498,6 +549,67 @@ class CompanionPageAPI:
             state["plan_cancelled_at"] = time.time()
             await owner.save()
             return {"status": "ok", "data": {"saved": True}}
+        if action in {"work_versions", "work_restore_version"}:
+            if action == "work_restore_version" and (
+                umo in owner.running or umo in owner.chat_tasks
+            ):
+                raise ValueError("正在执行或整理，请稍后恢复草稿")
+            work = next(
+                (w for w in state.get("work_library", []) if w["id"] == body.get("id")),
+                None,
+            )
+            if (
+                not work
+                or work.get("producer") != "autonomous_save_work"
+                or work.get("status") != "drafting"
+                or not work.get("path")
+            ):
+                raise ValueError("仅支持查看和恢复本地草稿的历史版本")
+            path = Path(work["path"])
+            scope = hashlib.sha256(umo.encode()).hexdigest()[:16]
+            drafts = (
+                Path(
+                    StarTools.get_data_dir("astrbot_plugin_autonomous_companion")
+                ).resolve()
+                / "works"
+                / scope
+                / "drafts"
+            )
+            if (
+                path.parent != drafts
+                or path.resolve() != path
+                or not re.fullmatch(r"draft-[0-9a-f]{32}\.md", path.name)
+                or not path.is_file()
+            ):
+                raise ValueError("草稿文件不在当前作品目录或已缺失")
+            versions = await asyncio.to_thread(list_work_versions, path)
+            if action == "work_versions":
+                return {"status": "ok", "data": {"versions": versions}}
+            version = body.get("version_id")
+            if (
+                not isinstance(version, str)
+                or not VERSION_ID.fullmatch(version)
+                or not any(row["id"] == version for row in versions)
+            ):
+                raise ValueError("这个历史版本已不存在，请刷新页面")
+            source = drafts / ".versions" / path.stem / (version + ".md")
+            if source.resolve() != source or source.stat().st_size > 1024 * 1024:
+                raise ValueError("历史版本不可读取")
+            text = await asyncio.to_thread(source.read_bytes)
+            text = text.decode("utf-8")
+            old_title = text.partition("\n")[0].strip()
+            if (
+                not old_title
+                or len(old_title) > 200
+                or not text.partition("\n")[2].strip()
+            ):
+                raise ValueError("历史版本正文不可读取")
+            await asyncio.to_thread(replace_work_text, path, text)
+            register_local_work(
+                state, str(path), "autonomous_save_work", old_title, status="drafting"
+            )
+            await owner.save()
+            return {"status": "ok", "data": {"saved": True}}
         if action in {
             "work_archive",
             "work_restore",
@@ -524,13 +636,31 @@ class CompanionPageAPI:
                     raise ValueError(
                         "陪伴作品库条目只读，不可直接修改；请调用 companion API"
                     )
-                if not work.get("path"):
-                    raise ValueError("该草稿无本地文件，无法定稿")
-                # Mark as finished
-                state["work_library"] = [
-                    w if w["id"] != work["id"] else {**w, "status": "finished"}
-                    for w in state["work_library"]
-                ]
+                if work.get("status") != "drafting" or not work.get("path"):
+                    raise ValueError("该作品不是可定稿的本地草稿")
+                content = await asyncio.to_thread(read_library_text, state, work["id"])
+                if not content.strip():
+                    raise ValueError("草稿正文为空，无法定稿")
+                work["status"] = "finished"
+                compilation = {"status": "not_ready"}
+                if work.get("producer") == "autonomous_save_work" and work.get("title"):
+                    chapter = chapter_identity(work["title"])
+                    compilation = await asyncio.to_thread(
+                        refresh_finished_collection,
+                        state,
+                        umo,
+                        chapter[0] if chapter else work["title"],
+                        owner.logger,
+                    )
+                await owner.save()
+                return {
+                    "status": "ok",
+                    "data": {
+                        "saved": True,
+                        "compilation": compilation,
+                        "chapter": chapter_identity(work.get("title", "")) is not None,
+                    },
+                }
             elif action == "work_archive_chapters":
                 work = next(
                     (
@@ -543,9 +673,6 @@ class CompanionPageAPI:
                 if not work or not work.get("chapter_ids"):
                     raise ValueError("该作品没有已核验的合订章节关联，请先选择章节合订")
                 organize_work(state, work["chapter_ids"], True)
-            elif action == "work_finalize_draft":
-                # Already handled above; just save
-                pass
             else:
                 organize_work(state, body.get("ids"), action == "work_archive")
             await owner.save()
@@ -581,7 +708,9 @@ class CompanionPageAPI:
                 )
             return {"status": "ok", "data": {"saved": True}}
         if action == "work_download":
-            file = await asyncio.to_thread(download_library_file, state, body.get("id"))
+            file = await asyncio.to_thread(
+                download_library_file, state, body.get("id"), origin=umo
+            )
             return {"status": "ok", "data": file}
         elif action == "work_delete":
             if umo in owner.running or umo in owner.chat_tasks:
@@ -597,12 +726,14 @@ class CompanionPageAPI:
             )
             return {"status": "ok", "data": {"image": image}}
         elif action == "work_read":
-            text = await asyncio.to_thread(read_library_text, state, body.get("id"))
+            text = await asyncio.to_thread(
+                read_library_text, state, body.get("id"), origin=umo
+            )
             return {"status": "ok", "data": {"content": text}}
         elif action == "work_to_outbox":
             if umo in owner.running or umo in owner.chat_tasks:
                 raise ValueError("正在执行或整理，请稍后加入成果箱")
-            enqueue_work(state, body.get("id"))
+            enqueue_work(state, body.get("id"), origin=umo)
         elif action in {"note_save", "preference_save", "impression_save"}:
             if umo in owner.running or umo in owner.chat_tasks:
                 raise ValueError("正在执行或整理，请稍后修改关于你的记录")

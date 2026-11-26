@@ -10,8 +10,10 @@ from pathlib import Path
 from astrbot.api.star import StarTools
 from astrbot.core.agent.tool import FunctionTool
 
+from .compiled_work import chapter_identity, refresh_finished_collection
 from .library import catalogue_receipt, register_local_work, text_content_hash
 from .lifecycle import record_evidence
+from .work_versions import replace_work_text
 
 _TITLE_NOISE = " \t\r\n《》〈〉【】[]()（）\"'“”‘’·-—_：:；;，,。.!！?？、"
 _TITLE_TABLE = str.maketrans("", "", _TITLE_NOISE)
@@ -78,6 +80,21 @@ class SaveWorkTool(FunctionTool):
         ).resolve()
         scope = hashlib.sha256(self.event.unified_msg_origin.encode()).hexdigest()[:16]
         drafts_dir = root / "works" / scope / "drafts"
+        if work_id:
+            previous = next(
+                (
+                    w
+                    for w in self.event.state.get("work_library", [])
+                    if w["id"] == work_id
+                ),
+                None,
+            )
+            if previous:
+                old_title = previous.get("title", "")
+                old_chapter = chapter_identity(old_title)
+                new_chapter = chapter_identity(title)
+                if (old_chapter or new_chapter) and old_chapter != new_chapter:
+                    raise ValueError("不能用不同章节覆盖现有草稿，请为新章节另存")
 
         def owns_draft(item):
             if (
@@ -124,16 +141,8 @@ class SaveWorkTool(FunctionTool):
                     if not owns_draft(work_item):
                         raise ValueError("只能更新当前会话中由本工具创建的草稿")
                     target = Path(work_item["path"])
-                    # Overwrite existing draft
                     text = title.strip() + "\n\n" + content
-
-                    def write():
-                        with target.open("w", encoding="utf-8") as stream:
-                            stream.write(text)
-                        if target.read_text(encoding="utf-8") != text:
-                            raise OSError("Work verification failed")
-
-                    await asyncio.to_thread(write)
+                    await asyncio.to_thread(replace_work_text, target, text)
                     receipt = {
                         "saved": True,
                         "title": title[:200],
@@ -323,16 +332,8 @@ class SaveWorkTool(FunctionTool):
             if not owns_draft(work_item):
                 raise ValueError("只能定稿当前会话中由本工具创建的草稿")
             target = Path(work_item["path"])
-            # Overwrite with final content
             text = title.strip() + "\n\n" + content
-
-            def write():
-                with target.open("w", encoding="utf-8") as stream:
-                    stream.write(text)
-                if target.read_text(encoding="utf-8") != text:
-                    raise OSError("Work verification failed")
-
-            await asyncio.to_thread(write)
+            await asyncio.to_thread(replace_work_text, target, text)
             register_local_work(
                 state,
                 str(target.resolve()),
@@ -380,5 +381,13 @@ class SaveWorkTool(FunctionTool):
         record_evidence(state, "work_saved", json.dumps(receipt, ensure_ascii=False))
         state["saved_works"] = (state.get("saved_works", []) + [receipt])[-30:]
         owner.journal(state, "work_saved", json.dumps(receipt, ensure_ascii=False))
+        chapter = chapter_identity(title)
+        await asyncio.to_thread(
+            refresh_finished_collection,
+            state,
+            self.event.unified_msg_origin,
+            chapter[0] if chapter else title.strip(),
+            owner.logger,
+        )
         await owner.save()
         return json.dumps(receipt, ensure_ascii=False)

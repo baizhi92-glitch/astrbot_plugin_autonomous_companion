@@ -1,10 +1,14 @@
 """Durable per-task execution checkpoints."""
 
 import copy
+import json
+import re
 import time
 import uuid
 
 from .action_context import completed_action_match
+from .compiled_work import CHAPTER_NUMBER, chapter_identity, draft_sections
+from .library import normalized_work_body, read_library_text
 from .planning import blocked_project_task
 
 # 一个待办断点被自动续跑的次数上限。断点没有时间过期机制，只要 pending 就会被
@@ -171,6 +175,98 @@ def resume_checkpoint(event, task):
     event.media_deliveries = saved.get("media_deliveries", 0)
     event.execution_contract = copy.deepcopy(saved.get("contract", {}))
     return bool(event.execution_contract)
+
+
+def chapter_save_target(task):
+    """Parse only save-only tasks, not requests to write, edit or send a chapter."""
+    match = re.fullmatch(
+        r"保存\s*(?:《([^》]+)》|([^《》]+?))\s*草稿\s*[。.]?", task.strip()
+    )
+    if not match:
+        return None
+    title = (match[1] or match[2]).strip()
+    if re.fullmatch(rf"第{CHAPTER_NUMBER}[章节段回]", title):
+        identity = chapter_identity(f"chapter·{title}")
+        return ("", identity[1]) if identity else None
+    if (match[1] or "·" in title) and re.fullmatch(
+        rf"[^，。、；：:！!？?]+?第{CHAPTER_NUMBER}[章节段回]", title
+    ):
+        return chapter_identity(title)
+    return None
+
+
+def reconcile_saved_chapters(state, cid):
+    """Close stale save-only checkpoints using their own verified local outputs.
+
+    Args:
+        state: Per-conversation catalogue and task state.
+        cid: Current conversation identity.
+
+    Returns:
+        Tasks closed without re-executing any tool.
+    """
+    closed = set()
+    works = {item["id"]: item for item in state.get("work_library", [])}
+    records = [
+        *state.get("execution_checkpoints", {}).values(),
+        state.get("execution_checkpoint", {}),
+    ]
+    for record in records:
+        task = record.get("task", "")
+        if (
+            not record.get("pending")
+            or record.get("cid") != cid
+            or not (target := chapter_save_target(task))
+        ):
+            continue
+        series, ordinal = target
+        matches = set()
+        for receipt in record.get("receipts", []):
+            if receipt.get("tool") != "autonomous_save_work":
+                continue
+            try:
+                result = json.loads(receipt.get("result", ""))
+                if not isinstance(result, dict) or result.get("saved") is not True:
+                    continue
+                work_id = result.get("work_id")
+                work = works.get(work_id)
+                if (
+                    not work
+                    or work.get("producer") != "autonomous_save_work"
+                    or work.get("path") != result.get("path")
+                    or not work.get("path")
+                    or work.get("title") != result.get("title")
+                ):
+                    continue
+                content = normalized_work_body(
+                    read_library_text(state, work_id), work["title"]
+                )
+            except (ValueError, TypeError, OSError, KeyError):
+                continue
+            if not content:
+                continue
+            identity = chapter_identity(work["title"])
+            if (
+                identity
+                and identity[1] == ordinal
+                and (not series or identity[0] == series)
+            ):
+                matches.add(identity[0])
+            elif (
+                series
+                and work["title"] == series
+                and any(n == ordinal for n, _, _ in draft_sections(series, content))
+            ):
+                matches.add(series)
+        if len(matches) == 1:
+            record.update(pending=False, manual_review=False)
+            closed.add(task)
+    for task in closed:
+        clear_task_failure(state, task)
+    for field in ("future_task", "next_task"):
+        if state.get(field) in closed:
+            state[field] = ""
+    return sorted(closed)
 
 
 def next_checkpoint(state, cid, now=None):

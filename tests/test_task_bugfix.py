@@ -117,6 +117,7 @@ async def test_save_work_updates_only_owned_draft(tmp_path, monkeypatch):
         check_current=AsyncMock(),
         save=AsyncMock(),
         journal=Mock(),
+        logger=Mock(),
         config={"companion_integration": False},
     )
     event = SimpleNamespace(owner=owner, unified_msg_origin="owner", state={})

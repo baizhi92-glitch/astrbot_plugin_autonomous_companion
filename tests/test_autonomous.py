@@ -312,6 +312,96 @@ def test_compile_chapters_orders_deduplicates_and_rejects_conflicts(
         compiled_work.compile_chapters(state, "session", "短篇", ["one", "three"])
 
 
+def test_compile_mixed_manuscript_keeps_draft_and_requires_version_selection(tmp_path, monkeypatch):
+    from data.plugins.astrbot_plugin_autonomous_companion import compiled_work
+
+    monkeypatch.setattr(compiled_work.StarTools, "get_data_dir", lambda _: tmp_path)
+    state = {"work_library": [
+        {"id": "draft", "kind": "text", "title": "长篇", "status": "drafting", "inline_content": "长篇\n\n# 长篇\n\n## 第一节 出发\n原文一\n\n## 第二节 路上\n原文二"},
+        {"id": "old", "kind": "text", "title": "长篇", "inline_content": "## 第二节 路上\n另一版本"},
+        {"id": "three", "kind": "text", "title": "长篇·第三章 抵达", "inline_content": "原文三"},
+    ]}
+    with pytest.raises(ValueError, match="不同版本"):
+        compiled_work.compile_chapters(state, "session", "长篇")
+    receipt = compiled_work.compile_chapters(state, "session", "长篇", ["draft", "three"])
+    text = Path(receipt["path"]).read_text(encoding="utf-8")
+    assert receipt["chapters"] == 3
+    assert text.index("原文一") < text.index("原文二") < text.index("原文三")
+    assert state["work_library"][-1]["status"] == "drafting"
+    assert not state.get("library_archived")
+
+
+def test_reconcile_only_exact_saved_chapters(tmp_path):
+    from data.plugins.astrbot_plugin_autonomous_companion.checkpoint import reconcile_saved_chapters
+
+    path = tmp_path / "novel.md"
+    path.write_text("正文", encoding="utf-8")
+    title = "长篇·第四章 最后一页"
+    receipt = {"tool": "autonomous_save_work", "status": "observed", "result": json.dumps({"saved": True, "work_id": "four", "path": str(path), "title": title})}
+    tasks = ["保存第四章草稿", "保存第五章草稿", "保存《别的作品·第四章》草稿", "保存第四章草稿并发送"]
+    records = {task: {"task": task, "cid": "cid", "pending": True, "receipts": [receipt]} for task in tasks}
+    state = {"execution_checkpoints": records, "future_task": tasks[0], "work_library": [{"id": "four", "title": title, "kind": "text", "path": str(path), "producer": "autonomous_save_work"}]}
+    assert reconcile_saved_chapters(state, "other") == []
+    assert reconcile_saved_chapters(state, "cid") == tasks[:1]
+    assert state["future_task"] == ""
+    assert [r["pending"] for r in records.values()] == [False, True, True, True]
+    records[tasks[0]]["pending"] = True
+    path.unlink()
+    assert reconcile_saved_chapters(state, "cid") == []
+
+
+@pytest.mark.asyncio
+async def test_save_only_round_rejects_wrong_chapter_before_touching_files():
+    plugin, state, event = make_plugin()
+    event.owner = plugin
+    event.checkpoint_task = "保存第四章草稿"
+    wrapped = module.BudgetTool(module.SaveWorkTool(event), event)
+    replies = [reply async for reply in wrapped.call(None, title="长篇·第五章 新章", content="正文", mode="draft")]
+    assert json.loads(replies[0])["saved"] is False
+    assert not state.get("saved_works")
+
+
+@pytest.mark.asyncio
+async def test_save_work_cannot_overwrite_manuscript_with_new_chapter(tmp_path, monkeypatch):
+    from data.plugins.astrbot_plugin_autonomous_companion import works
+
+    plugin, _, event = make_plugin()
+    event.owner = plugin
+    monkeypatch.setattr(works.StarTools, "get_data_dir", lambda _: tmp_path)
+    tool = works.SaveWorkTool(event)
+    saved = json.loads(await tool.call(None, title="长篇", content="## 第一节\n原文", mode="draft"))
+    original = Path(saved["path"]).read_bytes()
+    for mode in ("draft", "final"):
+        with pytest.raises(ValueError, match="不同章节"):
+            await tool.call(None, title="长篇·第二章 新章", content="新章", mode=mode, work_id=saved["work_id"])
+    assert Path(saved["path"]).read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_finalizing_chapters_automatically_updates_one_visible_collection(tmp_path, monkeypatch):
+    from data.plugins.astrbot_plugin_autonomous_companion import works
+
+    plugin, state, event = make_plugin()
+    event.owner = plugin
+    monkeypatch.setattr(works.StarTools, "get_data_dir", lambda _: tmp_path)
+    tool = works.SaveWorkTool(event)
+    one = json.loads(await tool.call(None, title="长篇·第一章 起点", content="原文一"))
+    three = json.loads(await tool.call(None, title="长篇·第三章 路上", content="原文三", mode="draft"))
+    assert not any(row.get("compilation") for row in state["work_library"])
+    two = json.loads(await tool.call(None, title="长篇·第二章 出发", content="原文二"))
+    first = next(row for row in state["work_library"] if row.get("finished_chapter_collection"))
+    assert first["chapter_count"] == 2
+    assert first["status"] != "finished"
+    assert "原文三" not in Path(first["path"]).read_text(encoding="utf-8")
+    assert "id:" + three["work_id"] not in state["library_archived"]
+    await tool.call(None, title="长篇·第三章 路上", content="原文三", work_id=three["work_id"])
+    visible = [row for row in state["work_library"] if "id:" + row["id"] not in state["library_archived"]]
+    assert len(visible) == 1
+    assert visible[0]["chapter_count"] == 3
+    assert set(visible[0]["chapter_ids"]) == {one["work_id"], two["work_id"], three["work_id"]}
+    assert all(Path(row["path"]).is_file() for row in (one, two, three, first))
+
+
 @pytest.mark.asyncio
 async def test_completed_project_stops_requested_extra_chapter():
     plugin, state, event = make_plugin()
@@ -4652,6 +4742,67 @@ async def test_work_optional_companion_sync_preserves_local_file(
     assert receipt["companion"]["saved"] is (not fails)
     api.import_completed_text_work.assert_awaited_once()
     assert api.import_completed_text_work.call_args.kwargs["content"] == "full text"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task", "message", "manual", "expect_send"),
+    [
+        ("更新小说", "", False, False),
+        ("更新小说", "NO_REPLY", False, False),
+        ("保存第四章草稿", "", False, False),
+        ("更新小说", "给你看看这段。", False, True),
+        ("更新小说", "", True, True),
+    ],
+)
+async def test_autonomous_save_respects_silence_and_explicit_sharing(
+    task, message, manual, expect_send
+):
+    plugin, state, event = make_plugin()
+    plugin.config["task_completion_message"] = True
+    plugin.config["natural_task_closing"] = not manual
+    if manual:
+        state["manual_plan"] = task
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text=json.dumps({"action": "tools", "task": task})
+    )
+    if task == "保存第四章草稿":
+        contract = {"mode": "action", "steps": [{
+            "goal": "读取原文", "tools": ["autonomous_read_file"],
+            "accept": "observed", "criterion": "读取第四章",
+        }]}
+        state["execution_checkpoint"] = {
+            "task": task, "cid": event.cid, "pending": True, "contract": contract,
+        }
+
+    async def execute(**kwargs):
+        event.action_receipts.extend([
+            {"tool": "list_models", "status": "unverified", "result": "models"},
+            {"tool": "autonomous_save_work", "status": "observed", "result": '{"saved":true}'},
+        ])
+        return SimpleNamespace(completion_text=json.dumps({"message": message, "summary": "已保存草稿"}))
+
+    plugin.context.tool_loop_agent.side_effect = execute
+    await plugin.turn(event.unified_msg_origin)
+    assert event.send.await_count == int(expect_send)
+    if message and expect_send:
+        assert event.send.call_args.args[0].get_plain_text() == message
+    assert plugin.context.llm_generate.await_count == int(not manual and task != "保存第四章草稿")
+
+
+@pytest.mark.asyncio
+async def test_autonomous_save_tool_notices_stay_private():
+    plugin, _, event = make_plugin()
+    plugin.context.get_config = lambda *_: {"provider_settings": {"show_tool_call_result": True}}
+    plugin.deliver = AsyncMock()
+    await plugin.tool_notice(event, "autonomous_save_work", "开始调用")
+    await plugin.tool_notice(event, "autonomous_save_work", "返回结果", "stored locally")
+    event.checkpoint_task = "保存第四章草稿"
+    await plugin.tool_notice(event, "list_models", "开始调用")
+    plugin.deliver.assert_not_awaited()
+    event.manual_task = True
+    await plugin.tool_notice(event, "autonomous_save_work", "开始调用")
+    plugin.deliver.assert_awaited_once()
 
 
 @pytest.mark.asyncio

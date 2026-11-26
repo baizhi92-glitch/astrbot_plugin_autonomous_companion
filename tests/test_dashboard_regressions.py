@@ -1,5 +1,6 @@
 """Isolated regressions for the embedded dashboard's secret and catalogue."""
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -45,6 +46,159 @@ def dashboard():
     page = CompanionPageAPI(owner)
     page.library_checked = {ORIGIN: time.time()}  # No background refresh.
     return page, owner
+
+
+def test_library_view_detects_manuscript_versions_without_changing_source(
+    dashboard, tmp_path
+):
+    page, _ = dashboard
+    state = {}
+    for i, text in enumerate(
+        (
+            "# 故事\n\n## 第一节 起点\n正文\n## 第二节\n正文",
+            "## 第一节\n改稿\n## 第二节\n正文\n## 第三节\n正文",
+            "同名但没有章节的独立作品",
+        )
+    ):
+        path = tmp_path / f"{i}.md"
+        path.write_text("故事\n\n" + text, encoding="utf-8")
+        library.register_local_work(
+            state, str(path), "autonomous_save_work", "故事", status="drafting"
+        )
+    rows = state["work_library"]
+    for _ in range(2):
+        views = page.inspect_library_views({ORIGIN: [dict(row) for row in rows]})[
+            ORIGIN
+        ]
+        assert [row.get("manuscript_sections") for row in views] == [
+            [1, 2],
+            [1, 2, 3],
+            None,
+        ]
+    assert all("manuscript_sections" not in row for row in rows)
+    Path(rows[1]["path"]).write_text("故事\n\n无章节的新稿", encoding="utf-8")
+    views = page.inspect_library_views({ORIGIN: [dict(row) for row in rows]})[ORIGIN]
+    assert "manuscript_sections" not in views[1]
+
+
+def test_library_preserves_more_than_one_hundred_sources(tmp_path):
+    state = {}
+    for i in range(105):
+        path = tmp_path / f"{i}.txt"
+        path.write_text(f"Original {i}", encoding="utf-8")
+        assert library.register_local_work(state, str(path), "safe_write")
+    for i in range(105):
+        assert library.catalogue_receipt(
+            state,
+            "run_template",
+            json.dumps(
+                {
+                    "status": "completed",
+                    "outputs": {
+                        "image": {
+                            "type": "image",
+                            "url": f"https://example.test/{i}.png",
+                        }
+                    },
+                }
+            ),
+        )
+    assert len(state["work_library"]) == 210
+    assert (
+        library.read_library_text(state, state["work_library"][0]["id"]) == "Original 0"
+    )
+
+
+@pytest.mark.asyncio
+async def test_creative_artifact_access_is_scoped_and_receipt_replay_is_ignored(
+    dashboard, tmp_path, monkeypatch
+):
+    from data.plugins.astrbot_plugin_autonomous_companion.creative_artifacts import (
+        CREATIVE_ARTIFACT_TOOL,
+    )
+
+    page, owner = dashboard
+    monkeypatch.setattr(library.StarTools, "get_data_dir", lambda _: tmp_path)
+    scope = hashlib.sha256(ORIGIN.encode()).hexdigest()[:16]
+    folder = tmp_path / "works" / scope / "creative"
+    folder.mkdir(parents=True)
+    file = folder / ("artifact-" + "b" * 32 + ".json")
+    file.write_text('{"a": 1}', encoding="utf-8")
+    state = owner.states[ORIGIN]
+    assert not library.catalogue_receipt(
+        state,
+        CREATIVE_ARTIFACT_TOOL,
+        json.dumps({"saved": True, "output_path": str(file)}),
+    )
+    assert not library.register_local_work(state, str(file), "safe_write")
+    assert library.register_local_work(
+        state, str(file), CREATIVE_ARTIFACT_TOOL, "Structured work"
+    )
+    row = state["work_library"][0]
+    for action in ("work_read", "work_download", "work_to_outbox"):
+        response = await page.perform(
+            {"action": action, "umo": ORIGIN, "id": row["id"]}
+        )
+        assert response["status"] == "ok"
+    with pytest.raises(ValueError):
+        library.read_library_text(state, row["id"], origin="other:FriendMessage:123")
+    with pytest.raises(ValueError):
+        library.download_library_file(
+            state, row["id"], origin="other:FriendMessage:123"
+        )
+
+
+@pytest.mark.asyncio
+async def test_draft_versions_restore_and_report_actual_finalize(
+    dashboard, tmp_path, monkeypatch
+):
+    from data.plugins.astrbot_plugin_autonomous_companion.work_versions import (
+        replace_work_text,
+    )
+
+    page, owner = dashboard
+    owner.logger = Mock()
+    monkeypatch.setattr(library.StarTools, "get_data_dir", lambda _: tmp_path)
+    scope = hashlib.sha256(ORIGIN.encode()).hexdigest()[:16]
+    drafts = tmp_path / "works" / scope / "drafts"
+    drafts.mkdir(parents=True)
+    path = drafts / ("draft-" + "a" * 32 + ".md")
+    first = "长篇·第一章 出发\n\n上一版"
+    second = "长篇·第一章 出发\n\n本版"
+    path.write_bytes(first.encode())
+    state = owner.states[ORIGIN]
+    assert library.register_local_work(
+        state, str(path), "autonomous_save_work", "长篇·第一章 出发", status="drafting"
+    )
+    identifier = state["work_library"][0]["id"]
+    replace_work_text(path, second)
+    versions = (
+        await page.perform({"umo": ORIGIN, "action": "work_versions", "id": identifier})
+    )["data"]["versions"]
+    assert len(versions) == 1
+    await page.perform(
+        {
+            "umo": ORIGIN,
+            "action": "work_restore_version",
+            "id": identifier,
+            "version_id": versions[0]["id"],
+        }
+    )
+    assert path.read_text(encoding="utf-8") == first
+    with pytest.raises(ValueError):
+        await page.perform(
+            {
+                "umo": ORIGIN,
+                "action": "work_restore_version",
+                "id": identifier,
+                "version_id": "../draft",
+            }
+        )
+    result = await page.perform(
+        {"umo": ORIGIN, "action": "work_finalize_draft", "id": identifier}
+    )
+    assert result["data"]["compilation"] == {"status": "not_ready"}
+    assert state["work_library"][0]["status"] == "finished"
 
 
 @pytest.mark.asyncio
